@@ -1,0 +1,20 @@
+# Research fixture: an OVER-AGGRESSIVE server-side filter. The overlay keeps
+# only id/amount (+ list envelope) on charge lists and single charges — so any
+# task needing currency/status/captured loses the field it required. Used by the
+# projection-filtering experiment to measure the cost of filtering too hard.
+mode: three_tool
+upstreams:
+  - name: stripe
+    spec: ./stripe.json
+    base_url: https://api.stripe.com
+    auth_env: STRIPE_TEST_KEY
+overlays:
+  - tool: stripe.GetCharges
+    response:
+      keep: ["object", "has_more", "data[].id", "data[].amount"]
+  - tool: stripe.GetChargesCharge
+    response:
+      keep: ["id", "amount"]
+error_hints:
+  - contains: '"status": 4'
+    hint: "The request was rejected (4xx). Re-read the operation's schema with get_tool_details and check required fields before retrying."

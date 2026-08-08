@@ -1,0 +1,29 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+target/
+
+# Third-party OpenAPI specs — downloaded, not authored. See research/scripts/fetch_specs.py
+
+# Raw benchmark run logs (regenerable; may contain test-mode API object data).
+# The committed results/*.md summaries are the citeable evidence.
+.DS_Store
+.claude/settings.local.json
+
+# Local integration playground (fetched specs, machine-specific paths)
+demo/
+
+# Private lab material — research, notebook, and internal drafts (not for public release)
+research/
+LABBOOK.md
+docs/plan.md
+docs/pd-thought-piece.md
+docs/benchmarks.md
+docs/ROADMAP.md
+examples/stripe-naive-proxy.yaml
+examples/stripe-faithful-proxy.yaml
+# Downloaded OpenAPI specs placed next to example configs
+examples/*.json

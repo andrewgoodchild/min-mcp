@@ -1,0 +1,85 @@
+# Demo: EVERY overlay feature, on a self-contained sample spec.
+#
+# No network, no credentials. See it all with:
+#   minmcp inspect --config examples/demo-overlays.yaml     # surface stats
+#   minmcp map     --config examples/demo-overlays.yaml     # source map + which tools an overlay patched
+#   minmcp help    --config examples/demo-overlays.yaml acme.widgets/create   # the patched schema
+#   minmcp lint    --config examples/demo-overlays.yaml     # best-practice smells
+#   minmcp search  --config examples/demo-overlays.yaml "look up a widget"    # search + aliases
+#
+# (`minmcp call` / `verify` need a live server at base_url — this spec is never
+#  actually called; base_url is a placeholder.)
+
+mode: three_tool           # the agent sees 3 tools (search → details → call), not the whole catalog
+
+# Opt-in local validation: a missing-required / out-of-enum value is rejected
+# BEFORE the upstream call, with a structured error — no round-trip, no opaque 400.
+preflight: true
+
+upstreams:
+  - name: acme
+    spec: specs/acme-store.json
+    base_url: http://localhost:8787      # placeholder — inspection needs no server
+
+# Fleet-wide error hints apply to every tool of every upstream.
+error_hints:
+  - contains: "429"
+    hint: "Rate limited — wait and retry."
+    retryable: true                       # appends an explicit transient/permanent retry signal
+
+overlays:
+  # --- widgets/create: descriptions, field patches, user_supplied, headers, structured errors, verify ---
+  - tool: acme.widgets/create
+    description: "Create a widget. Provide a name and a deployment zone."   # replaces the terse summary
+    fields:
+      body.name:
+        example: "gearbox-01"                                               # example value
+      body.zone:                                                            # the load-bearing fix:
+        description: "Deployment region code. 'z-1'=us-east, 'z-2'=us-west, 'z-3'=eu."
+        required: true                                                      # mark an undocumented-required param required
+        enum: ["z-1", "z-2", "z-3"]                                         # constrain the value
+      body.region:
+        user_supplied: "env:ACME_REGION"                                    # stripped from the agent schema; injected from env (anti-fabrication)
+      body.notes:
+        hide: true                                                          # drop a noisy field the agent shouldn't set
+    headers:
+      x-api-version: "2"                                                    # per-endpoint static header the spec requires
+      x-request-id: "{{uuid}}"                                              # fresh UUIDv4 each call
+      x-idempotency-key: "{{hash}}"                                         # stable key from the request body (dedupes a retry)
+    error_hints:
+      - contains: "ERR_ZONE"
+        hint: "the zone is invalid"                                         # prose fallback...
+        field: body.zone                                                    # ...but render a STRUCTURED error from the schema (recovers weak agents)
+    verify:
+      - name: "omitting zone is rejected"
+        arguments: { body: { name: "w" } }
+        expect: { status: 400 }                                            # a deterministic check `minmcp verify` runs against a live server
+    binding: strong                                                         # fail-closed if this overlay ever stops matching the upstream
+
+  # --- widgets/list: request defaults, auto-pagination, response reshaping ---
+  - tool: acme.widgets/list
+    defaults:
+      query_params.limit: 50                                                # fill a request field the agent omits
+    paginate:
+      items: "data"                                                         # follow the cursor and concatenate pages
+      cursor: "next_cursor"
+      into: "query_params.cursor"
+      more: "has_more"
+      max_pages: 5
+    response:
+      remove: ["data[].internal_token"]                                     # strip a secret/noise field, server-side
+      rename: { "data[].created_ts": "created" }                            # tidy a key
+      set: { "source": "min-mcp" }                                          # stamp a field
+      when: success                                                         # only on success (never blank an error body)
+
+  # --- widgets/get: search aliases (a poorly-named tool made findable) ---
+  - tool: acme.widgets/get
+    aliases: ["look up a widget by its id", "fetch widget details"]         # indexed for search_tools only; routing unchanged
+
+  # --- orders/create: a per-tool error hint ---
+  - tool: acme.orders/create
+    fields:
+      body.quantity: { description: "Number of units to order (1 or more).", example: 1 }
+    error_hints:
+      - contains: "insufficient_stock"
+        hint: "Reduce the quantity, or pick a widget with stock."

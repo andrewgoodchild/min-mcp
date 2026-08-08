@@ -1,0 +1,11 @@
+# Self-contained config for CI: mounts a tiny checked-in OpenAPI spec so the
+# MCP-compliance suite can spin min-mcp up as a stdio server with no network,
+# no credentials, and no external MCP server. The base_url is never dialed by
+# the compliance probes (they exercise initialize / tools-list / errors, not
+# real tool calls).
+mode: three_tool
+upstreams:
+  - name: fixture
+    spec: mini-openapi.json
+    base_url: https://example.invalid
+    auth_env: CI_FIXTURE_KEY

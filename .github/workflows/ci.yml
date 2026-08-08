@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Blocking: the build must compile, lint clean, and pass every test.
+  rust:
+    name: build · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (deny warnings)
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: Test (unit + HTTP conformance)
+        run: cargo test --release
+
+  # Informational: run the external MCP-spec compliance suite against a
+  # self-contained min-mcp server (a checked-in mini OpenAPI spec, no network,
+  # no credentials). Non-blocking until we've reviewed which of the 88 checks
+  # min-mcp should pass — the report is the value.
+  mcp-compliance:
+    name: MCP spec compliance (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the binary
+        run: cargo build --release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run @yawlabs/mcp-compliance
+        run: |
+          npx --yes @yawlabs/mcp-compliance@latest test \
+            ./target/release/minmcp serve --config tests/fixtures/ci-server.yaml \
+            --format markdown | tee compliance-report.md || true
+      - name: Upload compliance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-compliance-report
+          path: compliance-report.md

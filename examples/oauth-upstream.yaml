@@ -1,0 +1,13 @@
+# Proxy an OAuth-protected REMOTE MCP server. min-mcp runs the OAuth 2.0
+# client-credentials grant against `token_url`, caches the bearer, refreshes it
+# before expiry, and attaches it to every upstream call — no hand-minted tokens.
+# The client secret is read from the environment via ${...}, never stored here.
+mode: three_tool
+upstreams:
+  - name: remote
+    url: https://mcp.example.com/mcp
+    oauth:
+      token_url: https://auth.example.com/oauth/token
+      client_id: my-service-client
+      client_secret: "${REMOTE_MCP_CLIENT_SECRET}"
+      scope: "mcp.read mcp.call"   # optional

@@ -1,0 +1,41 @@
+# Demo: a COMPOSITE tool — a fixed multi-step chain exposed to the agent as ONE
+# tool that runs the whole chain internally, threading each step's output into
+# the next. Fewer round-trips, fewer tokens, no place for the agent to fumble the
+# intermediate ids.
+#
+#   minmcp map    --config examples/demo-workflow.yaml        # the composite appears alongside the spec tools
+#   minmcp search --config examples/demo-workflow.yaml "order a brand new widget"
+#   minmcp help   --config examples/demo-workflow.yaml orderNewWidget
+
+mode: three_tool
+upstreams:
+  - name: acme
+    spec: specs/acme-store.json
+    base_url: http://localhost:8787
+
+workflows:
+  - id: orderNewWidget
+    description: >-
+      Create a widget and immediately place an order for it, in one step —
+      instead of calling widgets/create then orders/create separately.
+    inputs:
+      type: object
+      required: [name, quantity]
+      properties:
+        name: { type: string, description: the new widget's name }
+        quantity: { type: integer, description: how many units to order }
+    steps:
+      - id: widget
+        tool: acme.widgets/create
+        input: { body: { name: "$inputs.name", zone: "z-1" } }
+        output: { id: id }                       # extract the created widget's id
+      - id: order
+        tool: acme.orders/create
+        input:
+          body:
+            widget_id: "$steps.widget.id"        # thread it into the next step
+            quantity: "$inputs.quantity"
+        output: { id: id }
+    outputs:
+      widgetId: "$steps.widget.id"
+      orderId: "$steps.order.id"

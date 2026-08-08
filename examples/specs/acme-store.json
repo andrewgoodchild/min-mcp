@@ -1,0 +1,75 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Acme Store API",
+    "version": "1.0.0",
+    "description": "A tiny self-contained sample API for the min-mcp examples. It is never called — the demo configs mount it so you can inspect the minified surface and every overlay with `minmcp inspect|help|map|lint`, no network or credentials required."
+  },
+  "paths": {
+    "/widgets": {
+      "post": {
+        "operationId": "widgets/create",
+        "summary": "Create a widget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string", "description": "Human-readable widget name." },
+                  "zone": { "type": "string" },
+                  "region": { "type": "string" },
+                  "notes": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "201": { "description": "Created" } }
+      },
+      "get": {
+        "operationId": "widgets/list",
+        "summary": "List widgets.",
+        "parameters": [
+          { "name": "cursor", "in": "query", "schema": { "type": "string" }, "description": "Opaque page cursor." },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" }, "description": "Page size." }
+        ],
+        "responses": { "200": { "description": "A page of widgets." } }
+      }
+    },
+    "/widgets/{widgetId}": {
+      "get": {
+        "operationId": "widgets/get",
+        "summary": "Get a widget.",
+        "parameters": [
+          { "name": "widgetId", "in": "path", "required": true, "schema": { "type": "string" }, "description": "The widget id." }
+        ],
+        "responses": { "200": { "description": "The widget." } }
+      }
+    },
+    "/orders": {
+      "post": {
+        "operationId": "orders/create",
+        "summary": "Place an order for a widget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["widget_id", "quantity"],
+                "properties": {
+                  "widget_id": { "type": "string", "description": "Id of the widget to order." },
+                  "quantity": { "type": "integer" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "201": { "description": "Order placed." } }
+      }
+    }
+  }
+}

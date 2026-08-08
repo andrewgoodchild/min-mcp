@@ -1,0 +1,55 @@
+[package]
+name = "min-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Minify your MCPs — a minifying, scope-aware proxy for MCP servers"
+license = "Apache-2.0"
+
+[[bin]]
+name = "minmcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+jaq-core = "1.5"
+jaq-interpret = "1.5"
+jaq-parse = "1.0"
+jaq-std = "1.5"
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Official MCP SDK — serves both agent-facing transports (behind its
+# ServerHandler), while the surface, spec executor, and upstream clients stay
+# hand-rolled. `server` = ServerHandler; `transport-io` = stdio();
+# `transport-streamable-http-server` = the Streamable HTTP service (with SSE).
+rmcp = { version = "3", default-features = false, features = [
+    "server", "transport-io", "transport-streamable-http-server",
+] }
+# HTTP runtime to drive rmcp's StreamableHttpService (a tower service) on a
+# TCP listener. Both are already in the tree via reqwest/rmcp.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
+# CSPRNG for request-id generation (UUIDv4). Portable OS entropy (getrandom(2) /
+# SecRandomCopyBytes / RtlGenRandom); already in the tree via rustls.
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+# preserve_order: keep JSON object keys in source order so response bodies (and
+# TOON encodings) present fields as the API returned them, not alphabetized.
+serde_json = { version = "1", features = ["preserve_order"] }
+# serde_yaml_ng: the maintained fork of the (archived, deprecated) serde_yaml,
+# aliased to `serde_yaml` so call sites are unchanged. On the hot path — it
+# parses the config and every YAML OpenAPI spec (e.g. the 42 MB MS Graph doc).
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+tokio = { version = "1", features = ["macros", "rt", "io-util", "io-std", "process", "time", "sync", "net"] }
+# Logging over the ecosystem-standard `tracing`; one subscriber also captures
+# rmcp's own spans. Trimmed features (no ansi colours — output goes to stderr).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
+
+[dev-dependencies]
+# Parse `minmcp inspect` JSON output and validate doc/example YAML in the
+# integration tests (serde_yaml_ng parses JSON too — JSON is a subset of YAML).
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+
+[profile.release]
+lto = true

@@ -1,0 +1,29 @@
+# Demo: control what's visible — static filters (for everyone) + per-caller scopes.
+#
+#   minmcp inspect --config examples/demo-scopes.yaml                       # only the surviving read tools
+#   minmcp map     --config examples/demo-scopes.yaml --scopes store.write  # grant a scope, see writes appear
+#
+# Filters drop tools for EVERYONE; scopes hide tools from a caller who lacks the
+# right scope (default-deny once any rule exists). Hidden tools are never listed,
+# searched, or callable.
+
+mode: three_tool
+upstreams:
+  - name: acme
+    spec: specs/acme-store.json
+    base_url: http://localhost:8787
+
+# Static filter: this deployment never exposes the delete-style/orders surface at
+# all (drop it for everyone). `include`, if present, is an allowlist; `exclude`
+# is applied after. Patterns are exact or a trailing `*` prefix.
+filters:
+  exclude: ["acme.orders/create"]        # orders are never proxied here
+
+# Per-caller scopes: with any rule present, a caller sees ONLY what their scopes
+# grant. A read-only caller (no scope, or `store.read`) can't see widget creation.
+scopes:
+  rules:
+    - scope: store.read
+      tools: ["acme.widgets/list", "acme.widgets/get"]
+    - scope: store.write
+      tools: ["acme.widgets/create"]

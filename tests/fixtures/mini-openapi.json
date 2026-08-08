@@ -1,0 +1,41 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "ci-fixture", "version": "1.0.0" },
+  "paths": {
+    "/ping": {
+      "get": {
+        "operationId": "GetPing",
+        "summary": "Health check that returns pong.",
+        "responses": { "200": { "description": "ok" } }
+      }
+    },
+    "/items/{id}": {
+      "get": {
+        "operationId": "GetItem",
+        "summary": "Retrieve an item by id.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "ok" } }
+      }
+    },
+    "/items": {
+      "post": {
+        "operationId": "PostItems",
+        "summary": "Create an item.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "type": "string" } }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "ok" } }
+      }
+    }
+  }
+}

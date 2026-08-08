@@ -1,0 +1,7 @@
+# Benchmark config: mount the bundled synthetic 120-operation spec. No network,
+# no credentials — used to reproduce the token-compression measurement offline.
+mode: three_tool
+upstreams:
+  - name: big
+    spec: specs/bigapi.json
+    base_url: http://localhost:9000

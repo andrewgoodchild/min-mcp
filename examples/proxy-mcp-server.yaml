@@ -1,0 +1,38 @@
+# Template: proxy one or more existing MCP servers behind one minified surface.
+# Point your agent at `minmcp serve --config <this file>`; it sees 3 tools
+# (search_tools / get_tool_details / call_tool) instead of every upstream tool.
+#
+# Copy and edit. Paths and `--directory` are resolved relative to THIS file.
+mode: three_tool
+
+upstreams:
+  # An MCP server launched over stdio. `command` + `args` are how you'd run it
+  # by hand; `env` passes it any variables it needs.
+  - name: files
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/expose"]
+
+  # Add as many as you like — their tools are federated into one surface.
+  # - name: github
+  #   command: docker
+  #   args: ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"]
+  #   env: { GITHUB_PERSONAL_ACCESS_TOKEN: "" }   # prefer a real secret store
+
+# Optional: include/exclude whole APIs or individual tools, statically. A
+# filtered tool is never listed, searched, or callable; a fully excluded API
+# isn't connected at all (needs no command/credentials). `include` is an
+# allowlist (only matches survive); `exclude` a denylist (applied after).
+# Patterns: `files` (whole API) · `files.read_file` (one tool) · `files.write*`
+# (a family). Leave both out to pass everything through.
+# filters:
+#   exclude: ["files.write_file", "files.move_file"]   # read-only surface
+#   # include: ["github", "files.read_file"]           # allowlist instead
+
+# Optional: patch a third-party tool's text without forking it, and turn raw
+# upstream errors into recovery instructions for the agent.
+# overlays:
+#   - tool: files.read_file
+#     description: "Read a UTF-8 text file. Path must be absolute."
+#     error_hints:
+#       - contains: "ENOENT"
+#         hint: "The path does not exist — list the directory first."

@@ -1,0 +1,53 @@
+# Benchmark condition: identical to stripe-from-spec.yaml, plus ONE composite
+# tool that collapses the create-product -> create-price -> create-session chain
+# into a single call. The A/B (this vs stripe-from-spec.yaml) isolates the
+# effect of exposing the composite: does the agent find it, and does using it
+# cut tokens/round-trips without losing task success?
+mode: three_tool
+upstreams:
+  - name: stripe
+    spec: ./stripe.json
+    base_url: https://api.stripe.com
+    auth_env: STRIPE_TEST_KEY
+error_hints:
+  - contains: '"status": 4'
+    hint: "The request was rejected (4xx). Re-read the operation's schema with get_tool_details and check required fields before retrying."
+workflows:
+  - id: createCheckoutForNewProduct
+    description: >-
+      Create a Stripe checkout session for a NEW product in one step: creates the
+      product, a one-time price in the given currency, and the checkout session.
+      Use this instead of calling PostProducts + PostPrices + PostCheckoutSessions
+      separately.
+    inputs:
+      type: object
+      required: [name, amount]
+      properties:
+        name: { type: string, description: product name }
+        amount: { type: integer, description: unit price in cents (e.g. 2500 for $25.00) }
+        client_reference_id: { type: string, description: caller reference recorded on the session }
+    steps:
+      - id: product
+        tool: stripe.PostProducts
+        input: { body: { name: "$inputs.name" } }
+        output: { id: id }
+      - id: price
+        tool: stripe.PostPrices
+        input:
+          body:
+            product: "$steps.product.id"
+            unit_amount: "$inputs.amount"
+            currency: usd
+        output: { id: id }
+      - id: session
+        tool: stripe.PostCheckoutSessions
+        input:
+          body:
+            mode: payment
+            success_url: "https://example.com/success"
+            client_reference_id: "$inputs.client_reference_id"
+            line_items: [ { price: "$steps.price.id", quantity: 1 } ]
+        output: { id: id, url: url }
+    outputs:
+      sessionId: "$steps.session.id"
+      url: "$steps.session.url"

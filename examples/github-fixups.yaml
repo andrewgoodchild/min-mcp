@@ -1,0 +1,33 @@
+# Fix a broken server WITHOUT forking it.
+#
+# GitHub's reference MCP server scored D/F in a 36-server lint scan (the dominant
+# defect across that whole ecosystem: "parameter has no description" — agents then
+# invent required values). Mounted from its OpenAPI spec, min-mcp's surface is
+# correct but terse. This overlay pack turns it into a well-documented surface the
+# agent can use correctly — patching descriptions, field docs, and errors at the
+# proxy, without touching GitHub or maintaining a fork.
+#
+# See the before/after with:
+#   minmcp help --config examples/github-from-spec.yaml github.issues/create   # before
+#   minmcp help --config examples/github-fixups.yaml   github.issues/create   # after
+mode: three_tool
+upstreams:
+  - name: github
+    spec: ./github.json
+    base_url: https://api.github.com
+    auth_env: GITHUB_PAT
+overlays:
+  - tool: github.issues/create
+    description: >-
+      Create a new issue in a GitHub repository. Requires path_params.owner and
+      path_params.repo (which repository), and body.title. Put the description in
+      body.body (markdown); add body.labels / body.assignees as needed. Never
+      invent owner/repo — if you don't know them, ask or look them up first.
+    fields:
+      path_params: "REQUIRED. { owner: the repo owner or org login, repo: the repository name }. Never guess these — ask if unknown."
+      body: "REQUIRED: { title }. Optional: body (markdown description), labels (string[]), assignees (login[]), milestone (number)."
+    error_hints:
+      - contains: '"status": 404'
+        hint: "Repository not found or not visible to this token. Re-check owner/repo spelling; do NOT retry with a guessed repository."
+      - contains: '"status": 422'
+        hint: "Validation failed — usually a missing 'title' or an invalid label/assignee login. Re-read the fields and retry with a valid title."

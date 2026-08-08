@@ -1,0 +1,4450 @@
+{
+ "openapi": "3.0.3",
+ "info": {
+  "title": "BigAPI (synthetic)",
+  "version": "1.0.0",
+  "description": "A synthetic 120-operation API bundled to reproduce the compression measurement offline."
+ },
+ "paths": {
+  "/widgets": {
+   "post": {
+    "operationId": "widgets/create",
+    "summary": "Create a widget.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the widget."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "widgets/list",
+    "summary": "List widgets.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/widgets/{id}": {
+   "get": {
+    "operationId": "widgets/get",
+    "summary": "Get a widget by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The widget id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/gadgets": {
+   "post": {
+    "operationId": "gadgets/create",
+    "summary": "Create a gadget.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the gadget."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "gadgets/list",
+    "summary": "List gadgets.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/gadgets/{id}": {
+   "get": {
+    "operationId": "gadgets/get",
+    "summary": "Get a gadget by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The gadget id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/orders": {
+   "post": {
+    "operationId": "orders/create",
+    "summary": "Create a order.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the order."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "orders/list",
+    "summary": "List orders.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/orders/{id}": {
+   "get": {
+    "operationId": "orders/get",
+    "summary": "Get a order by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The order id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/invoices": {
+   "post": {
+    "operationId": "invoices/create",
+    "summary": "Create a invoice.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the invoice."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "invoices/list",
+    "summary": "List invoices.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/invoices/{id}": {
+   "get": {
+    "operationId": "invoices/get",
+    "summary": "Get a invoice by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The invoice id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/customers": {
+   "post": {
+    "operationId": "customers/create",
+    "summary": "Create a customer.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the customer."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "customers/list",
+    "summary": "List customers.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/customers/{id}": {
+   "get": {
+    "operationId": "customers/get",
+    "summary": "Get a customer by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The customer id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/projects": {
+   "post": {
+    "operationId": "projects/create",
+    "summary": "Create a project.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the project."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "projects/list",
+    "summary": "List projects.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/projects/{id}": {
+   "get": {
+    "operationId": "projects/get",
+    "summary": "Get a project by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The project id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/tickets": {
+   "post": {
+    "operationId": "tickets/create",
+    "summary": "Create a ticket.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the ticket."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "tickets/list",
+    "summary": "List tickets.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/tickets/{id}": {
+   "get": {
+    "operationId": "tickets/get",
+    "summary": "Get a ticket by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The ticket id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/servers": {
+   "post": {
+    "operationId": "servers/create",
+    "summary": "Create a server.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the server."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "servers/list",
+    "summary": "List servers.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/servers/{id}": {
+   "get": {
+    "operationId": "servers/get",
+    "summary": "Get a server by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The server id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/alerts": {
+   "post": {
+    "operationId": "alerts/create",
+    "summary": "Create a alert.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the alert."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "alerts/list",
+    "summary": "List alerts.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/alerts/{id}": {
+   "get": {
+    "operationId": "alerts/get",
+    "summary": "Get a alert by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The alert id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/jobs": {
+   "post": {
+    "operationId": "jobs/create",
+    "summary": "Create a job.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the job."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "jobs/list",
+    "summary": "List jobs.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/jobs/{id}": {
+   "get": {
+    "operationId": "jobs/get",
+    "summary": "Get a job by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The job id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/payments": {
+   "post": {
+    "operationId": "payments/create",
+    "summary": "Create a payment.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the payment."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "payments/list",
+    "summary": "List payments.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/payments/{id}": {
+   "get": {
+    "operationId": "payments/get",
+    "summary": "Get a payment by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The payment id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/refunds": {
+   "post": {
+    "operationId": "refunds/create",
+    "summary": "Create a refund.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the refund."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "refunds/list",
+    "summary": "List refunds.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/refunds/{id}": {
+   "get": {
+    "operationId": "refunds/get",
+    "summary": "Get a refund by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The refund id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/subscriptions": {
+   "post": {
+    "operationId": "subscriptions/create",
+    "summary": "Create a subscription.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the subscription."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "subscriptions/list",
+    "summary": "List subscriptions.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/subscriptions/{id}": {
+   "get": {
+    "operationId": "subscriptions/get",
+    "summary": "Get a subscription by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The subscription id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/products": {
+   "post": {
+    "operationId": "products/create",
+    "summary": "Create a product.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the product."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "products/list",
+    "summary": "List products.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/products/{id}": {
+   "get": {
+    "operationId": "products/get",
+    "summary": "Get a product by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The product id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/prices": {
+   "post": {
+    "operationId": "prices/create",
+    "summary": "Create a price.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the price."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "prices/list",
+    "summary": "List prices.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/prices/{id}": {
+   "get": {
+    "operationId": "prices/get",
+    "summary": "Get a price by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The price id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/coupons": {
+   "post": {
+    "operationId": "coupons/create",
+    "summary": "Create a coupon.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the coupon."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "coupons/list",
+    "summary": "List coupons.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/coupons/{id}": {
+   "get": {
+    "operationId": "coupons/get",
+    "summary": "Get a coupon by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The coupon id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/shipments": {
+   "post": {
+    "operationId": "shipments/create",
+    "summary": "Create a shipment.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the shipment."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "shipments/list",
+    "summary": "List shipments.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/shipments/{id}": {
+   "get": {
+    "operationId": "shipments/get",
+    "summary": "Get a shipment by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The shipment id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/carts": {
+   "post": {
+    "operationId": "carts/create",
+    "summary": "Create a cart.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the cart."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "carts/list",
+    "summary": "List carts.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/carts/{id}": {
+   "get": {
+    "operationId": "carts/get",
+    "summary": "Get a cart by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The cart id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/reviews": {
+   "post": {
+    "operationId": "reviews/create",
+    "summary": "Create a review.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the review."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "reviews/list",
+    "summary": "List reviews.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/reviews/{id}": {
+   "get": {
+    "operationId": "reviews/get",
+    "summary": "Get a review by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The review id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/tags": {
+   "post": {
+    "operationId": "tags/create",
+    "summary": "Create a tag.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the tag."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "tags/list",
+    "summary": "List tags.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/tags/{id}": {
+   "get": {
+    "operationId": "tags/get",
+    "summary": "Get a tag by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The tag id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/teams": {
+   "post": {
+    "operationId": "teams/create",
+    "summary": "Create a team.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the team."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "teams/list",
+    "summary": "List teams.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/teams/{id}": {
+   "get": {
+    "operationId": "teams/get",
+    "summary": "Get a team by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The team id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/users": {
+   "post": {
+    "operationId": "users/create",
+    "summary": "Create a user.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the user."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "users/list",
+    "summary": "List users.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/users/{id}": {
+   "get": {
+    "operationId": "users/get",
+    "summary": "Get a user by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The user id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/roles": {
+   "post": {
+    "operationId": "roles/create",
+    "summary": "Create a role.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the role."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "roles/list",
+    "summary": "List roles.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/roles/{id}": {
+   "get": {
+    "operationId": "roles/get",
+    "summary": "Get a role by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The role id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/webhooks": {
+   "post": {
+    "operationId": "webhooks/create",
+    "summary": "Create a webhook.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the webhook."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "webhooks/list",
+    "summary": "List webhooks.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/webhooks/{id}": {
+   "get": {
+    "operationId": "webhooks/get",
+    "summary": "Get a webhook by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The webhook id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/apikeys": {
+   "post": {
+    "operationId": "apikeys/create",
+    "summary": "Create a apikey.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the apikey."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "apikeys/list",
+    "summary": "List apikeys.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/apikeys/{id}": {
+   "get": {
+    "operationId": "apikeys/get",
+    "summary": "Get a apikey by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The apikey id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/domains": {
+   "post": {
+    "operationId": "domains/create",
+    "summary": "Create a domain.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the domain."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "domains/list",
+    "summary": "List domains.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/domains/{id}": {
+   "get": {
+    "operationId": "domains/get",
+    "summary": "Get a domain by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The domain id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/records": {
+   "post": {
+    "operationId": "records/create",
+    "summary": "Create a record.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the record."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "records/list",
+    "summary": "List records.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/records/{id}": {
+   "get": {
+    "operationId": "records/get",
+    "summary": "Get a record by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The record id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/zones": {
+   "post": {
+    "operationId": "zones/create",
+    "summary": "Create a zone.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the zone."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "zones/list",
+    "summary": "List zones.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/zones/{id}": {
+   "get": {
+    "operationId": "zones/get",
+    "summary": "Get a zone by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The zone id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/clusters": {
+   "post": {
+    "operationId": "clusters/create",
+    "summary": "Create a cluster.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the cluster."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "clusters/list",
+    "summary": "List clusters.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/clusters/{id}": {
+   "get": {
+    "operationId": "clusters/get",
+    "summary": "Get a cluster by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The cluster id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/nodes": {
+   "post": {
+    "operationId": "nodes/create",
+    "summary": "Create a node.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the node."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "nodes/list",
+    "summary": "List nodes.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/nodes/{id}": {
+   "get": {
+    "operationId": "nodes/get",
+    "summary": "Get a node by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The node id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/volumes": {
+   "post": {
+    "operationId": "volumes/create",
+    "summary": "Create a volume.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the volume."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "volumes/list",
+    "summary": "List volumes.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/volumes/{id}": {
+   "get": {
+    "operationId": "volumes/get",
+    "summary": "Get a volume by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The volume id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/snapshots": {
+   "post": {
+    "operationId": "snapshots/create",
+    "summary": "Create a snapshot.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the snapshot."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "snapshots/list",
+    "summary": "List snapshots.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/snapshots/{id}": {
+   "get": {
+    "operationId": "snapshots/get",
+    "summary": "Get a snapshot by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The snapshot id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/images": {
+   "post": {
+    "operationId": "images/create",
+    "summary": "Create a image.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the image."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "images/list",
+    "summary": "List images.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/images/{id}": {
+   "get": {
+    "operationId": "images/get",
+    "summary": "Get a image by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The image id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/networks": {
+   "post": {
+    "operationId": "networks/create",
+    "summary": "Create a network.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the network."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "networks/list",
+    "summary": "List networks.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/networks/{id}": {
+   "get": {
+    "operationId": "networks/get",
+    "summary": "Get a network by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The network id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/routes": {
+   "post": {
+    "operationId": "routes/create",
+    "summary": "Create a route.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the route."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "routes/list",
+    "summary": "List routes.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/routes/{id}": {
+   "get": {
+    "operationId": "routes/get",
+    "summary": "Get a route by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The route id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/policies": {
+   "post": {
+    "operationId": "policies/create",
+    "summary": "Create a policie.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the policie."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "policies/list",
+    "summary": "List policies.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/policies/{id}": {
+   "get": {
+    "operationId": "policies/get",
+    "summary": "Get a policie by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The policie id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/secrets": {
+   "post": {
+    "operationId": "secrets/create",
+    "summary": "Create a secret.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the secret."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "secrets/list",
+    "summary": "List secrets.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/secrets/{id}": {
+   "get": {
+    "operationId": "secrets/get",
+    "summary": "Get a secret by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The secret id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/configs": {
+   "post": {
+    "operationId": "configs/create",
+    "summary": "Create a config.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the config."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "configs/list",
+    "summary": "List configs.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/configs/{id}": {
+   "get": {
+    "operationId": "configs/get",
+    "summary": "Get a config by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The config id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/events": {
+   "post": {
+    "operationId": "events/create",
+    "summary": "Create a event.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the event."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "events/list",
+    "summary": "List events.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/events/{id}": {
+   "get": {
+    "operationId": "events/get",
+    "summary": "Get a event by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The event id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  },
+  "/logs": {
+   "post": {
+    "operationId": "logs/create",
+    "summary": "Create a log.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "Name of the log."
+         },
+         "description": {
+          "type": "string",
+          "description": "Free-text description."
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "active",
+           "paused",
+           "archived"
+          ],
+          "description": "Lifecycle status."
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "Labels."
+         },
+         "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata."
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created"
+     }
+    }
+   },
+   "get": {
+    "operationId": "logs/list",
+    "summary": "List logs.",
+    "parameters": [
+     {
+      "name": "cursor",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Page cursor."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      },
+      "description": "Page size."
+     },
+     {
+      "name": "status",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      },
+      "description": "Filter by status."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "A page."
+     }
+    }
+   }
+  },
+  "/logs/{id}": {
+   "get": {
+    "operationId": "logs/get",
+    "summary": "Get a log by id.",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "The log id."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The object."
+     }
+    }
+   }
+  }
+ }
+}

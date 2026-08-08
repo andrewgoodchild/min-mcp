@@ -1,0 +1,13 @@
+# Mount GitHub's OpenAPI spec directly as an upstream (pure-Rust converter).
+# JSON bodies (unlike Stripe's form encoding), bearer + GitHub media type.
+# Secret from env (GITHUB_PAT); base_url + accept in config, no keys.
+mode: three_tool
+upstreams:
+  - name: github
+    spec: ./github.json
+    base_url: https://api.github.com
+    auth_env: GITHUB_PAT
+    accept: application/vnd.github+json
+error_hints:
+  - contains: '"status": 4'
+    hint: "GitHub rejected the request (4xx). Check the path, required path parameters (owner/repo), and that you used the right operation via get_tool_details."
