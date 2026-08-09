@@ -13,6 +13,14 @@ use crate::http_upstream::HttpUpstream;
 use crate::spec::Spec;
 use crate::upstream::{McpRpc, ToolDef, Upstream};
 
+// `Mcp` is about twice the size of the next variant *on Windows only*, where the
+// process handles inside `Upstream` (`Child`, `ChildStdin`, the buffered stdout
+// reader) are wider than their Unix fd equivalents — so this lint fires there and
+// nowhere else. Boxing would trade a startup-time byte count for an indirection on
+// every upstream call, and the lint's actual concern doesn't apply: these live in
+// `Surface.upstreams: Vec<Backend>`, one per configured upstream, moved exactly
+// once at build time and only borrowed afterwards.
+#[allow(clippy::large_enum_variant)]
 pub enum Backend {
     Mcp(Upstream),
     Http(HttpUpstream),
