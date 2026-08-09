@@ -27,7 +27,13 @@ cargo test --release
 ```
 
 The test suite is offline and credential-free: bundled OpenAPI specs plus
-scriptable POSIX-sh MCP servers under `tests/fixtures/`. Suites:
+scriptable POSIX-sh MCP servers under `tests/fixtures/`. The one thing there that
+looks alarming is `rs256-test-key.pem` — a throwaway RSA keypair for the
+RS256/JWKS tests, which have to produce real signatures to assert that invalid
+ones are rejected. It authenticates to nothing, is `cfg(test)`-only so it never
+reaches a released binary, and is the single path listed in
+`.github/secret_scanning.yml`. Don't reuse it for anything, and don't add other
+keys beside it. Suites:
 
 | suite | what it covers |
 |---|---|

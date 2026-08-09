@@ -112,35 +112,14 @@ mod tests {
 
     const SECRET: &str = "test-secret";
 
-    // Test RSA keypair (generated offline, used ONLY in tests).
-    const PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDdLS4EHMXHyd0W
-OSz9XthnmnfXu+E1GCYaQTaMZFz8TK8iVgIl6uI8UEvmg1t9FhUKcS0qq5Pj0ywD
-G5Fy6HtKAzvx+7C/eEhMt03VVONVSt0JQBu5gIr23Rfk6IZaLPJ5MUZaQFVUUqzU
-rfJ6/SQluifUmii5uSss+XmcKi7junfmxLaAf5vD6VyugAxO7bYf0aQBV6L2D1G4
-OejJunafa7dWgJDleb6LIpjCPyJf78cw34EPX1wLpHFiAjDHBSKhCHje/7BjO2kN
-UHERuQpjgQeT68wiAlRhT+l0mEH+sNJ0BaFG/C+NmkE3Zd5KT1p7uRqrwyXRausC
-pGj/i7qXAgMBAAECggEAXqdqLQpfPixOuKcJcPl5JYV+yk22iLFoBQ5pmNWO0c7D
-mK80RiPqZCN9CA6pRbQAlzJuQPei1/pUuJPAwGtr7/XIXrv3HUoNrv83iRfGHodm
-ZwIPm2i+j/14r1cvwEHCF0mWMSOdIPQs0OwMfMP/B0JOr3a1/R2Ys6ukdse6v2wO
-97MuOSbHk9/M3P++dpgi0bIzF/0bDDw2S58JBAm2w568ULbq6M5tNajHp5L7XCo9
-MPTweEl7JOhqxyTTbfU8xMoq5nJ5fJSwE1ioGkUyLVWPsJtETXeP8vO34+uTaylW
-JIGNTaoFEZbvbWYB28NIE9PupUFXlUGt8DXNQjr7uQKBgQD3WKc9R6mm3Gjdoo7U
-E3aKCojxPcLOKBFiIWYAQeS8LVWr0WZOIrnbf5oiy8EGSO7JJfyZpxZ6rgQen0qo
-auVKeBITq2qTk6A2PD84XjatT2gFPgA4FweSkPapDiKlvwNauKU/gfwryTDTy/Le
-tRWCMEhV6upK9BOKg1lQo4hYdQKBgQDk6iM5fZNBThCKUixQ9KhiVGHpFIpxnNQi
-1SpzJlryTZlKWYs6AoxHl9whSuhKe9k6xCfnenLtTQ3+Vbzd9bnBYJ9uVSHCZKFD
-J5bx5krILRmz3VrhWwUmSPsvQxOrNg82MppoSzMDQCKyr4AKDeZbVnUU4do1EQvh
-ncpyh7IFWwKBgA9r0ZF6hFNI7qjS18DVLdDRc1RHG3wq91p85pUhhpdM5EiAF7bL
-Z3cN75g3x+MSbQDRg3w49KfVbaBTIh55+6226rmbOFvXGmgHPZHQHeyURNH+2Zil
-pu02aIqFvRdEX3sqg/L/sa8xLgAmeQ/1jk+9nuTsbosZyJYcNldWust5AoGAdct2
-LNNNv0EoicUXQOFk9JRvfb0wMJ5/Gx2OJosKKb18sCG73zIIdZ7Ti948AngQpIjj
-79223h3UoZgFBEK6P6Q05lWwdZPK1/+7UOcsfC2ZGFFDvstTrwvHFd7ydBvxX/ZS
-NnDb40RRlplwzbuxWjb3MLO30a7f6k2EK8Nf/BkCgYBXl5uZfcNUDCNwyZgtbeBL
-yawh7tZvKm8XUhOq5dqoeiJQ2wJEvYS0cfkbGYn5ldpxFsAhCitS4ioUP+JaEZnY
-T60JG69EFcKl1CErImjRlA8w8SsBbG3owqvxFunDZedbn5QsL8vgWWNL4DIsoe7h
-LeW9Rjd1ytKAew5bPDZVAQ==
------END PRIVATE KEY-----";
+    // A throwaway RSA keypair, generated for these tests and used nowhere else.
+    // RS256/JWKS verification can only be tested by producing real signatures —
+    // including the invalid ones (`rs256_rejects_a_forged_signature`) — so the tests
+    // mint tokens on demand rather than carry pre-signed ones. Kept in a fixture file
+    // so its status is obvious from the filename, and so secret scanning can be
+    // excluded for that one path instead of for all of auth.rs. Test-only: `cfg(test)`
+    // means it is not in the shipped binary.
+    const PRIV_PEM: &str = include_str!("../tests/fixtures/rs256-test-key.pem");
     const PUB_PEM: &str = "-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3S0uBBzFx8ndFjks/V7Y
 Z5p317vhNRgmGkE2jGRc/EyvIlYCJeriPFBL5oNbfRYVCnEtKquT49MsAxuRcuh7
