@@ -38,9 +38,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
 
-      # Don't publish from a tree that wouldn't pass CI.
+      # Don't publish from a tree that wouldn't pass CI — on any platform we
+      # publish for, Windows included.
       - name: Gate (clippy + tests)
-        if: runner.os != 'Windows'
         run: |
           cargo clippy --release --all-targets -- -D warnings
           cargo test --release

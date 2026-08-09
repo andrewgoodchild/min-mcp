@@ -9,15 +9,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Blocking: the build must compile, lint clean, and pass every test — on both
-  # platforms most contributors and CI runners use.
+  # Blocking on every platform we publish a binary for. Windows runs fewer tests
+  # — the fixtures needing /bin/sh or curl are `cfg(unix)`-gated and skip — but
+  # it is gated the same way, because release.yml ships a Windows binary and must
+  # never publish one from a tree nothing checked.
   rust:
     name: build · clippy · test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,19 +30,6 @@ jobs:
         run: cargo clippy --release --all-targets -- -D warnings
       - name: Test (unit + stdio/HTTP end-to-end + feature coverage)
         run: cargo test --release
-
-  # Informational: Windows. The portable suites should pass; the fixtures that
-  # need /bin/sh or curl are `cfg(unix)`-gated and skip. Non-blocking until a
-  # Windows contributor needs it green.
-  windows:
-    name: build · test (windows, informational)
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release
 
   # Informational: run the external MCP-spec compliance suite against a
   # self-contained min-mcp server (a checked-in mini OpenAPI spec, no network,

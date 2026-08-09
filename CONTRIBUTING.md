@@ -38,8 +38,11 @@ scriptable POSIX-sh MCP servers under `tests/fixtures/`. Suites:
 | `tests/cli_contract.rs` | flags, exit codes, the startup banner |
 | `tests/compression.rs` | the compression claim — this one is a published number, keep it honest |
 
-Tests needing `/bin/sh` or `curl` are `cfg(unix)`-gated. Windows runs the
-portable subset (informational in CI).
+Tests needing `/bin/sh` or `curl` are `cfg(unix)`-gated, so Windows runs 17 of
+the 24 end-to-end tests — `http_e2e.rs` skips entirely. All three platforms are
+**blocking** in CI regardless, because `release.yml` publishes a binary for each
+one and none should ship from a tree nothing checked. If you port a fixture to
+Windows, drop its gate.
 
 ## The bar for a change
 
