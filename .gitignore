@@ -20,8 +20,9 @@ demo/
 research/
 planning/
 LABBOOK.md
-docs/plan.md
-docs/pd-thought-piece.md
+# Private drafts still living in docs/. Prefer moving new private material into
+# planning/ or research/ — a per-file rule here silently swallows a legitimate
+# public doc that later takes the same name.
 docs/benchmarks.md
 docs/ROADMAP.md
 examples/stripe-naive-proxy.yaml
