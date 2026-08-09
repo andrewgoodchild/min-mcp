@@ -8,7 +8,7 @@ All notable changes to min-mcp. Format loosely follows
 
 Nothing yet.
 
-## [0.1.0] — unreleased
+## [0.1.0] — 2026-08-09
 
 First public version. A minifying proxy for MCP servers and OpenAPI specs:
 your agent sees three tools instead of every upstream's catalog, and you can
