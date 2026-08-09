@@ -15,13 +15,22 @@ to over stdio or HTTP. Every command below runs from the repo root; if you'd
 rather type `minmcp` than `./target/release/minmcp`, install it on your PATH
 with `cargo install --path .`.
 
-**Platforms.** Linux, macOS, and Windows are all built and gated in CI. Be aware
-that the test coverage behind them is not equal: 7 of the 24 end-to-end tests use
-a POSIX shell script or `curl` as their fixture, so they are `cfg(unix)`-gated and
-skip on Windows — including the whole Streamable HTTP suite. The Windows binary
-compiles, lints clean, and passes the other 17, but its HTTP transport has no
-end-to-end coverage on that platform. If you run min-mcp over HTTP on Windows,
-you are the first — please file what you find.
+**Platforms.** Linux, macOS, and Windows are all built and gated in CI, and
+`cargo build --release` works on any of them. Two things are worth knowing before
+you rely on a platform.
+
+Prebuilt release binaries cover Linux (`x86_64`, `aarch64`), Apple Silicon macOS,
+and Windows (`x86_64`) — but **not Intel macOS**. GitHub retired the last hosted
+runner that could execute Intel macOS builds, so shipping that binary would mean
+publishing one nothing had ever run. Intel Mac users build from source with the
+command above; it is a supported configuration, just not a prebuilt one.
+
+The test coverage behind the platforms is also not equal: 7 of the 24 end-to-end
+tests use a POSIX shell script or `curl` as their fixture, so they are
+`cfg(unix)`-gated and skip on Windows — including the whole Streamable HTTP
+suite. The Windows binary compiles, lints clean, and passes the other 17, but its
+HTTP transport has no end-to-end coverage on that platform. If you run min-mcp
+over HTTP on Windows, you are the first — please file what you find.
 
 ## 1. See it work — no network, no credentials
 
