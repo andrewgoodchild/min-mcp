@@ -19,8 +19,10 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
+    GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::io::stdio;
@@ -45,7 +47,8 @@ impl MinMcpServer {
 impl ServerHandler for MinMcpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities =
+            ServerCapabilities::builder().enable_tools().enable_resources().enable_prompts().build();
         info.server_info = Implementation::new("min-mcp", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(
             "Minified MCP surface. Use search_tools to find a tool, get_tool_details for its \
@@ -53,6 +56,62 @@ impl ServerHandler for MinMcpServer {
                 .to_string(),
         );
         info
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let v = self.surface.lock().await.list_resources().await;
+        // Per-entry tolerant, like list_tools below: one malformed upstream
+        // entry (missing `name`, wrong-typed field) must drop THAT entry, not
+        // fail the whole merged listing (min-mcp's own resource included).
+        Ok(ListResourcesResult::with_all_items(collect_valid(&v, "resources")))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let v = self
+            .surface
+            .lock()
+            .await
+            .read_resource(&request.uri)
+            .await
+            .map_err(|e| ErrorData::resource_not_found(e.to_string(), None))?;
+        let result: ReadResourceResult = serde_json::from_value(v)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(result.into())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        let v = self.surface.lock().await.list_prompts().await;
+        Ok(ListPromptsResult::with_all_items(collect_valid(&v, "prompts")))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
+        let v = self
+            .surface
+            .lock()
+            .await
+            .get_prompt(&request.name, args)
+            .await
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let result: GetPromptResult = serde_json::from_value(v)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(result.into())
     }
 
     async fn list_tools(
@@ -86,6 +145,28 @@ impl ServerHandler for MinMcpServer {
         let result = result.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(value_to_call_result(&result).into())
     }
+}
+
+/// Deserialize each entry of `listing[key]` individually, dropping (and
+/// logging) the ones that don't fit rmcp's typed model — a Vec deserialization
+/// is atomic, and one non-compliant upstream entry must not empty the merge.
+fn collect_valid<T: serde::de::DeserializeOwned>(listing: &Value, key: &str) -> Vec<T> {
+    listing
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| match serde_json::from_value::<T>(e.clone()) {
+                    Ok(v) => Some(v),
+                    Err(err) => {
+                        crate::log_warn!("dropping malformed {key} entry from listing: {err}");
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One `{name, description, inputSchema}` surface tool → rmcp `Tool`.
@@ -130,10 +211,42 @@ pub async fn serve_stdio(surface: Surface) -> Result<()> {
     Ok(())
 }
 
+/// Is this `Origin` header value acceptable for a locally-bound MCP server?
+///
+/// The MCP spec asks HTTP servers to validate `Origin` against DNS-rebinding:
+/// a page on `https://evil.example` can be made to resolve to 127.0.0.1 and
+/// POST to a local server, and the browser will attach its own origin. rmcp
+/// validates the `Host` header; this adds the `Origin` half.
+///
+/// A **missing** Origin is allowed — non-browser clients (agents, curl, the MCP
+/// SDKs) don't send one, and rejecting that would break every normal caller.
+/// A **present** Origin must be loopback, which is the only origin a browser
+/// could legitimately have for a localhost-bound server.
+pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    let origin = origin.trim();
+    if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
+        return true; // opaque origin (file://, sandboxed iframe) carries no authority
+    }
+    // Strip scheme, then any :port, then compare the host.
+    let after_scheme = origin.split_once("://").map(|(_, rest)| rest).unwrap_or(origin);
+    let host = after_scheme.split('/').next().unwrap_or("");
+    let host = match host.rsplit_once(':') {
+        // don't cut inside a bare IPv6 literal ("[::1]" has no port)
+        Some((h, _)) if !h.ends_with(']') || h.contains(']') => h,
+        _ => host,
+    };
+    matches!(
+        host.trim_end_matches('.'),
+        "localhost" | "127.0.0.1" | "[::1]" | "::1" | "[0:0:0:0:0:0:0:1]"
+    )
+}
+
 /// Serve the minified surface over Streamable HTTP using rmcp's
 /// `StreamableHttpService` (JSON-RPC over POST, SSE for streamed replies,
 /// session ids, Host-header validation for DNS-rebinding defence), driven on a
-/// TCP listener by hyper. One shared `Surface` backs every session (the
+/// TCP listener by hyper, with an added `Origin` check (see
+/// [`origin_allowed`]). One shared `Surface` backs every session (the
 /// per-session factory just clones the handle).
 pub async fn serve_http(surface: Surface, addr: &str) -> Result<()> {
     use anyhow::Context;
@@ -158,10 +271,65 @@ pub async fn serve_http(surface: Surface, addr: &str) -> Result<()> {
     loop {
         let (tcp, _peer) = listener.accept().await.context("accepting connection")?;
         let io = TokioIo::new(tcp);
-        let hyper_service = TowerToHyperService::new(service.clone());
-        // One task per connection; a slow request never blocks the accept loop.
-        tokio::spawn(async move {
-            let _ = http1::Builder::new().serve_connection(io, hyper_service).await;
+        let inner = TowerToHyperService::new(service.clone());
+        // Gate on Origin before the request reaches the MCP service, then hand
+        // it off untouched. One task per connection; a slow request never
+        // blocks the accept loop.
+        let guarded = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let inner = inner.clone();
+            async move {
+                let origin =
+                    req.headers().get(hyper::header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_string);
+                if !origin_allowed(origin.as_deref()) {
+                    crate::log_warn!(
+                        "refused an HTTP request from Origin {:?} (DNS-rebinding defence)",
+                        origin.unwrap_or_default()
+                    );
+                    let body = http_body_util::BodyExt::boxed(http_body_util::Full::new(
+                        bytes::Bytes::from_static(b"forbidden: Origin not allowed"),
+                    ));
+                    let mut res = hyper::Response::new(body);
+                    *res.status_mut() = hyper::StatusCode::FORBIDDEN;
+                    return Ok(res);
+                }
+                hyper::service::Service::call(&inner, req).await
+            }
         });
+        tokio::spawn(async move {
+            let _ = http1::Builder::new().serve_connection(io, guarded).await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_allowed;
+
+    #[test]
+    fn origin_allows_absent_and_loopback_only() {
+        // absent / opaque: normal non-browser clients, and sandboxed pages
+        assert!(origin_allowed(None));
+        assert!(origin_allowed(Some("")));
+        assert!(origin_allowed(Some("null")));
+        // loopback in its various spellings, with and without ports
+        for ok in [
+            "http://localhost",
+            "http://localhost:8080",
+            "https://127.0.0.1:3000",
+            "http://[::1]:9000",
+            "http://localhost.",
+        ] {
+            assert!(origin_allowed(Some(ok)), "should allow {ok}");
+        }
+        // anything else is a rebinding candidate
+        for bad in [
+            "https://evil.example",
+            "http://evil.example:80",
+            "https://localhost.evil.example",
+            "http://169.254.169.254",
+            "https://sub.localhost.attacker.com",
+        ] {
+            assert!(!origin_allowed(Some(bad)), "should refuse {bad}");
+        }
     }
 }

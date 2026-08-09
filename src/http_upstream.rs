@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::config::{expand_env, UpstreamConfig};
 use crate::oauth::OAuthClient;
-use crate::upstream::{push_tools_page, ToolDef, PROTOCOL_VERSION};
+use crate::upstream::{TimeoutElapsed, PROTOCOL_VERSION};
 
 /// Per-request ceiling, matching the stdio client's REQUEST_TIMEOUT. Without it
 /// a slow or stream-holding remote MCP server would stall min-mcp forever:
@@ -21,6 +21,9 @@ const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub struct HttpUpstream {
     pub name: String,
+    /// How this upstream's tool results are serialized to the agent (`json` =
+    /// compact re-encode of JSON text blocks; `raw` = byte-for-byte).
+    pub result_format: crate::config::ResultFormat,
     client: reqwest::Client,
     url: String,
     /// Static auth headers (values with `${VAR}` expanded from the environment).
@@ -50,6 +53,7 @@ impl HttpUpstream {
             .context("building HTTP client for upstream")?;
         let mut up = HttpUpstream {
             name: cfg.name.clone(),
+            result_format: cfg.result_format,
             client,
             url,
             headers,
@@ -98,6 +102,19 @@ impl HttpUpstream {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_deadline(method, params, None).await
+    }
+
+    /// `deadline` (overlay `timeout_s`) is applied per-request via reqwest; on
+    /// expiry the Err carries a typed [`TimeoutElapsed`] so dispatch renders an
+    /// agent-facing timeout instead of a protocol error. HTTP cancellation is
+    /// frame-safe (one request per exchange, no shared stream).
+    async fn request_deadline(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
         let bearer = self.bearer().await?;
@@ -105,10 +122,20 @@ impl HttpUpstream {
         if let Some(b) = bearer {
             rb = rb.bearer_auth(b);
         }
-        let resp = rb
-            .send()
-            .await
-            .with_context(|| format!("POST {method} to {}", self.url))?;
+        if let Some(d) = deadline {
+            rb = rb.timeout(d);
+        }
+        let resp = match rb.send().await {
+            Ok(r) => r,
+            Err(e) if deadline.is_some() && e.is_timeout() => {
+                return Err(anyhow::Error::new(TimeoutElapsed {
+                    secs: deadline.unwrap_or_default().as_secs(),
+                }));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("POST {method} to {}", self.url));
+            }
+        };
         // capture the session id assigned at initialize
         if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
             self.session_id = Some(sid.to_string());
@@ -151,27 +178,6 @@ impl HttpUpstream {
             bail!("upstream {} rejected notification {method}: HTTP {}", self.name, resp.status());
         }
         Ok(())
-    }
-
-    pub async fn list_tools(&mut self, upstream_idx: usize) -> Result<Vec<ToolDef>> {
-        let mut tools = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let params = match &cursor {
-                Some(c) => json!({"cursor": c}),
-                None => json!({}),
-            };
-            let result = self.request("tools/list", params).await?;
-            cursor = push_tools_page(&result, &self.name, upstream_idx, &mut tools);
-            if cursor.is_none() {
-                break;
-            }
-        }
-        Ok(tools)
-    }
-
-    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        self.request("tools/call", json!({"name": name, "arguments": arguments})).await
     }
 }
 
@@ -217,6 +223,21 @@ fn frame_match(data: &str, want: &Value, fallback: &mut Option<Value>) -> Option
         *fallback = Some(v);
     }
     None
+}
+
+impl crate::upstream::McpRpc for HttpUpstream {
+    fn rpc_name(&self) -> &str {
+        &self.name
+    }
+
+    async fn rpc(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<Value> {
+        self.request_deadline(method, params, deadline).await
+    }
 }
 
 #[cfg(test)]

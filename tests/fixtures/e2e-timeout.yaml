@@ -1,0 +1,11 @@
+# E2E fixture: a per-tool timeout on an upstream that never answers tools/call,
+# with a breaker so repeated timeouts trip it (timeouts count as failures).
+mode: three_tool
+upstreams:
+  - name: slow
+    command: sh
+    args: ["slow-server.sh"]
+overlays:
+  - tool: slow.sleepy
+    timeout_s: 1
+    breaker: { consecutive_failures: 2, cooldown_s: 60 }

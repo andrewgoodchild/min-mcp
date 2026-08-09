@@ -11,8 +11,8 @@ New here? Read [Getting started](getting-started.md), then [Concepts](concepts.m
   MCP server, mount an OpenAPI spec, serve over stdio or HTTP.
 
 ## Concepts
-- **[Concepts](concepts.md)** — the "minifier" model, the two surface modes
-  (`three_tool` / `passthrough`), the source map, and the verification-first ethos.
+- **[Concepts](concepts.md)** — the "minifier" model, the three-tool surface,
+  response projection, the source map, and the verification-first ethos.
 
 ## Configuration & usage
 - **[Configuration reference](configuration.md)** — every YAML key: upstreams
@@ -25,3 +25,14 @@ New here? Read [Getting started](getting-started.md), then [Concepts](concepts.m
   remote MCP upstreams, outbound OAuth, JWT-derived caller scopes, security.
 - **[CLI reference](cli.md)** — `serve`, `inspect`, `map`, `verify`, `lint`,
   `search`, `help`, `call`, and their flags.
+
+## Evidence
+- **[Measurements](measurements.md)** — every published number, how to reproduce
+  the ones that are reproducible, and an explicit list of what *isn't* measured.
+
+## Background — the landscape, measured
+- **[About mcp-compressor](about-mcp-compressor.md)** — the closest peer to
+  min-mcp (same deferred-schema architecture, a listing instead of search):
+  what it is, and what a same-upstream head-to-head measured.
+- **[About TOON](about-toon.md)** — the token-oriented serialization format,
+  worked examples, four evaluations, and why min-mcp doesn't emit it.

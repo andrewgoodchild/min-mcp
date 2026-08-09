@@ -17,7 +17,8 @@ overlays: [ ... ]         # patch/reshape tools you don't own — see overlays.m
 workflows: [ ... ]        # composite multi-step tools — see composites.md
 binding_policy: warn      # warn (default) | strict — how broken overlays behave
 error_hints: [ ... ]      # fleet-wide error→recovery hints (all tools)
-preflight: false          # validate calls against the patched schema locally (opt-in)
+preflight: true           # validate calls against the patched schema locally (default ON)
+read_cache_ttl_s: 0       # TTL cache for read-only tools' results (0 = off)
 log_file: events.ndjson   # optional NDJSON audit log of search/details/call
 ```
 
@@ -28,12 +29,13 @@ log_file: events.ndjson   # optional NDJSON audit log of search/details/call
 | `filters` | Static allow/deny of tools, for everyone. See [Filters](#filters). |
 | `scopes` | Per-caller visibility, keyed off JWT scopes. See [Transports & auth](transports-and-auth.md). |
 | `auth` | How caller JWTs are validated. See [Transports & auth](transports-and-auth.md). |
-| `overlays` | Per-tool fixes for a server you don't own: patch descriptions, the input schema (`fields`: required/example/enum/hide/`user_supplied`), errors (`error_hints` + `retryable` + structured `field`), responses, request `defaults`/`headers` (with `{{uuid}}`/`{{hash}}` generators), `aliases`, `paginate`, and `verify` checks. See [Overlays](overlays.md). |
+| `overlays` | Per-tool fixes for a server you don't own: patch descriptions, the input schema (`fields`: required/example/enum/hide/`user_supplied`), errors (`error_hints` + `retryable` + structured `field`), responses, request `defaults`/`headers` (with `{{uuid}}`/`{{hash}}` generators), `aliases`, `paginate`, `verify` checks, and per-tool guards — `timeout_s` (call deadline) and `breaker` (circuit breaker on consecutive failures). See [Overlays](overlays.md). |
 | `workflows` | Composite tools. See [Composites](composites.md). |
 | `binding_policy` | Default reaction when an overlay no longer matches the live schema: `warn` (serve, skip broken parts) or `strict` (refuse to start). Overridable per overlay. |
 | `error_hints` | Recovery instructions appended to any tool result whose text contains a substring. Per-tool overlay hints stack on top. A hint with a `field:` pointer renders a machine-shaped error from the patched schema. |
-| `preflight` | Opt-in. Validate each call against its (patched) input schema *before* the upstream call — a missing-required or out-of-enum value returns a structured error locally, with no round-trip. Makes the patched schema authoritative. |
-| `log_file` | If set, one NDJSON line per search/details/call — what the agent searched, selected, and called, and its origin. |
+| `preflight` | **On by default.** Validate each call against its (patched) input schema *before* the upstream call — a missing-required or out-of-enum value returns a structured error locally, with no round-trip. Makes the patched schema authoritative; where a spec over-declares `required`, disable per tool with an overlay's `preflight: false` (or globally here). |
+| `read_cache_ttl_s` | TTL (seconds) for caching results of **read-only** tools keyed by (tool, arguments): spec `GET` operations, MCP tools with `annotations.readOnlyHint`, or overlay `cacheable: true`. `0` (default) disables. Cached values are the raw pre-shaping result — each hit still gets this call's overlays and `fields` projection. Errors are never cached. |
+| `log_file` | If set, one NDJSON line per search/details/call — what the agent searched, selected, and called, its origin, and whether it was served from cache. |
 
 ## Upstreams
 
@@ -49,7 +51,14 @@ upstreams:
     args: ["-y", "@some/mcp-server"]
     env: { LOG_LEVEL: debug }           # optional literal env vars set on the child
     # cwd: ./subdir                      # optional; defaults to the config's dir
+    # result_format: json                # json (default): re-encode JSON text results
+    #                                    # compactly; raw: pass through byte-for-byte
 ```
+
+Upstream **prompts and resources pass through** under the same object model as
+tools: prompt names are namespaced `upstream.name`, an upstream hidden by
+filters/scopes is invisible through these side doors too, and min-mcp adds its
+own `minmcp://tools` resource — the [source map](cli.md) over the protocol.
 
 ### b) Remote MCP server over Streamable HTTP
 

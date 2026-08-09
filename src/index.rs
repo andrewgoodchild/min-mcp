@@ -15,6 +15,12 @@ const B: f64 = 0.4;
 const USAGE_DAMP: f64 = 0.15;
 /// Multiplier when a query verb's affinity token appears in the tool id.
 const VERB_BOOST: f64 = 1.3;
+/// Multiplier when the whole normalized query is a substring of the normalized
+/// tool id — "post customers" → PostCustomers. A near-exact name reference
+/// should beat sibling tools that merely share resource words. (Query-rewrite
+/// stage: measured candidates live in search_recall.md; this is the cheap,
+/// deterministic slice of it.)
+const EXACT_SUBSTRING_BOOST: f64 = 1.5;
 /// Weighted first-line-of-description cap, mirroring the Python summary field.
 const SUMMARY_CAP: usize = 200;
 
@@ -35,6 +41,12 @@ const VERB_AFFINITY: &[(&[&str], &[&str])] = &[
     (&["delete", "remove", "cancel", "destroy"], &["delete", "remove", "cancel", "destroy"]),
     (&["list", "get", "find", "search", "show", "retrieve"], &["list", "get", "find", "search", "show", "retrieve"]),
 ];
+
+/// Lowercase alphanumerics only — the ONE normal form shared by the search
+/// exact-substring boost and the near-miss matcher (they must agree).
+pub(crate) fn normalize_id(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
 
 pub fn tokenize(text: &str) -> Vec<String> {
     // camelCase boundaries -> spaces, then split on non-alphanumerics
@@ -74,6 +86,8 @@ struct Doc {
     /// deduped id token set, for verb-affinity matching (distinct from `tokens`,
     /// which also holds description words that must NOT trigger the verb boost)
     id_token_set: std::collections::HashSet<String>,
+    /// normalized id (lowercase alphanumerics) for the exact-substring boost
+    norm_id: String,
 }
 
 pub struct Index {
@@ -118,6 +132,7 @@ impl Index {
                 len,
                 id_tokens: id_toks.len() as f64,
                 id_token_set: id_toks.into_iter().collect(),
+                norm_id: normalize_id(tool_id),
             });
         }
         let n = docs.len().max(1) as f64;
@@ -159,6 +174,7 @@ impl Index {
     pub fn search(&self, query: &str, k: usize) -> Vec<(String, f64)> {
         let q_tokens = tokenize(query);
         let desired = Self::desired_id_tokens(&q_tokens);
+        let q_norm = normalize_id(query);
         let mut scored: Vec<(String, f64)> = Vec::new();
         for doc in &self.docs {
             let mut score = 0.0;
@@ -175,6 +191,11 @@ impl Index {
                 // token the query's verb implies (favours write over read etc.)
                 if desired.iter().any(|t| doc.id_token_set.contains(*t)) {
                     score *= VERB_BOOST;
+                }
+                // near-exact name reference: the whole normalized query appears
+                // inside the normalized id ("post customers" → PostCustomers)
+                if q_norm.len() >= 4 && doc.norm_id.contains(&q_norm) {
+                    score *= EXACT_SUBSTRING_BOOST;
                 }
                 let uses = *self.usage.get(&doc.tool_id).unwrap_or(&0) as f64;
                 score *= 1.0 + USAGE_DAMP * (1.0 + uses).ln();
@@ -238,6 +259,15 @@ mod tests {
             "stripe.GetCustomersCustomer",
             "'retrieve' must favour the read sibling"
         );
+    }
+
+    #[test]
+    fn exact_name_reference_beats_sibling_resource_words() {
+        let idx = fixture();
+        // the whole query is a normalized substring of one id — that id must win
+        // over siblings sharing the resource words
+        assert_eq!(idx.search("post customers", 3)[0].0, "stripe.PostCustomers");
+        assert_eq!(idx.search("get customers customer", 4)[0].0, "stripe.GetCustomersCustomer");
     }
 
     #[test]

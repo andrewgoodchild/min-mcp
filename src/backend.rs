@@ -11,7 +11,7 @@ use crate::config::UpstreamConfig;
 use crate::exec::Executor;
 use crate::http_upstream::HttpUpstream;
 use crate::spec::Spec;
-use crate::upstream::{ToolDef, Upstream};
+use crate::upstream::{McpRpc, ToolDef, Upstream};
 
 pub enum Backend {
     Mcp(Upstream),
@@ -39,11 +39,25 @@ impl Backend {
         name: &str,
         args: Value,
         extra_headers: &[(String, String)],
+        deadline: Option<std::time::Duration>,
     ) -> Result<Value> {
+        let mut r = match self {
+            // Spec results compact in exec.rs, where the envelope is built.
+            Backend::Spec(s) => return s.call_tool(name, args, extra_headers, deadline).await,
+            Backend::Mcp(u) => u.call_tool(name, args, deadline).await?,
+            Backend::Http(h) => h.call_tool(name, args, deadline).await?,
+        };
+        if self.result_format() == crate::config::ResultFormat::Json {
+            compact_json_texts(&mut r);
+        }
+        Ok(r)
+    }
+
+    fn result_format(&self) -> crate::config::ResultFormat {
         match self {
-            Backend::Mcp(u) => u.call_tool(name, args).await,
-            Backend::Http(h) => h.call_tool(name, args).await,
-            Backend::Spec(s) => s.call_tool(name, args, extra_headers).await,
+            Backend::Mcp(u) => u.result_format,
+            Backend::Http(h) => h.result_format,
+            Backend::Spec(_) => crate::config::ResultFormat::Json, // unused on that path
         }
     }
 
@@ -71,6 +85,33 @@ impl Backend {
             Backend::Mcp(_) => "mcp",
             Backend::Http(_) => "http",
             Backend::Spec(_) => "spec",
+        }
+    }
+
+    /// Merged passthrough listing of one MCP collection (`resources/list` →
+    /// `resources`, `prompts/list` → `prompts`). Spec upstreams have none; an
+    /// upstream without the capability contributes nothing.
+    pub async fn list_passthrough(&mut self, method: &str, key: &str) -> Vec<Value> {
+        match self {
+            Backend::Mcp(u) => u.list_passthrough(method, key).await,
+            Backend::Http(h) => h.list_passthrough(method, key).await,
+            Backend::Spec(_) => Vec::new(),
+        }
+    }
+
+    pub async fn read_resource(&mut self, uri: &str) -> Result<Value> {
+        match self {
+            Backend::Mcp(u) => u.read_resource(uri).await,
+            Backend::Http(h) => h.read_resource(uri).await,
+            Backend::Spec(_) => anyhow::bail!("spec upstream has no resources"),
+        }
+    }
+
+    pub async fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        match self {
+            Backend::Mcp(u) => u.get_prompt(name, arguments).await,
+            Backend::Http(h) => h.get_prompt(name, arguments).await,
+            Backend::Spec(_) => anyhow::bail!("spec upstream has no prompts"),
         }
     }
 
@@ -133,6 +174,8 @@ impl SpecBackend {
                 // Cheap unresolved schema at load; resolved on demand in
                 // get_tool_details (Backend::resolved_schema) so huge specs load fast.
                 input_schema: self.spec.tool_input_schema_shallow(op),
+                // GET operations are read-only by HTTP semantics → cacheable.
+                read_only: Some(op.method.eq_ignore_ascii_case("get")),
             })
             .collect()
     }
@@ -142,6 +185,7 @@ impl SpecBackend {
         op_id: &str,
         args: Value,
         extra_headers: &[(String, String)],
+        deadline: Option<std::time::Duration>,
     ) -> Result<Value> {
         let Some(op) = self.spec.get(op_id) else {
             return Ok(err_result(format!("unknown operation {op_id:?}")));
@@ -149,7 +193,7 @@ impl SpecBackend {
         let pp = args.get("path_params").cloned().unwrap_or(json!({}));
         let qp = args.get("query_params").cloned().unwrap_or(json!({}));
         let body = args.get("body").cloned().unwrap_or(json!({}));
-        let out = self.executor.execute(&self.spec, op, &pp, &qp, &body, extra_headers).await?;
+        let out = self.executor.execute(&self.spec, op, &pp, &qp, &body, extra_headers, deadline).await?;
         // shape into an MCP tool result; mark isError on HTTP >= 400 or transport error
         let is_error = out.get("error").is_some()
             || out.get("status").and_then(Value::as_u64).map(|s| s >= 400).unwrap_or(false);
@@ -162,4 +206,94 @@ impl SpecBackend {
 
 fn err_result(msg: String) -> Value {
     json!({"content": [{"type": "text", "text": msg}], "isError": true})
+}
+
+/// Re-encode each JSON text block of an MCP tool result as compact JSON — the
+/// free token win `toon.md` measured (~24% on a spacey `json.dumps` payload),
+/// previously applied only on the spec path. Non-JSON text is left untouched.
+///
+/// The compaction is LEXICAL (strip insignificant whitespace outside strings),
+/// not a parse→serialize round-trip: number literals, key order, and escapes
+/// pass through byte-for-byte, so a 128-bit integer or 20-digit decimal can
+/// never be silently rewritten through f64. Validity is still checked by a
+/// real parse first (into `IgnoredAny` — no tree built).
+fn compact_json_texts(result: &mut Value) {
+    let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for block in blocks {
+        let Some(text) = block.get("text").and_then(Value::as_str) else { continue };
+        if serde_json::from_str::<serde::de::IgnoredAny>(text).is_err() {
+            continue; // not JSON — leave as-is
+        }
+        let compact = strip_json_whitespace(text);
+        // Only replace when it actually shrinks.
+        if compact.len() < text.len() {
+            if let Some(obj) = block.as_object_mut() {
+                obj.insert("text".into(), Value::String(compact));
+            }
+        }
+    }
+}
+
+/// Remove whitespace outside string literals from KNOWN-VALID JSON text.
+/// Purely lexical: every non-whitespace byte (including all number literals and
+/// escape sequences) is copied verbatim.
+fn strip_json_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if !c.is_ascii_whitespace() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_json_texts_shrinks_spacey_json_and_leaves_prose() {
+        let mut r = json!({"content": [
+            {"type": "text", "text": "{ \"a\": [ 1, 2 ],  \"b\": \"x\" }"},
+            {"type": "text", "text": "plain prose, untouched"}
+        ], "isError": false});
+        compact_json_texts(&mut r);
+        assert_eq!(r["content"][0]["text"], json!("{\"a\":[1,2],\"b\":\"x\"}"));
+        assert_eq!(r["content"][1]["text"], json!("plain prose, untouched"));
+    }
+
+    #[test]
+    fn compaction_is_lexical_and_never_rewrites_numbers() {
+        // 128-bit integer and >17-significant-digit decimal: a Value round-trip
+        // would push both through f64 and corrupt them; lexical compaction must
+        // copy the literals byte-for-byte.
+        let big = "{ \"id\": 340282366920938463463374607431768211455, \"rate\": 0.12345678901234567890123 }";
+        let mut r = json!({"content": [{"type": "text", "text": big}], "isError": false});
+        compact_json_texts(&mut r);
+        assert_eq!(
+            r["content"][0]["text"],
+            json!("{\"id\":340282366920938463463374607431768211455,\"rate\":0.12345678901234567890123}")
+        );
+        // whitespace INSIDE strings (and escapes) survive untouched
+        let s = "{ \"note\": \"two  spaces \\\" and \\\\ stay\" }";
+        let mut r = json!({"content": [{"type": "text", "text": s}], "isError": false});
+        compact_json_texts(&mut r);
+        assert_eq!(r["content"][0]["text"], json!("{\"note\":\"two  spaces \\\" and \\\\ stay\"}"));
+    }
 }

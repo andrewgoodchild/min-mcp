@@ -28,6 +28,10 @@ rmcp = { version = "3", default-features = false, features = [
 # HTTP runtime to drive rmcp's StreamableHttpService (a tower service) on a
 # TCP listener. Both are already in the tree via reqwest/rmcp.
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+# Build the 403 body for the Origin guard in the same shape rmcp's service
+# returns (BoxBody<Bytes, Infallible>). Both are already in the tree via hyper.
+http-body-util = "0.1"
+bytes = "1"
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
 # CSPRNG for request-id generation (UUIDv4). Portable OS entropy (getrandom(2) /
 # SecRandomCopyBytes / RtlGenRandom); already in the tree via rustls.

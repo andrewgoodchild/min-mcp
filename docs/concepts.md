@@ -13,8 +13,9 @@ min-mcp is a *minifier* for tool surfaces. Like a JS minifier, the output is:
 
 The claim ("smaller *and* behaviour-preserving") is falsifiable, and it was
 checked that way — against live APIs, with a benchmark built to falsify it, not
-just asserted. (The harness is developed privately; the reported results and the
-shipped `minmcp verify` are what the repo carries.)
+just asserted. The compression half is reproducible here and asserted in CI
+(`./bench/compression.sh`, and `tests/compression.rs`); the shipped
+`minmcp verify` is the same discipline applied to your own overlays.
 
 ## The problem it solves
 
@@ -33,7 +34,7 @@ what it needs.
 Context bloat has two sources, and min-mcp attacks both:
 
 1. **Tool definitions (input side)** — the catalog the agent must hold before it
-   acts. The [surface modes](#the-two-surface-modes) collapse 587 definitions to 3.
+   acts. The [three-tool surface](#the-surface-three-tools) collapses 587 definitions to 3.
 2. **Tool results (output side)** — a single list endpoint can return tens of KB
    of JSON, most of it fields the agent will never read. That fills context just
    as fast, and no amount of tool-definition minification touches it.
@@ -61,11 +62,7 @@ everything. Two related levers:
 Both run before the response reaches the model, so a large result never bloats the
 context in the first place.
 
-## The two surface modes
-
-Only the two modes that *measured* as a win over the baseline ship:
-
-### `three_tool` (default)
+## The surface: three tools
 
 The agent sees `search_tools` / `get_tool_details` / `call_tool`. It searches for
 the operation it needs, pulls that one schema on demand, and calls it. This is
@@ -77,20 +74,31 @@ tiered disclosure: three declarations regardless of upstream size.
   bias toward shorter/canonical ids (exact-score ties break alphabetically).
   Returns ids + one-line summaries.
 - `get_tool_details(tool_id)` — the full input schema on demand (the source map).
-- `call_tool(tool_id, arguments)` — routes to the owning upstream (MCP server,
-  remote MCP server, or spec-backed HTTP call); applies scope checks and error
-  overlays.
+  Very large schemas degrade in stages (prose-minified → structure-only →
+  depth-pruned with explicit elision counts) so every field *name* survives the
+  display budget — never a blind truncation that hides trailing fields. A
+  mistyped id gets a near-miss suggestion ("did you mean …?").
+- `call_tool(tool_id, arguments, fields?)` — validates against the (patched)
+  schema locally first (preflight, on by default), routes to the owning
+  upstream (MCP server, remote MCP server, or spec-backed HTTP call), applies
+  scope checks and error overlays, and projects the response down to `fields`
+  if given.
 
-### `passthrough`
+Three declarations, whatever the upstreams hold — one server or twenty, 4
+operations or 17,531.
 
-Every upstream tool is declared directly — plain federation, no search step. Use
-it for small surfaces where the agent benefits from seeing everything at once.
-
-> **Removed on purpose.** Two other patterns — `hotset` (a usage-promoted working
-> set) and `pd` (uniform progressive disclosure) — were built, measured, and
-> *removed* because tiering beat them, and `hotset` overfit on held-out tasks.
-> Shipping only what beats the
-> baseline is a design rule, not an accident.
+> **When not to minify.** Three meta-tools have a floor cost of their own
+> (~424 tokens), so below roughly a dozen upstream tools they cost *more* than
+> simply declaring everything. For that case there's `mode: passthrough`, which
+> federates tools directly with no search step. The startup banner tells you
+> when you're in that regime rather than leaving you to guess — a minifier that
+> can't say when not to minify isn't measuring anything. See
+> [Configuration](configuration.md).
+>
+> Two further patterns — `hotset` (a usage-promoted working set) and `pd`
+> (uniform progressive disclosure) — were built, measured, and *removed*
+> because tiering beat them, and `hotset` overfit on held-out tasks. Shipping
+> only what beats the baseline is a design rule, not an accident.
 
 ## What else the surface does
 
@@ -114,10 +122,11 @@ LLM judges. Three levels of it, and where you can check each:
   and offline. Locked in CI ([`tests/compression.rs`](../tests/compression.rs)).
 - **A fix works** — falsify it yourself with **`minmcp verify`**: real calls
   against your own upstream, deterministic assertions.
-- **Agent effectiveness** (task success, error-recovery, anti-fabrication) — success
-  is a state assertion (make the call, then `GET` the object and check it). These
-  ran on a private harness driving a real LLM against real APIs; the numbers are
-  reported, the harness isn't shipped (it needs a model key and spend).
+- **Agent effectiveness** (task success, error-recovery, anti-fabrication) —
+  success is a state assertion: make the call, then `GET` the object and check
+  it. Those runs need a model key and real API spend, so the reported numbers
+  are what this repo carries — with an explicit list of what *isn't* measured in
+  [Measurements](measurements.md).
 
 This is why features that lost their measurement (TOON, `pd`, `hotset`, mined
 composite discovery) were removed rather than kept on vibes.

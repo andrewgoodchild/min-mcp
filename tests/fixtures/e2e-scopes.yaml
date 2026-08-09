@@ -1,0 +1,15 @@
+# Offline fixture for JWT-derived caller scopes. The HS256 secret is a test
+# value; a real deployment reads it from MINMCP_JWT_SECRET.
+mode: three_tool
+upstreams:
+  - name: acme
+    spec: ../../examples/specs/acme-store.json
+    base_url: https://example.invalid
+auth:
+  jwt_secret: "test-secret"
+scopes:
+  rules:
+    - scope: store.read
+      tools: ["acme.widgets/list", "acme.widgets/get"]
+    - scope: store.write
+      tools: ["acme.widgets/create"]

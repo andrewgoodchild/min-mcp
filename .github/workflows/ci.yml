@@ -9,10 +9,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Blocking: the build must compile, lint clean, and pass every test.
+  # Blocking: the build must compile, lint clean, and pass every test — on both
+  # platforms most contributors and CI runners use.
   rust:
-    name: build · clippy · test
-    runs-on: ubuntu-latest
+    name: build · clippy · test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,8 +26,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (deny warnings)
         run: cargo clippy --release --all-targets -- -D warnings
-      - name: Test (unit + HTTP conformance)
+      - name: Test (unit + stdio/HTTP end-to-end + feature coverage)
         run: cargo test --release
+
+  # Informational: Windows. The portable suites should pass; the fixtures that
+  # need /bin/sh or curl are `cfg(unix)`-gated and skip. Non-blocking until a
+  # Windows contributor needs it green.
+  windows:
+    name: build · test (windows, informational)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
 
   # Informational: run the external MCP-spec compliance suite against a
   # self-contained min-mcp server (a checked-in mini OpenAPI spec, no network,

@@ -17,23 +17,37 @@ use crate::spec::{Operation, QueryStyle, Spec};
 // exactly the large responses it's meant for).
 const MAX_RESPONSE_CHARS: usize = 2_000_000;
 
-/// Serialize a raw response body per the configured format, then apply the
-/// safety cap. `Raw` keeps the upstream bytes; `Json` re-serializes the parsed
-/// value as compact JSON (falling back to raw text if the body isn't JSON).
-fn format_body(text: &str, fmt: ResultFormat) -> (String, bool) {
-    let rendered = match fmt {
-        ResultFormat::Raw => text.to_string(),
-        ResultFormat::Json => match serde_json::from_str::<Value>(text) {
-            Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| text.to_string()),
-            Err(_) => text.to_string(), // non-JSON (empty, HTML error) -> passthrough
-        },
-    };
-    // Truncate by CHARACTER count (byte-boundary safe) and report `truncated`
-    // from whether a char actually had to be cut — not from byte length, which
-    // would mislabel a multibyte body that fits in the char budget.
+/// Shape a raw response body per the configured format, then apply the safety
+/// cap. `Raw` keeps the upstream bytes as a string; `Json` embeds the parsed
+/// value AS JSON in the result envelope — `{"status":200,"body":{...}}` — so
+/// the agent never reads a JSON blob escaped inside a string (measured ~15%
+/// token overhead, and it blinded downstream structural transforms). A body
+/// that isn't JSON (empty, HTML error) stays a string either way.
+fn format_body(text: &str, fmt: ResultFormat) -> (Value, bool) {
+    if fmt == ResultFormat::Json {
+        if let Ok(v) = serde_json::from_str::<Value>(text) {
+            // Cap by the compact rendering's char count — same budget the string
+            // path uses. An over-budget body degrades to a truncated string
+            // (truncated JSON can't be embedded as a value).
+            let compact = serde_json::to_string(&v).unwrap_or_else(|_| text.to_string());
+            if compact.chars().count() <= MAX_RESPONSE_CHARS {
+                return (v, false);
+            }
+            let (cut, _) = truncate_chars(&compact);
+            return (Value::String(cut), true);
+        }
+    }
+    let (cut, truncated) = truncate_chars(text);
+    (Value::String(cut), truncated)
+}
+
+/// Truncate by CHARACTER count (byte-boundary safe) and report whether a char
+/// actually had to be cut — not byte length, which would mislabel a multibyte
+/// body that fits in the char budget.
+fn truncate_chars(rendered: &str) -> (String, bool) {
     match rendered.char_indices().nth(MAX_RESPONSE_CHARS) {
         Some((byte_idx, _)) => (rendered[..byte_idx].to_string(), true),
-        None => (rendered, false),
+        None => (rendered.to_string(), false),
     }
 }
 
@@ -159,7 +173,13 @@ impl Executor {
         result_format: ResultFormat,
     ) -> Self {
         Executor {
-            client: reqwest::Client::new(),
+            // Same 120s transport ceiling the MCP clients have — a spec upstream
+            // that accepts the connection but never responds must not wedge the
+            // whole proxy behind the surface mutex (reqwest has NO default).
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             accept,
@@ -168,6 +188,10 @@ impl Executor {
         }
     }
 
+    // One HTTP call's inputs, threaded from dispatch. Grouping them into a
+    // struct would add a type for a single call site without making the call
+    // clearer, so the lint is allowed deliberately.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         spec: &Spec,
@@ -176,6 +200,7 @@ impl Executor {
         query_params: &Value,
         body: &Value,
         extra_headers: &[(String, String)],
+        deadline: Option<std::time::Duration>,
     ) -> Result<Value> {
         // fill {placeholders}. Path param values are agent-controlled, so they
         // are percent-encoded as a single path segment — otherwise a value like
@@ -248,8 +273,20 @@ impl Executor {
             }
         }
 
+        if let Some(d) = deadline {
+            req = req.timeout(d); // overlay timeout_s: tighter than the 120s default
+        }
         let resp = match req.send().await {
             Ok(r) => r,
+            Err(e) if deadline.is_some() && e.is_timeout() => {
+                // Spec-path transport issues surface as error envelopes (not
+                // Err), so the timeout does too — worded for the agent.
+                return Ok(json!({"error": format!(
+                    "TIMEOUT after {}s: {}",
+                    deadline.unwrap_or_default().as_secs(),
+                    crate::upstream::TIMEOUT_GUIDANCE
+                )}));
+            }
             Err(e) => return Ok(json!({"error": format!("transport error: {e}")})),
         };
         let status = resp.status().as_u16();
@@ -368,20 +405,20 @@ mod tests {
     }
 
     #[test]
-    fn format_body_json_compacts() {
+    fn format_body_json_embeds_parsed_value() {
         let raw = "{ \"data\": [ {\"id\": 1} ] }"; // whitespace + valid JSON
-        let (json_out, t) = format_body(raw, ResultFormat::Json);
-        assert_eq!(json_out, "{\"data\":[{\"id\":1}]}"); // compacted
+        let (body, t) = format_body(raw, ResultFormat::Json);
+        assert_eq!(body, json!({"data": [{"id": 1}]})); // real JSON, not an escaped string
         assert!(!t);
     }
 
     #[test]
     fn format_body_raw_and_non_json_pass_through() {
         let (out, _) = format_body("plain text, not json", ResultFormat::Raw);
-        assert_eq!(out, "plain text, not json");
+        assert_eq!(out, json!("plain text, not json"));
         // Json mode falls back to the raw text when the body isn't JSON
         let (out, _) = format_body("<html>500</html>", ResultFormat::Json);
-        assert_eq!(out, "<html>500</html>");
+        assert_eq!(out, json!("<html>500</html>"));
     }
 
     #[test]
@@ -391,12 +428,23 @@ mod tests {
         let fits = "€".repeat(MAX_RESPONSE_CHARS); // 3 bytes each
         let (out, truncated) = format_body(&fits, ResultFormat::Raw);
         assert!(!truncated, "char count within budget must not be flagged truncated");
-        assert_eq!(out.chars().count(), MAX_RESPONSE_CHARS);
+        assert_eq!(out.as_str().unwrap().chars().count(), MAX_RESPONSE_CHARS);
         // One more char and it must truncate, on a char boundary.
         let over = "€".repeat(MAX_RESPONSE_CHARS + 100);
         let (out, truncated) = format_body(&over, ResultFormat::Raw);
         assert!(truncated);
-        assert_eq!(out.chars().count(), MAX_RESPONSE_CHARS);
-        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        let s = out.as_str().unwrap();
+        assert_eq!(s.chars().count(), MAX_RESPONSE_CHARS);
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn format_body_json_over_budget_degrades_to_truncated_string() {
+        // A parseable JSON body larger than the cap can't be embedded whole —
+        // it degrades to a truncated string and flags `truncated`.
+        let big = format!("{{\"blob\":\"{}\"}}", "x".repeat(MAX_RESPONSE_CHARS + 10));
+        let (out, truncated) = format_body(&big, ResultFormat::Json);
+        assert!(truncated);
+        assert!(out.is_string());
     }
 }

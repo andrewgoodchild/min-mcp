@@ -1,6 +1,6 @@
 # min-mcp — minify your MCP servers, and fix them on the way through
 
-![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Language](https://img.shields.io/badge/rust-2021-orange) ![MCP](https://img.shields.io/badge/MCP-2025--06--18-6E56CF)
+[![CI](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml) ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Language](https://img.shields.io/badge/rust-2021-orange) ![MCP](https://img.shields.io/badge/MCP-2025--06--18-6E56CF)
 
 A minifying proxy for [Model Context Protocol](https://modelcontextprotocol.io)
 servers, written in Rust. Point min-mcp at your MCP servers (or straight at an
@@ -9,18 +9,14 @@ catalog in every request, the agent sees a small, searchable, scope-filtered
 surface — with a source map back to every original tool.
 
 ```
-your agent ──► minmcp ──► server A (89 tools)
-   sees            │────► server B (587 tools)
-  3 tools          └────► an OpenAPI spec (1,216 operations)
+your agent ──► minmcp ──► GitHub's MCP server (85 tools)
+   sees            │────► Stripe's OpenAPI spec (587 operations)
+  3 tools          └────► Microsoft Graph's OpenAPI spec (17,531 operations)
 ```
 
 It is a *minifier*, in the JavaScript sense: the output is radically smaller and
 behaviour-preserving, and there's a source map (`get_tool_details`) back to the
-full original. The claim is falsifiable, and we held it to that: the numbers
-below were measured with a benchmark that ran real tasks against real APIs and
-checked the resulting state — no LLM judges. (The benchmark harness is developed
-privately; the reported results and the shipped `minmcp verify` are what this
-repo carries.)
+full original.
 
 ## Why
 
@@ -95,13 +91,12 @@ agent's prompt. → [Overlays](docs/overlays.md)
 
 - **Stop fabrication, structurally.** Beyond documenting a field, `user_supplied`
   strips it from the agent's schema (injected from the session/env, so it can't be
-  invented), and structured errors + opt-in `preflight:` validation hand back
+  invented), and structured errors + default-on `preflight:` validation hand back
   `{field, allowed_values, fix}` — which took a weak agent from **0%→100%** recovery
   on a broken call where prose guidance did nothing. [Overlays](docs/overlays.md)
 - **Detect → verify.** `minmcp lint` flags best-practice smells (thin descriptions,
   undocumented-required params, confusable tools); `minmcp verify` proves a fix with
-  real calls and deterministic assertions — a CI / behavioural-drift gate. Detecting
-  and grading tools is crowded; *fixing a server you don't own and verifying it* isn't.
+  real calls and deterministic assertions — a CI / behavioural-drift gate.
 - **Compose.** A `workflows:` entry runs a fixed multi-step chain as one composite
   tool — a measured composite cut a 3-step task **6.8×** on tokens. [Composites](docs/composites.md)
 - **Minify responses too.** Beyond the `fields` filter, overlays reshape any response
@@ -117,110 +112,83 @@ agent's prompt. → [Overlays](docs/overlays.md)
 
 ## Quickstart
 
-```sh
-cargo build --release
-```
+You need [Rust](https://rustup.rs) (stable) and a clone; there's nothing else to
+install and no service to run:
 
 ```sh
-# a) Proxy an MCP server (edit the config for your server):
+git clone https://github.com/andrewgoodchild/min-mcp && cd min-mcp
+cargo build --release          # ~2 min from cold; binary at ./target/release/minmcp
+```
+
+Everything below runs from the repo root. See it work on the bundled
+120-operation spec — no network, no credentials:
+
+```sh
+./target/release/minmcp inspect --config bench/bigapi.yaml
+# 120 upstream tools → 3 surface tools; ~17,350 tokens of definitions → ~424
+```
+
+Explore that surface without an agent — the CLI mirrors the three tools:
+
+```sh
+./target/release/minmcp search --config bench/bigapi.yaml "create a widget"
+./target/release/minmcp help   --config bench/bigapi.yaml "big.widgets/create"
+```
+
+Or point it at a real public MCP server — GitHub's official one, all toolsets
+enabled (needs Docker and a GitHub token):
+
+```sh
+GITHUB_PERSONAL_ACCESS_TOKEN=ghp_... \
+  ./target/release/minmcp inspect --config examples/github-mcp-server.yaml
+# 85 upstream tools → 3 surface tools; ~20,822 tokens → ~424  (49×)
+```
+
+Then point it at your own upstreams — MCP servers you already run, or a spec:
+
+```sh
+# a) Proxy MCP servers (copy the template and edit it for your server):
 ./target/release/minmcp serve --config examples/proxy-mcp-server.yaml
 
-# b) Or mount an API spec directly — point `spec:` at any OpenAPI file
-#    (e.g. Stripe's from github.com/stripe/openapi), 587 operations → 3 tools:
+# b) Or mount an OpenAPI spec directly — e.g. Stripe's 587 operations → 3 tools.
+#    Download it from github.com/stripe/openapi next to the config as stripe.json:
 STRIPE_TEST_KEY=sk_test_... ./target/release/minmcp inspect --config examples/stripe-from-spec.yaml
-```
-
-Explore the surface without an agent — the CLI mirrors the three tools:
-
-```sh
-minmcp search --config examples/stripe-from-spec.yaml "create a customer"
-minmcp help   --config examples/stripe-from-spec.yaml stripe.PostCustomers
 ```
 
 Full walkthrough → [Getting started](docs/getting-started.md).
 
 ## Proof it works
 
-Measured on a cheap flash-tier model, with tasks verified against live API
-state — no LLM judges. The **compression numbers are reproducible right here**:
-`cargo build --release && ./bench/compression.sh` (deterministic, offline, no
-key), locked in CI. See [`bench/`](bench/).
+The claim ("radically smaller *and* behaviour-preserving") is falsifiable, so it
+gets measured. Headlines:
 
-- **The context tax, measured — and it scales to the extreme.** A naive 2-server
-  stack (Stripe + GitHub, 1,803 tools) is **~687K tokens of tool definitions — it
-  doesn't even fit** a context window; min-mcp collapses it to a flat **372 tokens**
-  (**1,847×**), constant no matter how many servers you add. It even mounts
-  **Microsoft Graph's 17,531 operations** (a 42 MB spec, ~3.26M raw tokens) — loaded,
-  indexed, and searchable in **~1.9s** via lazy schema resolution.
-- **Lossless minification.** Proxying a 587-tool Stripe server, min-mcp reproduces
-  its task-success set *exactly* while collapsing 587 definitions to 3 — **58×
-  fewer tokens** end-to-end — and runs where the raw surface exceeds the provider cap.
-- **The Rust spec converter works on very different APIs.** Stripe **10/10** and
-  GitHub (1,216 ops → 3 tools) **6/6**, with correct nested-body encoding.
-- **Fix a broken server without forking it.** A third of popular MCP servers ship
-  tools with undocumented parameters (agents then invent required values). One
-  overlay turns GitHub's terse `issues/create` into a documented tool — `owner`/
-  `repo`/`title` marked required, errors rewritten into recovery hints — as a
-  drift-checked binding, no fork.
-- **Composites collapse a chain to one call — 6.8× fewer tokens** at equal success.
-- **The harness catches overfits — including our own.** A held-out set reversed an
-  early `hotset` win; `hotset`, `pd`, and TOON were measured, then *removed*.
+- **85 tools → 3** proxying GitHub's official MCP server: ~20,822 tokens of
+  definitions → **~424** (49×). Add more upstreams and the 424 does not move.
+- **A Stripe + GitHub stack (1,803 tools) is ~687K tokens** — it does not fit a
+  context window; min-mcp serves it in ~424.
+- **Behaviour preserved:** proxying a 587-tool Stripe server reproduced its
+  task-success set *exactly* at **58× fewer tokens**, verified against live API
+  state with no LLM judges.
+- **Reproducible right here:** `./bench/compression.sh` (offline, no key),
+  asserted in CI.
+
+Full numbers, reproduction steps, and what is *not* measured →
+[Measurements](docs/measurements.md).
 
 ## Documentation
 
 | | |
 |---|---|
 | [Getting started](docs/getting-started.md) | build, proxy a server, mount a spec, serve |
-| [Concepts](docs/concepts.md) | the minifier model, surface modes, the source map |
+| [Concepts](docs/concepts.md) | the minifier model, the three-tool surface, the source map |
 | [Configuration](docs/configuration.md) | every YAML key, with examples |
 | [Overlays](docs/overlays.md) | patch and reshape tools you don't own |
 | [Composites](docs/composites.md) | multi-step chains as one tool, and their safety |
 | [Transports & auth](docs/transports-and-auth.md) | stdio/HTTP, OAuth, JWT scopes |
 | [CLI reference](docs/cli.md) | every command and flag |
-
-## Status
-
-v0.1: **stdio and Streamable-HTTP transports**, both served by the official MCP
-SDK ([`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)) wrapping min-mcp's
-surface behind its `ServerHandler` — so protocol conformance (version negotiation,
-sessions, SSE, Host-header/DNS-rebinding defence) tracks the SDK, and requests are
-handled concurrently (a health-check `ping` is answered while a slow `tools/call`
-is in flight); **three upstream kinds** — MCP-server subprocess, remote MCP server
-over HTTP, and mounted OpenAPI spec; per-upstream auth headers with `${ENV}`
-expansion and **outbound OAuth**; two surface modes (`three_tool`, `passthrough`).
-**Overlays** now patch descriptions/errors, the **input schema** (`required`/
-example/enum/type/hide/**`user_supplied`** via dotted paths), request `defaults`,
-**per-endpoint `headers`** (static + `${ENV}` + `{{uuid}}`/`{{now}}`/`{{iso8601}}`/
-`{{hash}}` generators), **auto-pagination**, `retryable` error tags, **structured
-errors** (`error_hints` `field:` pointer + opt-in `preflight:` local validation),
-response transforms, and search `aliases` — each a drift-checked binding. Also: composite `workflows:`;
-caller field projection; static include/exclude filters; JWT-derived caller scopes
-(**HS256, RS256, JWKS**); path-param injection hardening; `tracing`-based leveled
-logging (`MINMCP_LOG`). Tooling: `minmcp lint` (best-practice smells + stats),
-`minmcp verify` (deterministic checks against the live upstream — CI/drift gate),
-`minmcp map` (source map / drift diff), `minmcp search|help|call`. Not yet built: field *addition* for prose-only bodies,
-async-poll and interactive-OAuth overlays, write-verified GitHub tasks.
-
-## How it compares
-
-The deferred-schema pattern — show a small surface, fetch a tool's full schema on
-demand, then invoke it — is not unique. Atlassian's
-[mcp-compressor](https://github.com/atlassian-labs/mcp-compressor) is the closest
-peer: it uses the **same architecture** (a compressed surface + `get_tool_schema` /
-`invoke_tool`). min-mcp differs three ways — it *ranks* tools with **BM25 search**
-(`search_tools(query)`) rather than explicit name lookup; it reports **measured,
-reproducible** compression (run [`bench/`](bench/) yourself) rather than qualitative
-claims; and — the one thing neither it nor the broader pattern
-([ACI.dev](https://github.com/aipotheosis-labs/aci), Cloudflare Code Mode, AWS
-`call_aws`) does — it also **fixes** the tools it proxies.
-
-That *fixing* side is min-mcp's real column, and it has different peers: MCP quality
-graders like [mcpgrade](https://mcpgrade.com/methodology), glama's Agent-UX
-validator, and security scanners like mcp-scan. They all **detect and grade**; none
-patch a server they don't own, and none prove a fix works. min-mcp's `lint` shares
-their detection lane (we're not first there) — but the overlay + **`verify`** loop —
-*fix* a third-party tool as a drift-checked binding and *prove* it with a real
-call — is the uncontested column.
+| [About TOON](docs/about-toon.md) | what it is, what we measured, why we don't emit it |
+| [About mcp-compressor](docs/about-mcp-compressor.md) | the closest peer, measured head-to-head |
+| [Measurements](docs/measurements.md) | every number, how to reproduce it, and what isn't measured |
 
 ## License
 

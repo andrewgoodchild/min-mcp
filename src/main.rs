@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Map { common, diff } => {
             let surface = build(&common).await?;
-            let current = surface.source_map();
+            let current = surface.source_map(false);
             match diff {
                 None => {
                     println!("{}", serde_json::to_string_pretty(&current)?);
@@ -225,6 +225,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Serve(common) => {
             let surface = build(&common).await?;
+            print_serve_banner(&surface);
             // Both transports are served by the official MCP SDK (rmcp),
             // wrapping our Surface behind its ServerHandler.
             match &common.http {
@@ -237,6 +238,36 @@ async fn main() -> Result<()> {
 
 fn clean(scopes: Vec<String>) -> Vec<String> {
     scopes.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+/// One honest line at startup (stderr — stdout is the protocol): what got
+/// minified, to what, and the estimated ratio. And the line most tools won't
+/// print: when the minified surface is BIGGER than declaring everything
+/// (small N), say so and recommend `mode: passthrough` — a minifier that
+/// can't tell you when not to minify is marketing, not measurement.
+fn print_serve_banner(surface: &crate::surface::Surface) {
+    let s = surface.stats();
+    let (raw, min) = (
+        s["est_tokens_raw"].as_u64().unwrap_or(0),
+        s["est_tokens_minified"].as_u64().unwrap_or(0),
+    );
+    // Large spec surfaces report raw from unresolved $ref stubs — a lower
+    // bound, marked "≥"; the passthrough NOTE only fires on exact numbers.
+    let exact = s["est_raw_exact"].as_bool().unwrap_or(false);
+    let bound = if exact { "" } else { "≥" };
+    let ratio = if min > 0 { raw as f64 / min as f64 } else { 0.0 };
+    let ratio = if ratio >= 10.0 { format!("{ratio:.0}×") } else { format!("{ratio:.1}×") };
+    eprintln!(
+        "min-mcp: {} upstream tool(s) across {} upstream(s) → {} surface tool(s); ~{} tokens vs {bound}{} raw ({bound}{ratio})",
+        s["upstream_tools"], s["upstreams_active"], s["surface_tools"], min, raw
+    );
+    if s["mode"] == "ThreeTool" && exact && min >= raw && raw > 0 {
+        eprintln!(
+            "min-mcp: NOTE — at this size the minified surface is not smaller than declaring \
+             every tool (~{min} vs ~{raw} tokens); consider `mode: passthrough` until the \
+             surface grows"
+        );
+    }
 }
 
 /// Index a source map to (tool_id -> schema_sha) and the set of tool_ids that

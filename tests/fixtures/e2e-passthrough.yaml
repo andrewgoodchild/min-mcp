@@ -1,0 +1,6 @@
+# E2E fixture: passthrough mode — every upstream tool declared by name.
+mode: passthrough
+upstreams:
+  - name: fixture
+    spec: mini-openapi.json
+    base_url: https://example.invalid

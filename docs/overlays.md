@@ -31,9 +31,22 @@ overlays:
       remove: ["data[].secret", "livemode"]
     binding: strong                     # fail-closed if this overlay breaks
     authored_sha: "a1b2c3d4e5f60718"    # detect upstream schema/description drift
+    # preflight: false                  # exempt THIS tool from local schema validation
+    # cacheable: true                   # opt this tool's results into the read cache
+    # timeout_s: 10                     # per-tool call deadline (transport default: 120s)
+    # breaker: { consecutive_failures: 5, cooldown_s: 60 }   # trip after N straight errors
 ```
 
 Every field is optional; use only what you need.
+
+Two per-tool switches override global settings: `preflight` (local
+required/enum validation before the upstream call — **on by default**
+globally; set `false` here when a spec over-declares `required`) and
+`cacheable` (force a tool into — or out of — the `read_cache_ttl_s` TTL cache
+regardless of its read-only signal).
+
+Two more guard a flaky or slow tool — **`timeout_s`** and **`breaker`** — see
+[their section below](#timeout_s-and-breaker--guard-a-slow-or-flaky-tool).
 
 ## What each part does
 
@@ -103,6 +116,66 @@ overlays:
 Covers cursor-by-last-item (Stripe) and next-token (`cursor: "next_cursor"`,
 `into: "query_params.cursor"`, omit `more`) styles. The merged result has its item
 array replaced by the concatenation and `more` set false.
+
+### `timeout_s` and `breaker` — guard a slow or flaky tool
+
+A broken upstream doesn't just fail — it *drains the agent*. Two failure modes
+cost real money and turns, both measured: a tool that hangs eats the whole turn
+budget in silence, and a tool that fails identically every call invites the
+agent to retry it forever (our benchmarks caught 15 wasted turns in one episode
+and 562K tokens in another). These two keys make the proxy handle both, so the
+agent never has to.
+
+```yaml
+overlays:
+  - tool: flaky.search
+    timeout_s: 10                  # bound THIS tool's call (transport default: 120s)
+    breaker:
+      consecutive_failures: 5      # straight errors that trip it open (default 5)
+      cooldown_s: 60               # how long it stays open before a probe (default 60)
+```
+
+**`timeout_s`** bounds one upstream call. On expiry the agent gets an isError
+that states the ambiguity honestly:
+
+```
+TIMEOUT: flaky.search did not respond within 10s. The operation may or may not
+have completed upstream — for writes, check state before retrying.
+```
+
+That wording is deliberate: a timed-out *write* may have committed, so the
+agent must verify state rather than blindly retry. The deadline is applied
+inside the backend, so a stdio request is never cancelled mid-write (a
+half-written frame would corrupt the next request).
+
+**`breaker`** is a per-tool circuit breaker with the standard three states.
+Closed: calls pass through. After `consecutive_failures` straight errors it
+trips **open** and calls are refused *locally* — no upstream round-trip — with
+a message that is itself a continuation prompt:
+
+```
+BREAKER_OPEN: flaky.search has failed 5 time(s) in a row and is paused for ~42s.
+Do not retry it now — use a different tool or report what is failing.
+```
+
+After `cooldown_s` it goes **half-open** and lets exactly one probe call
+through (concurrent callers are still refused): success closes the breaker,
+failure re-opens it for another full cooldown. This is design law 6 —
+*errors are continuation prompts* — made structural rather than advisory.
+
+Details worth knowing:
+
+- **Timeouts count as failures**, so the two compose: a hanging tool trips its
+  own breaker and stops being called.
+- **Any failure counts**, including transport errors and upstream 5xx — not
+  just tool-level `isError` results.
+- State is **per tool and per process**; a sibling tool on the same upstream is
+  unaffected, and nothing persists across restarts.
+- **Cache hits bypass both** — a result served from `read_cache_ttl_s` is not a
+  call, so it neither times out nor counts toward the breaker.
+- Both are **opt-in per tool**. There is no global default: a breaker on a tool
+  that legitimately errors often (a `search` that returns 404 for "not found")
+  would do harm, so you name the tools you want guarded.
 
 ### `verify` — dynamic checks that prove the fix works
 The third leg of the loop — **detect (lint) → fix (overlay) → verify**. Each check
@@ -199,7 +272,7 @@ error_hints:
 
 This matters: a prose hint is a **capability-gated** fix — weak agents ignore it —
 whereas the structured shape recovers even weak agents (measured 0%→100% task
-success, at a fraction of the tokens). Pair it with `preflight: true`
+success, at a fraction of the tokens). Preflight is on by default and pairs with this
 ([configuration](configuration.md)) to return the *same* structured error
 **before** the upstream call, when a required/enum constraint is violated — no
 round-trip, no opaque 400 to thrash on.

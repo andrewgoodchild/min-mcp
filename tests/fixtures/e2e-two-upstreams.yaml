@@ -1,0 +1,10 @@
+# E2E fixture: TWO spec upstreams federated behind the same 3-tool surface.
+# No network — probes only exercise the local surface (search/details/errors).
+mode: three_tool
+upstreams:
+  - name: fixture
+    spec: mini-openapi.json
+    base_url: https://example.invalid
+  - name: big
+    spec: ../../bench/specs/bigapi.json
+    base_url: https://example.invalid

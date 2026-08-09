@@ -1,0 +1,52 @@
+# Offline fixture exercising the features that need an upstream which actually
+# returns data: composites, verify, auto-pagination, response transforms.
+mode: three_tool
+upstreams:
+  - name: fake
+    command: sh
+    args: ["fake-mcp-server.sh"]
+
+overlays:
+  # auto-pagination: follow next_cursor and concatenate `data`
+  - tool: fake.list_items
+    paginate:
+      items: "data"
+      cursor: "next_cursor"
+      into: "cursor"
+      more: "has_more"
+      max_pages: 5
+
+  # response transform + a verify check that proves the fix, against this server
+  - tool: fake.whoami
+    response:
+      remove: ["secret"]
+    verify:
+      - name: "whoami returns the user and no secret"
+        arguments: {}
+        expect:
+          is_error: false
+          has: ["user"]
+          missing: ["secret"]
+
+workflows:
+  - id: fake.product_with_price
+    description: "Create a product and a price for it in one call."
+    inputs:
+      type: object
+      properties:
+        name: { type: string }
+        amount: { type: integer }
+      required: ["name", "amount"]
+    steps:
+      - id: product
+        tool: fake.create_product
+        input: { name: "$inputs.name" }
+        output: { id: "id" }
+      - id: price
+        tool: fake.create_price
+        input: { product: "$steps.product.id", amount: "$inputs.amount" }
+        output: { id: "id", product: "product" }
+    outputs:
+      product_id: "$steps.product.id"
+      price_id: "$steps.price.id"
+      threaded_product: "$steps.price.product"

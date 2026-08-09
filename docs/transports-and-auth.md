@@ -128,6 +128,9 @@ sets an identity directly (prefer `--jwt` in production).
 
 - Agent-supplied path params on spec upstreams are strictly segment-encoded, so a
   value like `../` can't escape its endpoint.
-- HTTP serving validates `Origin` and binds localhost by default.
+- HTTP serving binds localhost and validates **both** DNS-rebinding headers:
+  the `Host` header (by rmcp) and the `Origin` header (min-mcp — a *present*
+  Origin must be loopback; an absent one is allowed, since non-browser clients
+  don't send one). A cross-origin POST is refused with 403 and logged.
 - Secrets are only ever referenced by env-var name; nothing sensitive belongs in
   the committed config.

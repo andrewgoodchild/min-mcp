@@ -1,0 +1,91 @@
+# Build release binaries when a version tag is pushed.
+#
+#   git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+#
+# Nothing here runs on a normal push: tagging is a deliberate act. The job
+# re-runs the full gate (clippy + tests) per platform before publishing, so a
+# release can never be cut from a red tree.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest,   target: aarch64-apple-darwin }
+          - { os: macos-13,       target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Don't publish from a tree that wouldn't pass CI.
+      - name: Gate (clippy + tests)
+        if: runner.os != 'Windows'
+        run: |
+          cargo clippy --release --all-targets -- -D warnings
+          cargo test --release
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          tar -czf minmcp-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release minmcp
+          shasum -a 256 minmcp-${{ matrix.target }}.tar.gz > minmcp-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/minmcp.exe `
+            -DestinationPath minmcp-${{ matrix.target }}.zip
+          (Get-FileHash minmcp-${{ matrix.target }}.zip -Algorithm SHA256).Hash `
+            | Out-File minmcp-${{ matrix.target }}.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minmcp-${{ matrix.target }}
+          path: |
+            minmcp-*.tar.gz
+            minmcp-*.tar.gz.sha256
+            minmcp-*.zip
+            minmcp-*.zip.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release (draft — review the notes, then publish)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          body_path: CHANGELOG.md
+          files: dist/*

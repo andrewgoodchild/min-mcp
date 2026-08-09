@@ -83,7 +83,10 @@ pub struct UpstreamConfig {
     /// Optional Accept header (e.g. application/vnd.github+json).
     #[serde(default)]
     pub accept: Option<String>,
-    /// How this upstream's response bodies are serialized to the agent.
+    /// How this upstream's response bodies are serialized to the agent. On spec
+    /// upstreams `json` embeds the parsed body in the result envelope; on MCP /
+    /// HTTP upstreams `json` re-encodes JSON text blocks compactly (the free
+    /// token win) and `raw` passes results through byte-for-byte.
     #[serde(default)]
     pub result_format: ResultFormat,
 }
@@ -458,6 +461,49 @@ pub struct Overlay {
     /// Auto-follow pagination and concatenate results (spec upstreams).
     #[serde(default)]
     pub paginate: Option<Paginate>,
+    /// Per-tool preflight override: `false` disables local schema validation for
+    /// this tool (e.g. the spec over-declares `required`); `true` forces it even
+    /// when the global `preflight` is off. Absent → the global setting.
+    #[serde(default)]
+    pub preflight: Option<bool>,
+    /// Per-tool read-cache override: `true` marks this tool's results cacheable
+    /// even without a read-only signal; `false` exempts a tool that IS read-only
+    /// but must never be cached (e.g. a token mint). Absent → inferred (spec GET
+    /// / `annotations.readOnlyHint`). Only effective when `read_cache_ttl_s` > 0.
+    #[serde(default)]
+    pub cacheable: Option<bool>,
+    /// Per-tool call timeout (seconds) for the upstream call, tighter than the
+    /// transport's 120s default. On expiry the agent gets an isError result that
+    /// says the operation may still have completed — never a silent hang eating
+    /// the turn budget. Applies to the primary call (not pagination follow-ups).
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
+    /// Circuit breaker: after `consecutive_failures` isError results this tool
+    /// is paused for `cooldown_s` (then one probe call is let through). The
+    /// structural fix for identical-retry loops — measured burning 15 turns in
+    /// the spike and 562K tokens in the recall benchmark. (Mined from
+    /// ContextForge's circuit_breaker plugin; consecutive-failure subset.)
+    #[serde(default)]
+    pub breaker: Option<Breaker>,
+}
+
+/// Per-tool circuit-breaker thresholds (see `Overlay::breaker`).
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct Breaker {
+    /// Consecutive isError results that trip the breaker open (default 5).
+    #[serde(default = "default_breaker_failures")]
+    pub consecutive_failures: u32,
+    /// Seconds the breaker stays open before allowing one probe (default 60).
+    #[serde(default = "default_breaker_cooldown")]
+    pub cooldown_s: u64,
+}
+
+fn default_breaker_failures() -> u32 {
+    5
+}
+
+fn default_breaker_cooldown() -> u64 {
+    60
 }
 
 impl Overlay {
@@ -497,6 +543,10 @@ pub struct Filters {
 
 fn default_scope_claim() -> String {
     "scope".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -576,11 +626,21 @@ pub struct Config {
     pub binding_policy: BindingPolicy,
     /// Validate each call against its (patched) input schema BEFORE the upstream
     /// call: a missing required field or an out-of-enum value returns a
-    /// structured error locally (no round-trip, no opaque upstream 400). Opt-in —
-    /// it makes the patched schema authoritative, so enable it where overlays
-    /// (or the spec) accurately mark `required`/`enum`.
-    #[serde(default)]
+    /// structured error locally (no round-trip, no opaque upstream 400). ON by
+    /// default — the schema's own `required`/`enum` are treated as authoritative
+    /// (measured: a local structured error beats a raw upstream dump; the
+    /// mcp-compressor head-to-head found our raw passthrough losing to their
+    /// default preflight). Set `preflight: false` globally, or per tool via an
+    /// overlay's `preflight: false`, where a spec over-declares `required`.
+    #[serde(default = "default_true")]
     pub preflight: bool,
+    /// TTL in seconds for caching results of READ-ONLY tools keyed by (tool,
+    /// arguments) — spec `GET` operations, MCP tools with
+    /// `annotations.readOnlyHint`, or tools an overlay marks `cacheable: true`.
+    /// 0 (default) disables caching. A proxy-side latency/token saver for
+    /// repeat reads; never applied to writes or error results.
+    #[serde(default)]
+    pub read_cache_ttl_s: u64,
     /// Error hints applied to EVERY tool (design law 6 at the fleet level).
     /// Per-tool overlay hints are additive on top of these.
     #[serde(default)]
@@ -629,18 +689,6 @@ impl Config {
                 if !PathBuf::from(log).is_absolute() {
                     cfg.log_file = Some(base.join(log).to_string_lossy().into_owned());
                 }
-            }
-        }
-        // result_format is applied only in the spec executor; MCP/HTTP upstreams
-        // pass their results through unchanged. Reject it on those rather than
-        // silently ignoring it, so a misplaced `result_format` fails loudly.
-        for up in &cfg.upstreams {
-            if !up.is_spec() && up.result_format != ResultFormat::Json {
-                anyhow::bail!(
-                    "upstream {:?}: `result_format` applies only to spec upstreams; \
-                     MCP and HTTP upstreams return their results unchanged",
-                    up.name
-                );
             }
         }
         Ok(cfg)
@@ -882,20 +930,18 @@ overlays:
     }
 
     #[test]
-    fn load_rejects_result_format_on_non_spec_upstream() {
+    fn load_accepts_result_format_on_any_upstream_and_defaults_preflight_on() {
         let dir = std::env::temp_dir();
-        // an MCP-server upstream (has `command`) with an explicit result_format
-        let bad = dir.join(format!("minmcp_cfg_bad_{}.yaml", std::process::id()));
-        std::fs::write(&bad, "upstreams:\n  - name: srv\n    command: echo\n    result_format: raw\n").unwrap();
-        let err = Config::load(bad.to_str().unwrap()).unwrap_err().to_string();
-        assert!(err.contains("result_format"), "{err}");
-        let _ = std::fs::remove_file(&bad);
-
-        // the default (json) on an MCP upstream is fine (it's just ignored)
-        let ok = dir.join(format!("minmcp_cfg_ok_{}.yaml", std::process::id()));
-        std::fs::write(&ok, "upstreams:\n  - name: srv\n    command: echo\n").unwrap();
-        assert!(Config::load(ok.to_str().unwrap()).is_ok());
-        let _ = std::fs::remove_file(&ok);
+        // result_format is now honored on MCP upstreams too (raw = opt out of
+        // the compact re-encode), so an explicit value must load cleanly.
+        let cfg_path = dir.join(format!("minmcp_cfg_rf_{}.yaml", std::process::id()));
+        std::fs::write(&cfg_path, "upstreams:\n  - name: srv\n    command: echo\n    result_format: raw\n").unwrap();
+        let cfg = Config::load(cfg_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.upstreams[0].result_format, ResultFormat::Raw);
+        // preflight defaults ON (the head-to-head correction); read cache OFF.
+        assert!(cfg.preflight, "preflight must default on");
+        assert_eq!(cfg.read_cache_ttl_s, 0, "read cache must default off");
+        let _ = std::fs::remove_file(&cfg_path);
     }
 
     #[test]

@@ -11,6 +11,106 @@ use crate::config::UpstreamConfig;
 use crate::jsonrpc;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Typed marker for an overlay `timeout_s` deadline expiring — dispatch
+/// downcasts it into an agent-facing isError instead of a protocol error.
+#[derive(Debug)]
+pub struct TimeoutElapsed {
+    pub secs: u64,
+}
+
+impl std::fmt::Display for TimeoutElapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "call exceeded its {}s deadline", self.secs)
+    }
+}
+
+impl std::error::Error for TimeoutElapsed {}
+
+/// The load-bearing sentence every timeout rendering shares (asserted by the
+/// E2E suite): a timed-out WRITE must never be blindly retried.
+pub const TIMEOUT_GUIDANCE: &str =
+    "The operation may or may not have completed upstream — for writes, check state before retrying.";
+
+/// `tools/list` / `resources/list` / `prompts/list` cursor page params.
+fn cursor_params(cursor: &Option<String>) -> Value {
+    match cursor {
+        Some(c) => json!({"cursor": c}),
+        None => json!({}),
+    }
+}
+
+/// `prompts/get` params — `arguments` omitted when null (spec shape).
+fn prompt_params(name: &str, arguments: Value) -> Value {
+    if arguments.is_null() {
+        json!({"name": name})
+    } else {
+        json!({"name": name, "arguments": arguments})
+    }
+}
+
+/// The JSON-RPC seam every MCP client transport implements. Everything
+/// protocol-shaped above it — tool listing, passthrough listing, resource and
+/// prompt fetches, tool calls — is provided ONCE here, so the stdio and HTTP
+/// clients cannot drift apart.
+#[allow(async_fn_in_trait)] // concrete impls only; no dyn use
+pub trait McpRpc {
+    /// The upstream's public name (prefixes tool ids).
+    fn rpc_name(&self) -> &str;
+    /// One JSON-RPC request; `deadline` is the overlay `timeout_s` (the
+    /// transport's own 120s ceiling still applies underneath).
+    async fn rpc(&mut self, method: &str, params: Value, deadline: Option<Duration>)
+        -> Result<Value>;
+
+    async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        deadline: Option<Duration>,
+    ) -> Result<Value> {
+        self.rpc("tools/call", json!({"name": name, "arguments": arguments}), deadline).await
+    }
+
+    async fn list_tools(&mut self, upstream_idx: usize) -> Result<Vec<ToolDef>> {
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let result = self.rpc("tools/list", cursor_params(&cursor), None).await?;
+            let name = self.rpc_name().to_string();
+            cursor = push_tools_page(&result, &name, upstream_idx, &mut tools);
+            if cursor.is_none() {
+                return Ok(tools);
+            }
+        }
+    }
+
+    /// Best-effort passthrough listing: an upstream without the capability (or
+    /// erroring on the method) contributes what it returned so far rather than
+    /// failing the merge. Follows `nextCursor` pagination like `list_tools`.
+    async fn list_passthrough(&mut self, method: &str, key: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let Ok(mut r) = self.rpc(method, cursor_params(&cursor), None).await else {
+                return out;
+            };
+            if let Some(arr) = r.get_mut(key).and_then(Value::as_array_mut) {
+                out.append(arr); // take, don't clone — r is owned and dropped
+            }
+            cursor = r.get("nextCursor").and_then(Value::as_str).map(str::to_string);
+            if cursor.is_none() {
+                return out;
+            }
+        }
+    }
+
+    async fn read_resource(&mut self, uri: &str) -> Result<Value> {
+        self.rpc("resources/read", json!({"uri": uri}), None).await
+    }
+
+    async fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        self.rpc("prompts/get", prompt_params(name, arguments), None).await
+    }
+}
 /// Protocol version min-mcp announces to *upstream* servers it proxies. (The
 /// agent-facing server side negotiates versions via rmcp now.)
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -24,6 +124,9 @@ pub struct ToolDef {
     pub input_schema: Value,
     /// Cached `upstream.name` — avoids re-allocating on every lookup.
     pub id: String,
+    /// The upstream's own read-only signal (`annotations.readOnlyHint` for MCP
+    /// tools; `method == GET` for spec operations). Drives read-result caching.
+    pub read_only: Option<bool>,
 }
 
 impl ToolDef {
@@ -53,6 +156,10 @@ pub fn push_tools_page(
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or(json!({"type": "object", "properties": {}})),
+            read_only: t
+                .get("annotations")
+                .and_then(|a| a.get("readOnlyHint"))
+                .and_then(Value::as_bool),
         });
     }
     result.get("nextCursor").and_then(Value::as_str).map(str::to_string)
@@ -60,6 +167,9 @@ pub fn push_tools_page(
 
 pub struct Upstream {
     pub name: String,
+    /// How this upstream's tool results are serialized to the agent (`json` =
+    /// compact re-encode of JSON text blocks; `raw` = byte-for-byte).
+    pub result_format: crate::config::ResultFormat,
     _child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
@@ -88,6 +198,7 @@ impl Upstream {
         let stdout = child.stdout.take().context("upstream stdout")?;
         let mut up = Upstream {
             name: cfg.name.clone(),
+            result_format: cfg.result_format,
             _child: child,
             stdin,
             lines: BufReader::new(stdout).lines(),
@@ -125,11 +236,35 @@ impl Upstream {
     /// method-not-found error) so a blocking upstream can't stall us; upstream
     /// notifications and non-JSON banner lines are skipped.
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_deadline(method, params, None).await
+    }
+
+    /// Like [`request`], but the RESPONSE WAIT runs under `deadline`. The write
+    /// is completed before the deadline starts, deliberately: cancelling a
+    /// stdio write mid-frame would leave a partial line in the pipe that merges
+    /// with the next request into one corrupt frame. On expiry the pending
+    /// response stays in the pipe and is skipped later by id mismatch.
+    async fn request_deadline(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Option<Duration>,
+    ) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
-        let want = json!(id);
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
+        match deadline {
+            Some(d) => match timeout(d, self.read_response(id, method)).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::Error::new(TimeoutElapsed { secs: d.as_secs() })),
+            },
+            None => self.read_response(id, method).await,
+        }
+    }
+
+    async fn read_response(&mut self, id: i64, method: &str) -> Result<Value> {
+        let want = json!(id);
         loop {
             let line = timeout(REQUEST_TIMEOUT, self.lines.next_line())
                 .await
@@ -176,25 +311,18 @@ impl Upstream {
         self.send(&reply).await
     }
 
-    pub async fn list_tools(&mut self, upstream_idx: usize) -> Result<Vec<ToolDef>> {
-        let mut tools = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let params = match &cursor {
-                Some(c) => json!({"cursor": c}),
-                None => json!({}),
-            };
-            let result = self.request("tools/list", params).await?;
-            cursor = push_tools_page(&result, &self.name, upstream_idx, &mut tools);
-            if cursor.is_none() {
-                break;
-            }
-        }
-        Ok(tools)
+
+
+
+
+}
+
+impl McpRpc for Upstream {
+    fn rpc_name(&self) -> &str {
+        &self.name
     }
 
-    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        self.request("tools/call", json!({"name": name, "arguments": arguments}))
-            .await
+    async fn rpc(&mut self, method: &str, params: Value, deadline: Option<Duration>) -> Result<Value> {
+        self.request_deadline(method, params, deadline).await
     }
 }
