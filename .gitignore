@@ -18,6 +18,7 @@ demo/
 
 # Private lab material — research, notebook, and internal drafts (not for public release)
 research/
+planning/
 LABBOOK.md
 docs/plan.md
 docs/pd-thought-piece.md
