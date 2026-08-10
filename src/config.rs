@@ -605,6 +605,12 @@ impl Auth {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    /// Score alternative retrievers against real traffic without serving them,
+    /// logging what each *would* have ranked when the agent calls a tool. Off by
+    /// default: each challenger is a second full index. See `surface/shadow.rs`.
+    #[serde(default)]
+    pub shadow: bool,
+
     #[serde(default)]
     pub mode: Mode,
     pub upstreams: Vec<UpstreamConfig>,

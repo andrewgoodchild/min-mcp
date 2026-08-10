@@ -20,6 +20,7 @@ fn test_surface(cfg: Config, tools: Vec<ToolDef>) -> Surface {
         by_id,
         exposed: BTreeMap::new(),
         index: Index::build(&[]),
+        shadow: super::shadow::Shadow::new(&[], false),
         workflow_by_id: std::collections::HashMap::new(),
         log: None,
         origin_sha: std::collections::HashMap::new(),
@@ -457,7 +458,11 @@ async fn observability_logs_search_and_details_events() {
     let mut by_id = std::collections::HashMap::new();
     by_id.insert("up.GetX".to_string(), 0);
     let cfg: Config = serde_yaml::from_str("mode: three_tool\nupstreams: []\n").unwrap();
-    let corpus = vec![("up.GetX".to_string(), "get x".to_string())];
+    let corpus = vec![crate::index::IndexedTool {
+        id: "up.GetX".to_string(),
+        description: "get x".to_string(),
+        params: String::new(),
+    }];
     let path = std::env::temp_dir().join(format!("minmcp_obs_{}.ndjson", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();

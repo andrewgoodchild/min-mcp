@@ -29,6 +29,7 @@ mod patch;
 mod preflight;
 mod resources;
 mod results;
+mod shadow;
 mod workflow;
 #[cfg(test)]
 mod tests;
@@ -82,6 +83,9 @@ pub struct Surface {
     resource_origin: HashMap<String, usize>,
     /// tool_id -> circuit-breaker state, for tools whose overlay sets `breaker:`.
     breakers: HashMap<String, breaker::BreakerState>,
+    /// Alternative retrievers scored against real traffic, serving nothing. Empty
+    /// (and free) unless `shadow: true`. See `surface/shadow.rs`.
+    shadow: shadow::Shadow,
     /// tool_id -> lazily resolved schema (immutable after load). Default-on
     /// preflight resolves on every call; without this a spec tool would re-expand
     /// its `$ref`s each time. RefCell: fills under `&self` (Surface sits behind
@@ -172,7 +176,7 @@ impl Surface {
         // Index upstream tools AND composite workflows (both searchable/callable).
         // Overlay `aliases` are appended to a tool's indexed text so a poorly-named
         // tool is findable by an outcome phrase, without changing its id.
-        let mut corpus: Vec<(String, String)> = tools
+        let mut corpus: Vec<crate::index::IndexedTool> = tools
             .iter()
             .map(|t| {
                 let aliases =
@@ -182,13 +186,24 @@ impl Surface {
                 } else {
                     format!("{} {}", t.description, aliases)
                 };
-                (t.id().to_string(), text)
+                crate::index::IndexedTool {
+                    id: t.id().to_string(),
+                    description: text,
+                    // Harvested unconditionally but only *indexed* by variants that
+                    // opt in (IndexOptions::params) — the shipped index ignores it.
+                    params: crate::index::schema_param_text(&t.input_schema),
+                }
             })
             .collect();
         for wf in &config.workflows {
-            corpus.push((wf.id.clone(), wf.description.clone()));
+            corpus.push(crate::index::IndexedTool {
+                id: wf.id.clone(),
+                description: wf.description.clone(),
+                params: String::new(), // composites declare no input schema
+            });
         }
         let index = Index::build(&corpus);
+        let shadow = shadow::Shadow::new(&corpus, config.shadow);
         let workflow_by_id: HashMap<String, usize> =
             config.workflows.iter().enumerate().map(|(i, w)| (w.id.clone(), i)).collect();
 
@@ -203,6 +218,7 @@ impl Surface {
             None => None,
         };
         let mut surface = Surface {
+            shadow,
             config,
             granted,
             upstreams,
@@ -414,7 +430,7 @@ impl Surface {
 
     /// Search tools by task description (CLI `minmcp search`).
     pub fn cli_search(&self, query: &str, k: usize) -> String {
-        self.search_text(query, k)
+        self.search_text(query, k).0
     }
 
     /// Full schema for one tool (CLI `minmcp help`).
@@ -442,8 +458,14 @@ impl Surface {
                     .and_then(Value::as_u64)
                     .and_then(|k| usize::try_from(k).ok())
                     .unwrap_or(DEFAULT_SEARCH_K);
-                let text = self.search_text(query, k);
+                let (text, served) = self.search_text(query, k);
                 self.log_event("search", json!({"query": query, "k": k}));
+                if self.shadow.enabled() {
+                    // Cloned because observe_search needs &mut self while `query`
+                    // still borrows `args`.
+                    let q = query.to_string();
+                    self.shadow.observe_search(&q, &served);
+                }
                 Ok(text_result(text, false))
             }
             "get_tool_details" if has_meta => {
@@ -459,6 +481,19 @@ impl Surface {
                     return Ok(bad_arg("call_tool requires a 'tool_id' string"));
                 };
                 let id = id.to_string();
+                if self.shadow.enabled() {
+                    // Eligible = the id is in the searchable surface. A composite
+                    // called directly, or a typo, must not count against a retriever
+                    // that was never given the chance to rank it.
+                    let eligible = self.by_id.contains_key(&id) || self.workflow_by_id.contains_key(&id);
+                    let obs = self.shadow.observe_call(&id, eligible);
+                    for o in obs {
+                        self.log_event(
+                            "shadow",
+                            json!({"tool_id": id, "method": o.method, "hit": o.hit, "rank": o.rank}),
+                        );
+                    }
+                }
                 // An explicit null is treated like omitted (clients send it for
                 // no-arg tools); any OTHER non-object would hand the upstream a
                 // protocol-invalid call — reject it client-side.
@@ -492,11 +527,14 @@ impl Surface {
         }
     }
 
-    fn search_text(&self, query: &str, k: usize) -> String {
+    /// Returns the agent-facing text and the ids it served, in rank order. The ids
+    /// are what shadow mode compares its challengers against.
+    fn search_text(&self, query: &str, k: usize) -> (String, Vec<String>) {
         // over-fetch so scope filtering can't starve the result list
         // (saturating: k is client-controlled, must not overflow)
         let hits = self.index.search(query, k.saturating_mul(3));
         let mut lines: Vec<String> = Vec::new();
+        let mut served: Vec<String> = Vec::new();
         for (id, _) in hits {
             if !self.allowed(&id) {
                 continue; // invisible, not forbidden
@@ -506,15 +544,19 @@ impl Surface {
                 let mut summary = desc.lines().next().unwrap_or("").to_string();
                 truncate_in_place(&mut summary, 110);
                 lines.push(format!("{id} — {summary}"));
+                served.push(id);
             }
             if lines.len() >= k {
                 break;
             }
         }
         if lines.is_empty() {
-            return "no matches — try different words (resource or action names work best)".into();
+            return (
+                "no matches — try different words (resource or action names work best)".into(),
+                served,
+            );
         }
-        lines.join("\n")
+        (lines.join("\n"), served)
     }
 
     fn details_text(&self, tool_id: &str) -> String {

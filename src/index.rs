@@ -44,6 +44,37 @@ const BODY_CAP: usize = 300;
 /// Field weights, expressed as repetition counts because the crate is single-field.
 const ID_REPEATS: usize = 3;
 const SUMMARY_REPEATS: usize = 2;
+/// Cap on text harvested from a tool's input schema, when a variant indexes it.
+/// Tight on purpose: Stripe operation schemas run to thousands of characters and
+/// an uncapped dump inflates document length enough to dilute the id signal.
+const PARAMS_CAP: usize = 200;
+/// How deep to walk nested schemas for parameter names.
+const PARAMS_DEPTH: usize = 3;
+
+/// Which retrieval behaviours an [`Index`] has switched on.
+///
+/// The shipped surface uses [`IndexOptions::default`]. The point of the struct is
+/// that a shadow challenger is *the same code with a different switch*, not a
+/// second retriever implementation to keep in sync — see `surface/shadow.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexOptions {
+    /// Apply the four rerank layers (verb affinity, exact substring, usage prior,
+    /// short-id tiebreak). Off = plain BM25, which is what Codex serves.
+    pub rerank: bool,
+    /// Index parameter names from the input schema, weighted below the description.
+    /// Rejected on a single-API benchmark (it cost 16 points of recall@1 on Stripe,
+    /// whose operations nearly all share `expand`/`metadata`/`customer`), but both
+    /// platforms do it for *federated* surfaces where parameter vocabulary actually
+    /// discriminates. Shadow mode on real multi-upstream traffic is the right venue
+    /// to settle that.
+    pub params: bool,
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self { rerank: true, params: false }
+    }
+}
 
 /// (query verb synonyms) -> (id tokens that satisfy the intent).
 ///
@@ -94,6 +125,50 @@ fn raw_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parameter names harvested from a tool's input schema, breadth-first so the
+/// top-level parameters — the ones a caller actually names — survive the cap.
+///
+/// Only used when [`IndexOptions::params`] is set. Anthropic's tool search covers
+/// "argument names and argument descriptions" and Codex walks the schema in
+/// `append_schema_search_text`; descriptions are deliberately excluded here because
+/// including them was the variant that lost worst on Stripe.
+pub fn schema_param_text(schema: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let mut level = vec![schema];
+    for _ in 0..PARAMS_DEPTH {
+        if out.len() >= PARAMS_CAP || level.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for node in level {
+            let Some(obj) = node.as_object() else { continue };
+            if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
+                for (name, sub) in props {
+                    if out.len() < PARAMS_CAP {
+                        if !out.is_empty() {
+                            out.push(' ');
+                        }
+                        out.push_str(name);
+                    }
+                    next.push(sub);
+                }
+            }
+            for key in ["items", "additionalProperties"] {
+                if let Some(sub) = obj.get(key) {
+                    next.push(sub);
+                }
+            }
+            for key in ["anyOf", "oneOf", "allOf"] {
+                if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
+                    next.extend(arr.iter());
+                }
+            }
+        }
+        level = next;
+    }
+    out
+}
+
 /// camelCase-aware tokenizer: split boundaries, then hand off to the crate's
 /// tokenizer for stemming, stop words and unicode normalization.
 pub struct ToolTokenizer {
@@ -130,18 +205,34 @@ struct Meta {
     norm_id: String,
 }
 
+/// One entry in the search corpus. A struct rather than a tuple because the texts
+/// carry different weights and must not be transposed by accident.
+#[derive(Clone)]
+pub struct IndexedTool {
+    pub id: String,
+    pub description: String,
+    /// Parameter names from the input schema; only indexed when
+    /// [`IndexOptions::params`] is set. Empty for composites.
+    pub params: String,
+}
+
 pub struct Index {
     engine: SearchEngine<String, u32, ToolTokenizer>,
     meta: HashMap<String, Meta>,
     usage: HashMap<String, u64>,
+    opts: IndexOptions,
 }
 
 impl Index {
-    /// `tools`: (tool_id, description) pairs.
-    pub fn build(tools: &[(String, String)]) -> Self {
+    /// The shipped surface's index: default options.
+    pub fn build(tools: &[IndexedTool]) -> Self {
+        Self::build_with(tools, IndexOptions::default())
+    }
+
+    pub fn build_with(tools: &[IndexedTool], opts: IndexOptions) -> Self {
         let mut docs: Vec<bm25::Document<String>> = Vec::with_capacity(tools.len());
         let mut meta = HashMap::with_capacity(tools.len());
-        for (tool_id, description) in tools {
+        for IndexedTool { id: tool_id, description, params } in tools {
             let id_toks = raw_tokens(tool_id);
             meta.insert(
                 tool_id.clone(),
@@ -151,9 +242,10 @@ impl Index {
                     norm_id: normalize_id(tool_id),
                 },
             );
+            let params = if opts.params { params.as_str() } else { "" };
             docs.push(bm25::Document::new(
                 tool_id.clone(),
-                weighted_contents(tool_id, description),
+                weighted_contents(tool_id, description, params),
             ));
         }
 
@@ -176,7 +268,7 @@ impl Index {
             .build()
         };
 
-        Index { engine, meta, usage: HashMap::new() }
+        Index { engine, meta, usage: HashMap::new(), opts }
     }
 
     pub fn record_use(&mut self, tool_id: &str) {
@@ -223,6 +315,12 @@ impl Index {
             }
             let tool_id = hit.document.id;
             let mut score = score;
+            if !self.opts.rerank {
+                // plain BM25, which is what both platforms serve. Kept reachable so a
+                // shadow challenger can show whether our layers earn their keep.
+                scored.push((tool_id, score));
+                continue;
+            }
             if let Some(m) = self.meta.get(&tool_id) {
                 // verb affinity: soft boost when the tool id carries an action
                 // token the query's verb implies (favours write over read etc.)
@@ -253,7 +351,7 @@ impl Index {
 /// which is approximate — BM25's term-frequency saturation means three copies is
 /// less than three times the weight — but it is the only lever a flat index
 /// offers, and the ordering it produces is what the recall harness measures.
-fn weighted_contents(tool_id: &str, description: &str) -> String {
+fn weighted_contents(tool_id: &str, description: &str, params: &str) -> String {
     let (first, rest) = match description.split_once('\n') {
         Some((f, r)) => (f, r),
         None => (description, ""),
@@ -271,6 +369,11 @@ fn weighted_contents(tool_id: &str, description: &str) -> String {
         out.push(' ');
     }
     out.push_str(&body);
+    if !params.is_empty() {
+        // weighted 1x, the lowest: most voluminous field, least precise
+        out.push(' ');
+        out.push_str(params);
+    }
     out
 }
 
@@ -278,18 +381,22 @@ fn weighted_contents(tool_id: &str, description: &str) -> String {
 mod tests {
     use super::*;
 
+    fn t(id: &str, description: &str) -> IndexedTool {
+        IndexedTool { id: id.into(), description: description.into(), params: String::new() }
+    }
+
     fn fixture() -> Index {
         Index::build(&[
-            ("stripe.PostCustomers".into(), "Create a customer".into()),
-            ("stripe.GetCustomers".into(), "List all customers".into()),
+            t("stripe.PostCustomers", "Create a customer"),
+            t("stripe.GetCustomers", "List all customers"),
             // sibling read/write pair sharing all resource words — only the
             // verb (Post vs Get) distinguishes them
-            ("stripe.PostCustomersCustomer".into(), "Update a customer".into()),
-            ("stripe.GetCustomersCustomer".into(), "Retrieve a customer".into()),
-            ("stripe.PostCheckoutSessions".into(), "Creates a Checkout Session".into()),
-            ("stripe.PostRefunds".into(), "Create a refund for a charge".into()),
-            ("gh.CreateIssue".into(), "Create an issue in a repository".into()),
-            ("gh.ListIssues".into(), "List issues in a repository".into()),
+            t("stripe.PostCustomersCustomer", "Update a customer"),
+            t("stripe.GetCustomersCustomer", "Retrieve a customer"),
+            t("stripe.PostCheckoutSessions", "Creates a Checkout Session"),
+            t("stripe.PostRefunds", "Create a refund for a charge"),
+            t("gh.CreateIssue", "Create an issue in a repository"),
+            t("gh.ListIssues", "List issues in a repository"),
         ])
     }
 
