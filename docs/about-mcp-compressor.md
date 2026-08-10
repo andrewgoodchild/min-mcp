@@ -1,22 +1,42 @@
 # About mcp-compressor — the closest peer
 
-Atlassian's [mcp-compressor](https://github.com/atlassian-labs/mcp-compressor)
-solves the same problem min-mcp does, with the same top-level architecture: sit
-between the agent and its MCP servers, hide the full tool catalog, hand out
-schemas on demand. It is the most direct comparison available, so we cloned it,
-built it, and ran both binaries against the same upstream. This page records
-what it is, what the measurements said, and where each design wins.
+> **Read this first — the category has moved.** This comparison was written when
+> compressing a tool surface required a proxy. It no longer does: Anthropic's API
+> ships a tool search tool with `defer_loading` and documents "over 85 percent"
+> reduction, and `openai/codex` implements the same thing in Rust using the same
+> BM25 crate min-mcp now uses. **Deferred loading and tool search have been
+> absorbed into the agents themselves.** If you are choosing between min-mcp and
+> mcp-compressor *for surface compression alone*, the honest answer in mid-2026 is
+> that you may need neither — check what your client already does, starting with
+> [About tool search](about-tool-search.md).
+>
+> What survives absorption is narrower and is not what either project's name
+> suggests: mounting APIs that have **no MCP server to compress**, catalogs past
+> the documented ceilings, and **repairing** tools rather than merely hiding them.
+> Everything below the fold is still an accurate measured record of two proxies
+> against the same upstream — read it as history plus a live scope difference,
+> not as a live buying decision.
 
-**Short answer:** two differences, one of scope and one of design. On **scope**,
+Atlassian's [mcp-compressor](https://github.com/atlassian-labs/mcp-compressor)
+solves the same problem min-mcp originally set out to solve, with the same
+top-level architecture: sit between the agent and its MCP servers, hide the full
+tool catalog, hand out schemas on demand. It was the most direct comparison
+available, so we cloned it, built it, and ran both binaries against the same
+upstream. This page records what it is, what the measurements said, and where each
+design wins.
+
+**Short answer:** two differences, one of scope and one of design — and the scope
+one is the only one that platform absorption doesn't touch. On **scope**,
 mcp-compressor compresses MCP servers; min-mcp also mounts **OpenAPI specs
-directly**, which is where the compression problem is genuinely acute — a
-587-operation Stripe or 17,531-operation Microsoft Graph spec can't attach to a
-model at all, and until someone writes and maintains an MCP server wrapping
-that API, an MCP-only compressor has nothing to compress. On **design**, both
-defer schemas but disagree on how the agent *finds* a tool: mcp-compressor
-shows it a listing of every backend tool, min-mcp makes it search. That sets
-the scaling behaviour (a listing is O(N) in backend tools, search is O(1)) and,
-measured live, it also decided task success.
+directly**, which is where the problem is genuinely acute and where neither a
+peer proxy nor a native client feature helps — a ~590-operation Stripe or
+17,531-operation Microsoft Graph spec is a document, not a server, so until
+somebody writes and maintains an MCP server wrapping that API there is nothing to
+compress and nothing to defer. On **design**, both defer schemas but disagree on
+how the agent *finds* a tool: mcp-compressor shows it a listing of every backend
+tool, min-mcp makes it search. That sets the scaling behaviour (a listing is O(N)
+in backend tools, search is O(1)) and, measured live, it also decided task success.
+Note where the platforms landed on that question: both chose search.
 
 ## What it is
 
@@ -351,26 +371,43 @@ theirs and are no longer distinctions. What remains:
 
 ## Where this leaves the comparison
 
-Both projects agree on the important thing — the agent should not carry every
-schema — and on the shape of the answer: a small surface, schemas on demand,
-one invoke path.
+Both projects agreed on the important thing — the agent should not carry every
+schema — and on the shape of the answer: a small surface, schemas on demand, one
+invoke path. That agreement has since been ratified by the platforms, which
+implemented the same shape natively and chose search over listing.
 
-Where they part company depends on what you're pointing them at. **If your
-tools live in MCP servers and you can name the ones you need**, a filtered
-listing is a fine answer: 569 tokens for ten tools, no ranking to trust, and
-mcp-compressor gives you SDKs and generated clients min-mcp doesn't have. **If
-you don't want to hand-maintain that list**, the listing grows at ~46
-tokens/tool and rewrites on every upstream change, while search stays at 394 —
-and on our tasks it was also more reliable end-to-end, because it hands the
-model ids it can actually call. **And if the surface you need to compress is an
-OpenAPI spec** — Stripe's 587 operations, Microsoft Graph's 17,531 — then
-mcp-compressor isn't in the running until an MCP server for that API exists and
-someone keeps it current; min-mcp mounts the spec.
+**Which means the live question is no longer "which proxy compresses better".**
+It's "does anything here still need a proxy at all?" Three answers survive, and
+only the last is about compression:
 
-The measurements here are honest about their limits: one upstream family
-(Stripe-shaped), tokens counted on real `tools/list` payloads, one flash-tier
-model for the live tasks, and per-task best-of-two seeds. mcp-compressor's
-non-compressed modes (cli/code/just-bash) were inspected, not agent-driven.
+1. **The API has no MCP server.** A ~590-operation Stripe spec or a
+   17,531-operation Microsoft Graph spec is a document. Neither a compressor nor a
+   client's deferred loading can act on tools that don't exist yet; min-mcp
+   manufactures the surface from the spec, with request-body encoding taken from
+   the declared media type. This is the one difference absorption doesn't reach,
+   and it's a scope difference rather than a quality one.
+2. **The tool is broken and you can't edit it.** Neither mcp-compressor nor either
+   platform lets you mark an undocumented parameter required, strip a field so it
+   can't be fabricated, turn an opaque `404` into `{field, allowed_values, fix}`,
+   pin the schema a patch was written against, or prove the fix with real calls in
+   CI. Hiding a bad tool is not fixing it.
+3. **The catalog is past the ceilings.** Anthropic documents a maximum of 10,000
+   deferred tools per request, and deferred definitions are still uploaded on every
+   request. Behind a three-tool surface, neither applies.
+
+If none of those three describe your situation — you run a handful of ordinary MCP
+servers and want the context bill down — then your client probably has you covered,
+and mcp-compressor additionally offers SDKs and generated clients min-mcp doesn't
+have.
+
+The measurements here are honest about their limits, and one more limit now
+applies: they are **historical**. They were taken against the versions of both
+projects available at the time, on one upstream family (Stripe-shaped), with tokens
+counted on real `tools/list` payloads, one flash-tier model for the live tasks, and
+per-task best-of-two seeds. mcp-compressor's non-compressed modes
+(cli/code/just-bash) were inspected, not agent-driven. Both projects have moved
+since, and we have not re-run the head-to-head — so treat the numbers as a record
+of a specific comparison on a specific day, not as current standings.
 
 ## Further reading
 
