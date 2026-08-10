@@ -96,15 +96,56 @@ pub(crate) fn normalize_id(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
-/// Insert spaces at camelCase boundaries so a downstream whitespace tokenizer can
-/// see the words. `PostCheckoutSessions` -> `Post Checkout Sessions`.
-fn split_camel(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 8);
+/// Split an identifier into space-separated words, whatever convention it uses.
+///
+/// This has to happen before the crate's tokenizer, which segments on Unicode word
+/// boundaries (UAX#29) and therefore does NOT split several forms that dominate real
+/// tool catalogs. Measured behaviour of the bare crate tokenizer:
+///
+/// ```text
+/// create_customer       -> ["create_custom"]        one token
+/// read_file             -> ["read_fil"]             one token
+/// github.issues_create  -> ["github.issues_cr"]     one token
+/// stripe.PostCustomers  -> ["stripe.post", "custom"] prefix glued to the verb
+/// getHTTPResponse       -> ["get", "httprespons"]   acronym unsplit
+/// ```
+///
+/// `_` is `ExtendNumLet` in UAX#29, which *joins* words rather than separating them,
+/// and `.` joins inside what looks like a number. So snake_case tool names — most of
+/// the MCP ecosystem: `read_file`, `get_issue`, `list_directory` — were single opaque
+/// tokens, making them unmatchable by any natural query. Our own `upstream.Tool` id
+/// scheme glued the upstream prefix onto the first word of every id.
+///
+/// Boundaries applied here:
+/// - any non-alphanumeric character (`_`, `.`, `-`, `/`, `:`, whitespace)
+/// - lower/digit followed by upper — `PostCheckout` -> `Post Checkout`
+/// - an acronym run ending in a word — `HTTPResponse` -> `HTTP Response`
+///
+/// Digits stay attached to a preceding letter, so `v1` and `oauth2` survive as
+/// single meaningful tokens rather than becoming `v` + `1`.
+fn split_identifier(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
     for (i, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            // separator of any kind: emit one space, never two in a row
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            continue;
+        }
         if i > 0 && c.is_uppercase() {
             let prev = chars[i - 1];
-            if prev.is_lowercase() || prev.is_ascii_digit() {
+            let starts_word = prev.is_lowercase() || prev.is_ascii_digit();
+            // XMLHttp: split before the H, which is the last upper of the run and
+            // the start of the next word
+            // Require a run of at least TWO uppercase before splitting, or the `O`
+            // in `OAuth2Token` is treated as a finished acronym and orphaned.
+            let ends_acronym = prev.is_uppercase()
+                && i >= 2
+                && chars[i - 2].is_uppercase()
+                && chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if (starts_word || ends_acronym) && !out.ends_with(' ') && !out.is_empty() {
                 out.push(' ');
             }
         }
@@ -118,8 +159,8 @@ fn split_camel(text: &str) -> String {
 /// the BM25 tokenizer on purpose: the stemmer turns `create` into `creat`, so
 /// VERB_AFFINITY's literals only work against raw tokens.
 fn raw_tokens(text: &str) -> Vec<String> {
-    split_camel(text)
-        .split(|c: char| !c.is_alphanumeric())
+    split_identifier(text)
+        .split_whitespace()
         .filter(|w| !w.is_empty())
         .map(str::to_lowercase)
         .collect()
@@ -190,7 +231,7 @@ impl Default for ToolTokenizer {
 
 impl Tokenizer for ToolTokenizer {
     fn tokenize(&self, input_text: &str) -> Vec<String> {
-        self.inner.tokenize(&split_camel(input_text))
+        self.inner.tokenize(&split_identifier(input_text))
     }
 }
 
@@ -400,8 +441,81 @@ mod tests {
         ])
     }
 
-    /// The reason ToolTokenizer exists. Without the camelCase pass the crate's
-    /// tokenizer returns one opaque token and operationIds stop being searchable.
+    /// Every naming convention a real tool catalog throws at us. The crate's own
+    /// tokenizer segments on UAX#29 word boundaries, where `_` JOINS words, so
+    /// before `split_identifier` existed `read_file` was the single token
+    /// `read_fil` and unmatchable by the query "read a file".
+    ///
+    /// Asserted on stems, since the pipeline stems: "customer" -> "custom",
+    /// "file" -> "fil", "directory" -> "directori".
+    #[test]
+    fn tokenizer_handles_every_naming_convention() {
+        let t = ToolTokenizer::default();
+        let cases: &[(&str, &[&str])] = &[
+            // camelCase / PascalCase — OpenAPI operationIds
+            ("PostCheckoutSessions", &["post", "checkout", "session"]),
+            ("getUserProfile", &["get", "user", "profil"]),
+            // snake_case — most of the MCP ecosystem
+            ("create_customer", &["creat", "custom"]),
+            ("read_file", &["read", "file"]),
+            ("list_directory", &["list", "directori"]),
+            // SCREAMING_SNAKE_CASE
+            ("CREATE_CUSTOMER", &["creat", "custom"]),
+            // kebab-case
+            ("create-customer", &["creat", "custom"]),
+            ("list-pull-requests", &["list", "pull", "request"]),
+            // dotted — our own upstream.Tool ids, and k8s-style group paths
+            ("stripe.PostCustomers", &["stripe", "post", "custom"]),
+            ("github.issues_create", &["github", "issu", "creat"]),
+            // acronym runs
+            ("getHTTPResponse", &["get", "http", "respons"]),
+            ("XMLHttpRequest", &["xml", "http", "request"]),
+            // digits stay glued: v1 and oauth2 are single meaningful terms
+            ("v1Customers", &["v1", "custom"]),
+            ("OAuth2Token", &["oauth2", "token"]),
+            // slash and colon separators, and mixed conventions in one id
+            ("widgets/create", &["widget", "creat"]),
+            ("acme:widgets_get-one", &["acm", "widget", "get", "one"]),
+        ];
+        for (input, expected) in cases {
+            let got = t.tokenize(input);
+            for want in *expected {
+                assert!(
+                    got.iter().any(|g| g == want),
+                    "{input:?} should yield {want:?}, got {got:?}",
+                );
+            }
+        }
+    }
+
+    /// The specific regression: snake_case tool names must be reachable from a
+    /// natural query. Before the fix, `read_file` indexed as `read_fil` and the
+    /// query "read a file" produced `["read","fil"]` — zero overlap, unfindable.
+    #[test]
+    fn snake_case_tools_are_findable_by_natural_queries() {
+        let idx = Index::build(&[
+            t("files.read_file", "Read the contents of a file"),
+            t("files.write_file", "Write contents to a file"),
+            t("files.list_directory", "List the entries of a directory"),
+        ]);
+        assert_eq!(idx.search("read a file", 3)[0].0, "files.read_file");
+        assert_eq!(idx.search("list a directory", 3)[0].0, "files.list_directory");
+    }
+
+    /// The reason ToolTokenizer exists at all: the bare crate tokenizer collapses
+    /// these, so the wrapper is load-bearing rather than cosmetic.
+    #[test]
+    fn the_bare_crate_tokenizer_really_does_collapse_these() {
+        let bare = bm25::DefaultTokenizer::builder().build();
+        for glued in ["PostCheckoutSessions", "create_customer", "read_file"] {
+            assert_eq!(
+                Tokenizer::tokenize(&bare, glued).len(),
+                1,
+                "{glued} should be one opaque token without our splitter",
+            );
+        }
+    }
+
     #[test]
     fn tokenizer_splits_camel_case_before_stemming() {
         let t = ToolTokenizer::default();
@@ -480,3 +594,4 @@ mod tests {
         assert!(idx.search("customer", 2).len() <= 2);
     }
 }
+
