@@ -1,70 +1,55 @@
-# min-mcp — minify your MCP servers, and fix them on the way through
+# min-mcp — fix the MCP servers you don't own, and minify them on the way through
 
 [![CI](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml) ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Language](https://img.shields.io/badge/rust-2021-orange) ![MCP](https://img.shields.io/badge/MCP-2025--06--18-6E56CF)
 
-A minifying proxy for [Model Context Protocol](https://modelcontextprotocol.io)
-servers, written in Rust. Point min-mcp at your MCP servers (or straight at an
-OpenAPI spec); point your agent at min-mcp. Instead of every server's full tool
-catalog in every request, the agent sees a small, searchable, scope-filtered
-surface — with a source map back to every original tool.
+A repair-and-governance proxy for [Model Context Protocol](https://modelcontextprotocol.io)
+servers, written in Rust. You don't own the servers your agents depend on, and you
+can't edit them — so today you fork them, or paper over their flaws in every
+agent's prompt. min-mcp patches them *as they pass through*: a versioned,
+drift-checked **overlay** you can prove with `minmcp verify` in CI. On the way
+through it also minifies the surface, so a 17,000-operation API arrives as three
+searchable tools instead of a context bill.
 
 ```
+                    ┌─ overlay: patch schemas, rewrite errors, reshape responses
+                    │           (drift-checked, verified in CI)
 your agent ──► minmcp ──► GitHub's MCP server (85 tools)
-   sees            │────► Stripe's OpenAPI spec (587 operations)
+   sees            │────► Stripe's OpenAPI spec (589 operations)
   3 tools          └────► Microsoft Graph's OpenAPI spec (17,531 operations)
 ```
 
-It is a *minifier*, in the JavaScript sense: the output is radically smaller and
-behaviour-preserving, and there's a source map (`get_tool_details`) back to the
-full original.
-
 ## Why
 
-Two things break as teams adopt MCP at scale, and both are widely documented:
+Two things break as teams adopt MCP at scale. One of them is now being solved for
+you; the other isn't.
 
-**1. The context tax.** Tool definitions are loaded into every request, unconditionally.
-GitHub's MCP server alone is [~42–55K tokens of schema](https://getunblocked.com/blog/mcp-token-budget-autopsy/);
-a typical [5–10 server stack burns 100,000–200,000 tokens before the user types a
-character](https://agentmarketcap.ai/blog/2026/04/08/mcp-context-bloat-enterprise-scale-tool-definitions-agent-context-budget).
-Priced out, that "context tax" runs into the [tens of thousands of dollars a year](https://getunblocked.com/blog/mcp-token-budget-autopsy/)
-for a mid-size team — before any productive work. And a 587-tool surface simply
-*can't attach* to some models (Google's 512-function-declaration cap). The usual
-fixes trade one problem for another: hand-curating loses coverage; converting an
-API 1:1 is unrunnable (provider caps), invalid (rejected schemas), or incorrect
-(dropped nested-body encoding).
-
-**2. The tools you depend on are broken.** You don't own the upstream servers, and
-the ecosystem is rough — around [half of registry servers are effectively dead](https://rapidclaw.dev/blog/mcp-servers-dead-what-it-means-2026),
+**1. The tools you depend on are broken, and you can't edit them.** The ecosystem
+is rough — around [half of registry servers are effectively dead](https://rapidclaw.dev/blog/mcp-servers-dead-what-it-means-2026),
 descriptions routinely diverge from behavior, and by week two of production you
 hit *"errors the model can't act on… tools silently disappearing… responses
 exceeding size limits."* ([StackOne](https://www.stackone.com/blog/mcp-where-its-been-where-its-going/))
-You can't edit someone else's server — so today you fork it or paper over it in
-every agent's prompt.
+Forking someone else's server means owning their release cadence forever; prompt
+patches rot silently and can't be tested. Nothing in the platforms addresses this:
+clients can now *find* tools well, but none of them can *fix* one.
 
-min-mcp addresses both: it **minifies** the surface (all tools stay reachable, the
-agent sees a small searchable set — and it trims bloated *responses* too), and it
-**fixes** the tools you don't own (patch descriptions, rewrite unhelpful errors,
-reshape responses) as a versioned, drift-checked overlay instead of a fork.
+**2. The context tax — increasingly handled by your client.** Tool definitions are
+loaded into every request, and a typical [5–10 server stack burns 100,000–200,000
+tokens before the user types a character](https://agentmarketcap.ai/blog/2026/04/08/mcp-context-bloat-enterprise-scale-tool-definitions-agent-context-budget).
+Both major clients now defer loading and search on demand, so if you run a handful
+of ordinary MCP servers, **your client may already cover this** — see
+[About tool search](docs/about-tool-search.md) for what they do and where the
+limits actually bite. min-mcp still matters at the top end: mounting an API that
+has *no MCP server at all*, and catalogs past the size a client can defer.
+
+min-mcp does both, in that order: it **fixes** the tools you don't own (patch
+descriptions and schemas, rewrite unhelpful errors, reshape responses) as a
+drift-checked binding instead of a fork, and it **minifies** the surface so every
+tool stays reachable through a small searchable set.
 → [Concepts](docs/concepts.md)
 
 ## How it works
 
-**1. Minify — the 3-tool surface.** In the default `three_tool` mode the agent
-sees exactly three tools, regardless of how big the upstreams are:
-
-- `search_tools(query, k)` — BM25 over every upstream tool → ranked ids + summaries
-- `get_tool_details(tool_id)` — the full schema on demand (the source map)
-- `call_tool(tool_id, arguments, fields)` — routes to the owning upstream, runs the
-  call, and — with the optional **`fields`** filter — projects the response down to
-  just the dotted paths you ask for (`["data[].id", "data[].amount"]`), GraphQL-style,
-  so a big result doesn't flood the context. Omit `fields` for the whole response.
-
-It searches for the operation it needs, pulls that one schema, calls it, and keeps
-only the fields it asked for. You point min-mcp at upstreams two ways — **proxy
-running MCP servers**, or **mount an OpenAPI spec directly** — through one config
-and one interface.
-
-**2. Fix — overlays.** The tools you're proxying are often broken (undocumented
+**1. Fix — overlays.** The tools you're proxying are often broken (undocumented
 required params, unhelpful errors, bloated responses), and you can't edit someone
 else's server. An **overlay** patches a tool *as it passes through the proxy* — you
 name a tool id and override the parts you want:
@@ -80,12 +65,29 @@ overlays:
         hint: "Repo not found — re-check owner/repo; don't retry with a guess."
 ```
 
-Overlays can rewrite descriptions and errors, patch the input schema
-(mark params `required`, add enums/examples, `hide` noise), inject request
-`defaults`/`headers` (with `{{uuid}}`/`{{hash}}` generators), auto-follow
-pagination, and reshape responses — each a versioned, drift-checked binding you
-can prove with `minmcp verify`, instead of forking the server or patching every
-agent's prompt. → [Overlays](docs/overlays.md)
+Overlays can rewrite descriptions and errors, patch the input schema (mark params
+`required`, add enums/examples, `hide` noise), inject request `defaults`/`headers`
+(with `{{uuid}}`/`{{hash}}` generators), guard a flaky tool (`timeout_s`,
+`breaker`), auto-follow pagination, and reshape responses — each a versioned,
+drift-checked binding you can prove with `minmcp verify`, instead of forking the
+server or patching every agent's prompt. → [Overlays](docs/overlays.md)
+
+**2. Minify — the 3-tool surface.** In the default `three_tool` mode the agent
+sees exactly three tools, regardless of how big the upstreams are:
+
+- `search_tools(query, k)` — BM25 over every upstream tool → ranked ids + summaries
+- `get_tool_details(tool_id)` — the full schema on demand (the source map)
+- `call_tool(tool_id, arguments, fields)` — routes to the owning upstream, runs the
+  call, and — with the optional **`fields`** filter — projects the response down to
+  just the dotted paths you ask for (`["data[].id", "data[].amount"]`), GraphQL-style,
+  so a big result doesn't flood the context. Omit `fields` for the whole response.
+
+It searches for the operation it needs, pulls that one schema, calls it, and keeps
+only the fields it asked for. You point min-mcp at upstreams two ways — **proxy
+running MCP servers**, or **mount an OpenAPI spec directly** — through one config
+and one interface. Search is BM25 over the [`bm25`](https://crates.io/crates/bm25)
+crate, with a camelCase-aware tokenizer so `PostCheckoutSessions` is findable as
+"checkout session".
 
 **3. Also.**
 
@@ -150,7 +152,7 @@ Then point it at your own upstreams — MCP servers you already run, or a spec:
 # a) Proxy MCP servers (copy the template and edit it for your server):
 ./target/release/minmcp serve --config examples/proxy-mcp-server.yaml
 
-# b) Or mount an OpenAPI spec directly — e.g. Stripe's 587 operations → 3 tools.
+# b) Or mount an OpenAPI spec directly — every operation in Stripe's spec → 3 tools.
 #    Download it from github.com/stripe/openapi next to the config as stripe.json:
 STRIPE_TEST_KEY=sk_test_... ./target/release/minmcp inspect --config examples/stripe-from-spec.yaml
 ```
@@ -159,8 +161,19 @@ Full walkthrough → [Getting started](docs/getting-started.md).
 
 ## Proof it works
 
-The claim ("radically smaller *and* behaviour-preserving") is falsifiable, so it
-gets measured. Headlines:
+Every claim here is falsifiable, so it gets measured. Fixing first, since that's
+the headline:
+
+- **A structured error beats prose guidance.** On a broken call where a prose hint
+  changed nothing, handing back `{field, allowed_values, fix}` took a weak agent
+  from **0% → 100%** recovery.
+- **A composite cut a 3-step task 6.8×** on tokens versus the same chain driven
+  step by step.
+- **Fixes are provable, not asserted.** `minmcp verify` runs an overlay's checks
+  against the live upstream with deterministic assertions — the same gate that
+  catches upstream drift in CI.
+
+And the minification, which is the supporting claim:
 
 - **85 tools → 3** proxying GitHub's official MCP server: ~20,822 tokens of
   definitions → **~424** (49×). Add more upstreams and the 424 does not move.
@@ -186,8 +199,9 @@ Full numbers, reproduction steps, and what is *not* measured →
 | [Composites](docs/composites.md) | multi-step chains as one tool, and their safety |
 | [Transports & auth](docs/transports-and-auth.md) | stdio/HTTP, OAuth, JWT scopes |
 | [CLI reference](docs/cli.md) | every command and flag |
+| [About tool search](docs/about-tool-search.md) | what Claude and Codex now do natively, and where that leaves this |
 | [About TOON](docs/about-toon.md) | what it is, what we measured, why we don't emit it |
-| [About mcp-compressor](docs/about-mcp-compressor.md) | the closest peer, measured head-to-head |
+| [About mcp-compressor](docs/about-mcp-compressor.md) | the closest peer proxy, measured head-to-head |
 | [Measurements](docs/measurements.md) | every number, how to reproduce it, and what isn't measured |
 
 ## License

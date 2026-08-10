@@ -152,7 +152,8 @@ upstreams:
     auth_env: STRIPE_TEST_KEY
 ```
 
-Stripe's spec is the scale demonstration — 587 operations to 3 tools. It isn't
+Stripe's spec is the scale demonstration — ~590 operations to 3 tools (the exact
+count moves as Stripe revises the spec). It isn't
 bundled (it's a large third-party document), so download it from
 [github.com/stripe/openapi](https://github.com/stripe/openapi), save it next to
 your config as `stripe.json`, and:
