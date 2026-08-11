@@ -66,7 +66,6 @@ impl Surface {
                 match resolve_user_source(&source) {
                     Some(v) => crate::project::set(&mut arguments, &path, Value::String(v)),
                     None => {
-                        self.index.record_use(tool_id);
                         let e = json!({
                             "error": "missing_user_supplied_value", "field": path,
                             "source": source,
@@ -82,7 +81,6 @@ impl Surface {
         // Runs AFTER defaults (so a default-filled field counts as present).
         if let Some(schema) = &preflight_schema {
             if let Some(se) = preflight_error(schema, &arguments) {
-                self.index.record_use(tool_id);
                 // Operator-facing: preflight is ON by default, so if a spec
                 // over-declares `required` this is where calls that used to
                 // reach the API now stop. Name the escape hatch in the log so
@@ -181,8 +179,18 @@ impl Surface {
                 }
             }
         };
-        self.index.record_use(tool_id);
         let mut is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+        // The usage prior counts SUCCESSES, not attempts. It used to fire on every
+        // path — preflight rejections that never left the proxy, timeouts, upstream
+        // isError — which promoted tools in search ranking *by failing*: the exact
+        // opposite of the breaker's philosophy, and a feedback loop for confusable
+        // tools (the agent keeps picking the wrong sibling, the wrong sibling keeps
+        // rising). Found when the recall eval's own failing calls warmed the prior
+        // and flipped a correct top-1 (PostPrices behind PostProducts at 2 failed
+        // "uses" — the 1.16x boost outweighed a close lexical margin).
+        if !is_error {
+            self.index.record_use(tool_id);
+        }
         if !from_cache {
             // Feed the breaker the PRIMARY call's outcome (cache hits never count).
             if let Some(b) = &breaker_cfg {

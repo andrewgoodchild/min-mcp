@@ -698,3 +698,72 @@ fn cache_allowed_requires_ttl_and_read_only_signal() {
     let s = mk("mode: three_tool\nupstreams: []\nread_cache_ttl_s: 60\noverlays:\n  - tool: up.GetX\n    cacheable: true\n");
     assert!(s.cache_allowed("up.GetX", None));
 }
+
+/// The usage prior must count successes, not attempts. A preflight-rejected call
+/// never left the proxy, yet used to bump the tool's usage — so a tool could rise
+/// in search ranking *by failing*, the opposite of the breaker's philosophy (found
+/// when the recall eval's own failing calls flipped a correct top-1).
+///
+/// Setup: two tools with identical text, so BM25 ties and rank order falls back to
+/// the id tiebreak (Alpha before Zebra). Thirty rejected calls to Zebra would lift
+/// it above Alpha if failures counted (1 + 0.15·ln(31) ≈ 1.5×, far above a tie).
+#[tokio::test]
+async fn failed_calls_do_not_feed_the_usage_prior() {
+    let cfg: Config = serde_yaml::from_str("mode: three_tool\nupstreams: []\n").unwrap();
+    let schema = json!({
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"]
+    });
+    let tools = vec![
+        ToolDef {
+            upstream_idx: 0,
+            name: "Alpha".into(),
+            description: "frob the widget".into(),
+            input_schema: schema.clone(),
+            id: "up.Alpha".into(),
+            read_only: None,
+        },
+        ToolDef {
+            upstream_idx: 0,
+            name: "Zebra".into(),
+            description: "frob the widget".into(),
+            input_schema: schema.clone(),
+            id: "up.Zebra".into(),
+            read_only: None,
+        },
+    ];
+    let corpus: Vec<crate::index::IndexedTool> = tools
+        .iter()
+        .map(|t| crate::index::IndexedTool {
+            id: t.id().to_string(),
+            description: t.description.clone(),
+            params: String::new(),
+        })
+        .collect();
+    let mut s = test_surface(cfg, tools);
+    s.index = Index::build(&corpus);
+    // preflight resolves via patched_schemas, so no backend is touched
+    s.patched_schemas.insert("up.Zebra".to_string(), schema);
+
+    let first = s.index.search("frob the widget", 2);
+    assert_eq!(first[0].0, "up.Alpha", "tie must break toward Alpha before any calls");
+
+    for _ in 0..30 {
+        let r = s
+            .call("call_tool", json!({"tool_id": "up.Zebra", "arguments": {}}))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.get("isError").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the call must be preflight-rejected: {r}"
+        );
+    }
+
+    let after = s.index.search("frob the widget", 2);
+    assert_eq!(
+        after[0].0, "up.Alpha",
+        "thirty REJECTED calls must not lift Zebra above Alpha — failures are not usage"
+    );
+}
