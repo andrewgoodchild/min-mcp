@@ -68,11 +68,29 @@ pub struct IndexOptions {
     /// discriminates. Shadow mode on real multi-upstream traffic is the right venue
     /// to settle that.
     pub params: bool,
+    /// Repeat the id and summary to fake per-field weights (id x3, summary x2).
+    ///
+    /// **Off by default, because it measured worse than doing nothing.** It was
+    /// inherited from a Python prototype and never tested against flat indexing.
+    /// When it finally was: Stripe verbatim recall@1 0.91 weighted vs **0.97 flat**
+    /// (MRR 0.949 vs 0.985), and an exact tie on a filesystem upstream — best or
+    /// tied without it on both corpora, never worse.
+    ///
+    /// The mechanism is that repetition is not weighting. Extra copies inflate
+    /// document length, which BM25 penalises linearly at b=0.75, while term-frequency
+    /// saturation caps what the copies buy. Past a point the penalty exceeds the gain.
+    /// Kept switchable so the comparison stays reproducible rather than folklore.
+    pub field_weights: bool,
+    /// Raise the description caps. **Rejected**: mixed across corpora (+0.03 Stripe
+    /// verbatim, -0.077 filesystem paraphrase). Stripe's descriptions are terse at
+    /// source, so a larger cap harvests nothing; where prose is plentiful the extra
+    /// text dilutes. The cap was never the constraint — upstream brevity was.
+    pub rich: bool,
 }
 
 impl Default for IndexOptions {
     fn default() -> Self {
-        Self { rerank: true, params: false }
+        Self { rerank: true, params: false, field_weights: false, rich: false }
     }
 }
 
@@ -286,7 +304,7 @@ impl Index {
             let params = if opts.params { params.as_str() } else { "" };
             docs.push(bm25::Document::new(
                 tool_id.clone(),
-                weighted_contents(tool_id, description, params),
+                weighted_contents(tool_id, description, params, opts),
             ));
         }
 
@@ -392,20 +410,24 @@ impl Index {
 /// which is approximate — BM25's term-frequency saturation means three copies is
 /// less than three times the weight — but it is the only lever a flat index
 /// offers, and the ordering it produces is what the recall harness measures.
-fn weighted_contents(tool_id: &str, description: &str, params: &str) -> String {
+fn weighted_contents(tool_id: &str, description: &str, params: &str, opts: IndexOptions) -> String {
     let (first, rest) = match description.split_once('\n') {
         Some((f, r)) => (f, r),
         None => (description, ""),
     };
-    let summary: String = first.chars().take(SUMMARY_CAP).collect();
-    let body: String = rest.chars().take(BODY_CAP).collect();
+    let (summary_cap, body_cap) =
+        if opts.rich { (SUMMARY_CAP * 3, BODY_CAP * 6) } else { (SUMMARY_CAP, BODY_CAP) };
+    let summary: String = first.chars().take(summary_cap).collect();
+    let body: String = rest.chars().take(body_cap).collect();
+    let (id_repeats, summary_repeats) =
+        if opts.field_weights { (ID_REPEATS, SUMMARY_REPEATS) } else { (1, 1) };
 
     let mut out = String::with_capacity(tool_id.len() * ID_REPEATS + summary.len() * SUMMARY_REPEATS + body.len() + 8);
-    for _ in 0..ID_REPEATS {
+    for _ in 0..id_repeats {
         out.push_str(tool_id);
         out.push(' ');
     }
-    for _ in 0..SUMMARY_REPEATS {
+    for _ in 0..summary_repeats {
         out.push_str(&summary);
         out.push(' ');
     }

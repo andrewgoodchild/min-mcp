@@ -77,15 +77,26 @@ impl Shadow {
             return Shadow { challengers: Vec::new(), turn: None };
         }
         let variants: &[(&'static str, IndexOptions)] = &[
+            // The shipped configuration, measured through the *challenger* path
+            // (raw index.search) rather than the serving path. `served` minus
+            // `baseline` is therefore the cost of serving itself — scope filtering,
+            // the k*3 over-fetch, and dropping tools without a description — not a
+            // retrieval difference. Without this row, every served-vs-challenger
+            // delta silently mixes the two.
+            ("baseline", IndexOptions::default()),
             // Plain BM25 — what both platforms serve. Tests whether our four rerank
             // layers earn their keep on real queries, or just on our fixtures.
-            ("plain_bm25", IndexOptions { rerank: false, params: false }),
+            ("plain_bm25", IndexOptions { rerank: false, ..IndexOptions::default() }),
+            // The pre-2026-08-11 behaviour: id and summary repeated to fake field
+            // weights. Kept as a challenger because it *lost* to flat indexing and we
+            // want the comparison to stay reproducible rather than become folklore.
+            ("field_weights", IndexOptions { field_weights: true, ..IndexOptions::default() }),
             // Parameter names indexed. Lost badly on the single-API Stripe set, but
             // that is the adversarial case; on a federated surface parameter
             // vocabulary should discriminate. This is the venue to find out.
-            ("params", IndexOptions { rerank: true, params: true }),
+            ("params", IndexOptions { params: true, ..IndexOptions::default() }),
             // Both switches, to catch an interaction the singles would miss.
-            ("plain_params", IndexOptions { rerank: false, params: true }),
+            ("plain_params", IndexOptions { rerank: false, params: true, ..IndexOptions::default() }),
         ];
         let challengers = variants
             .iter()
@@ -160,6 +171,11 @@ impl Shadow {
 mod tests {
     use super::*;
 
+    /// How many challengers the roster ships. Derived, not hardcoded.
+    fn s_challenger_count() -> usize {
+        Shadow::new(&corpus(), true).challengers.len()
+    }
+
     fn corpus() -> Vec<IndexedTool> {
         vec![
             IndexedTool {
@@ -193,8 +209,10 @@ mod tests {
         let mut s = Shadow::new(&corpus(), true);
         s.observe_search("create a customer", &["stripe.PostCustomers".to_string()]);
         let obs = s.observe_call("stripe.PostCustomers", true);
-        // one row for the incumbent plus one per challenger
-        assert_eq!(obs.len(), 4, "got {:?}", obs.iter().map(|o| o.method).collect::<Vec<_>>());
+        // one row for the incumbent plus one per challenger — asserted against the
+        // roster rather than a literal, so adding a challenger can't silently pass
+        assert_eq!(obs.len(), 1 + s_challenger_count(), "got {:?}",
+                   obs.iter().map(|o| o.method).collect::<Vec<_>>());
         assert!(obs.iter().any(|o| o.method == "served" && o.rank == Some(1)));
         for o in &obs {
             assert!(o.hit, "{} should have found the obvious tool", o.method);
