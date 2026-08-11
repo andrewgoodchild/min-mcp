@@ -53,8 +53,10 @@ upstreams:
     args: ["-y", "@some/mcp-server"]
     env: { LOG_LEVEL: debug }           # optional literal env vars set on the child
     # cwd: ./subdir                      # optional; defaults to the config's dir
-    # result_format: json                # json (default): re-encode JSON text results
-    #                                    # compactly; raw: pass through byte-for-byte
+    # result_format: raw                 # raw (default for MCP/HTTP): results pass
+    #                                    # through byte-for-byte — a read_file result
+    #                                    # is never rewritten. json: opt in to compact
+    #                                    # re-encoding of JSON text results
 ```
 
 Upstream **prompts and resources pass through** under the same object model as
@@ -95,7 +97,8 @@ upstreams:
     accept: application/json     # optional Accept header
     headers:                     # optional static request headers (${VAR} expands)
       Notion-Version: "2022-06-28"   # e.g. a mandatory runtime header a spec omits
-    result_format: json          # json (default, compact) | raw (byte-for-byte)
+    result_format: json          # json (default for spec upstreams — min-mcp builds
+                                 # this envelope, compacting is safe) | raw
 ```
 
 Request bodies are encoded from the spec's declared media type (form vs JSON);

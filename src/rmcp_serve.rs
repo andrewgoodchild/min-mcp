@@ -231,10 +231,21 @@ pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
     // Strip scheme, then any :port, then compare the host.
     let after_scheme = origin.split_once("://").map(|(_, rest)| rest).unwrap_or(origin);
     let host = after_scheme.split('/').next().unwrap_or("");
-    let host = match host.rsplit_once(':') {
-        // don't cut inside a bare IPv6 literal ("[::1]" has no port)
-        Some((h, _)) if !h.ends_with(']') || h.contains(']') => h,
-        _ => host,
+    // Port stripping that survives IPv6. A bracketed literal keeps everything up
+    // to `]` (a port can only follow the bracket); otherwise exactly one colon
+    // means host:port, while zero or several means there is no port to strip
+    // (several = a bare unbracketed IPv6 like `::1`). The previous rsplit-based
+    // guard got `http://[::1]` (no port) wrong: it split inside the literal,
+    // compared the host `[:`, and refused a legitimate loopback origin.
+    let host = if host.starts_with('[') {
+        match host.find(']') {
+            Some(i) => &host[..=i],
+            None => host,
+        }
+    } else if host.matches(':').count() == 1 {
+        host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+    } else {
+        host
     };
     matches!(
         host.trim_end_matches('.'),
@@ -317,6 +328,11 @@ mod tests {
             "http://localhost:8080",
             "https://127.0.0.1:3000",
             "http://[::1]:9000",
+            // bare IPv6 loopback, NO port — the case the old port-stripper
+            // mangled into `[:` and refused
+            "http://[::1]",
+            "http://[0:0:0:0:0:0:0:1]",
+            "http://[0:0:0:0:0:0:0:1]:8080",
             "http://localhost.",
         ] {
             assert!(origin_allowed(Some(ok)), "should allow {ok}");
@@ -328,6 +344,9 @@ mod tests {
             "https://localhost.evil.example",
             "http://169.254.169.254",
             "https://sub.localhost.attacker.com",
+            // IPv6 non-loopback, bracketed both ways
+            "http://[2001:db8::1]",
+            "http://[2001:db8::1]:8080",
         ] {
             assert!(!origin_allowed(Some(bad)), "should refuse {bad}");
         }

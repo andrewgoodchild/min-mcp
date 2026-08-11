@@ -25,6 +25,17 @@
 //!
 //! Off unless `shadow: true` is configured: each challenger is a full second index,
 //! so it costs memory and startup time that production should not pay.
+//!
+//! KNOWN LIMITS of the instrument (single-client use is the design point):
+//! - One `Turn` is shared across sessions, so concurrently interleaved HTTP
+//!   clients can score a call against another client's search. Use per session.
+//! - Challenger indexes never receive `record_use`, so on live traffic the
+//!   served-vs-challenger delta includes the usage prior (offline evals don't:
+//!   their calls fail and success-only usage records nothing).
+//! - Ranks are compared within the first `MAX_REMEMBERED` (20) positions for
+//!   all methods uniformly; a served hit past 20 logs as a miss.
+//! - For spec upstreams the `params` challengers index the *shallow* schema
+//!   ($refs unresolved), so body-parameter vocabulary is only partly present.
 
 use std::collections::HashSet;
 

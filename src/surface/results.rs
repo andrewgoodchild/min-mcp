@@ -17,14 +17,16 @@ pub(super) fn result_text(result: &Value) -> &str {
         .unwrap_or("")
 }
 
-/// The API payload inside a tool result: the spec envelope's `body` (embedded
-/// JSON, or a string body parsed), the parsed content JSON (MCP), or raw text.
-pub(super) fn result_payload(result: &Value) -> Value {
+/// The API payload inside a tool result: for a spec-backend result
+/// (`from_spec`), the envelope's `body` (embedded JSON, or a string body
+/// parsed); otherwise the parsed content JSON (MCP), or raw text. `from_spec`
+/// is provenance, not shape — see [`is_envelope`].
+pub(super) fn result_payload(result: &Value, from_spec: bool) -> Value {
     let text = result_text(result);
     let Ok(parsed) = serde_json::from_str::<Value>(text) else {
         return Value::String(text.to_string());
     };
-    if is_envelope(&parsed) {
+    if from_spec && is_envelope(&parsed) {
         match &parsed["body"] {
             Value::String(body) => {
                 if let Ok(b) = serde_json::from_str::<Value>(body) {
@@ -37,15 +39,18 @@ pub(super) fn result_payload(result: &Value) -> Value {
     parsed
 }
 
-/// Is this parsed result text the spec-executor envelope `{status, body, ...}`?
-/// (An MCP payload that merely *has* a `body` key lacks `status`, and vice versa.)
+/// Does this parsed result text have the spec-executor envelope shape
+/// `{status, body, ...}`? Shape alone is NOT sufficient to classify — an MCP
+/// tool can legitimately return an http-fetch-style `{"status":200,"body":{…}}`
+/// object of its own — so every caller gates this on *provenance*: only a
+/// result that came from a spec backend is unwrapped as an envelope.
 pub(super) fn is_envelope(parsed: &Value) -> bool {
     parsed.is_object() && parsed.get("status").is_some() && parsed.get("body").is_some()
 }
 
 /// Evaluate a verify check's assertions against a tool result. Returns
 /// (passed, failure-reasons). Every specified assertion must hold.
-pub(super) fn eval_expect(result: &Value, e: &crate::config::Expect) -> (bool, Vec<String>) {
+pub(super) fn eval_expect(result: &Value, from_spec: bool, e: &crate::config::Expect) -> (bool, Vec<String>) {
     let mut fails = Vec::new();
     let text = result_text(result);
 
@@ -71,7 +76,7 @@ pub(super) fn eval_expect(result: &Value, e: &crate::config::Expect) -> (bool, V
     }
     // has/missing check the parsed API payload (through the spec envelope)
     if !e.has.is_empty() || !e.missing.is_empty() {
-        let payload = result_payload(result);
+        let payload = result_payload(result, from_spec);
         for p in &e.has {
             if matches!(get_path(&payload, p), None | Some(Value::Null)) {
                 fails.push(format!("has {p:?}: missing or null"));
@@ -199,7 +204,7 @@ pub(super) fn apply_response_transform(
 /// keep status/truncated. An MCP result is transformed directly. Text that
 /// isn't JSON (or a body that isn't JSON, e.g. TOON) is left untouched. This is
 /// the shared unwrap used by overlay field-drop and caller field-projection.
-pub(super) fn transform_result(result: &mut Value, mut f: impl FnMut(&mut Value)) {
+pub(super) fn transform_result(result: &mut Value, from_spec: bool, mut f: impl FnMut(&mut Value)) {
     let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) else {
         return;
     };
@@ -210,7 +215,7 @@ pub(super) fn transform_result(result: &mut Value, mut f: impl FnMut(&mut Value)
         let Ok(mut parsed) = serde_json::from_str::<Value>(&text) else {
             continue; // not JSON — leave as-is
         };
-        let new_text = if is_envelope(&parsed) {
+        let new_text = if from_spec && is_envelope(&parsed) {
             // take, don't clone — parsed is local, and the continue arms drop it
             match std::mem::take(&mut parsed["body"]) {
                 // current shape: body embedded as JSON — transform in place

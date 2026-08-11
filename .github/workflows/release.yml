@@ -42,11 +42,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Don't publish from a tree that wouldn't pass CI — on any platform we
-      # publish for, Windows included.
-      - name: Gate (clippy + tests)
-        run: |
-          cargo clippy --release --all-targets -- -D warnings
-          cargo test --release
+      # publish for, Windows included. Two steps, not one script: on
+      # windows-latest the default pwsh shell keeps going past a failing native
+      # command and reports the LAST command's exit code, which silently
+      # swallowed a clippy failure.
+      - name: Gate (clippy)
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: Gate (tests)
+        run: cargo test --release
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}

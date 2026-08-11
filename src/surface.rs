@@ -371,6 +371,16 @@ impl Surface {
     /// The full input schema to surface for a tool — resolved on demand for spec
     /// upstreams (which store a cheap unresolved schema at load so huge specs load
     /// instantly), else the schema already stored on the ToolDef.
+    /// Provenance for envelope unwrapping: does this tool's result come from a
+    /// spec backend (whose executor wraps responses in `{status, body, …}`)?
+    /// MCP/HTTP upstream results are never envelopes, whatever their shape.
+    fn tool_from_spec(&self, tool_id: &str) -> bool {
+        self.by_id
+            .get(tool_id)
+            .map(|&i| self.tools[i].upstream_idx)
+            .is_some_and(|u| matches!(self.upstreams.get(u), Some(Backend::Spec(_))))
+    }
+
     fn resolved_schema(&self, t: &ToolDef) -> Value {
         // An overlaid tool's patched schema wins (it was resolved + patched at
         // load); otherwise resolve lazily, once, and memoize (schemas are
@@ -440,7 +450,9 @@ impl Surface {
 
     /// Invoke a tool or composite by id with optional projection (`minmcp call`).
     pub async fn cli_call(&mut self, tool_id: &str, arguments: Value, fields: &[String]) -> Result<Value> {
-        self.route_call(tool_id, arguments, fields).await
+        let mut r = self.route_call(tool_id, arguments, fields).await?;
+        truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
+        Ok(r)
     }
 
     /// Client-side errors (bad args, unknown tool) are returned as isError
@@ -511,7 +523,12 @@ impl Surface {
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                     .unwrap_or_default();
-                self.route_call(&id, inner, &fields).await
+                // Agent boundary: bound the result AFTER overlays/projection ran
+                // on the full body (workflow steps and verify call route_call/
+                // dispatch directly and read untruncated results).
+                let mut r = self.route_call(&id, inner, &fields).await?;
+                truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
+                Ok(r)
             }
             _ => {
                 // promoted / passthrough tool name (no meta wrapper -> no projection)
@@ -522,7 +539,9 @@ impl Surface {
                         true,
                     ));
                 };
-                self.dispatch(&id, args, &[]).await
+                let mut r = self.dispatch(&id, args, &[]).await?;
+                truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
+                Ok(r)
             }
         }
     }

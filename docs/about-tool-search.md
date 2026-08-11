@@ -56,7 +56,11 @@ The search text is built by walking the tool spec including its JSON Schema
 (`append_schema_search_text`), the BM25 index is cached and rebuilt when the tool
 registry changes, and a `limit` parameter caps results. Schema migrations
 (`0004_thread_dynamic_tools` → `0019_…_defer_loading` → `0026_…_namespace`) show a
-maturing feature rather than an experiment.
+maturing feature rather than an experiment — and it has since graduated past
+optional: the feature flags for it are retained only as removed no-ops, whose own
+comments read *"tool_search is always enabled"* and *"MCP tools are always
+deferred when tool_search is available"* (`codex-rs/features/src/lib.rs`). For
+Codex users, deferred tool search is not a setting; it is the only mode.
 
 min-mcp uses the same crate, so the honest comparison is precise. Two deliberate
 differences, both measured on our side:

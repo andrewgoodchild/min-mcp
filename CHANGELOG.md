@@ -32,6 +32,25 @@ All notable changes to min-mcp. Format loosely follows
   and larger description caps (upstream brevity, not our caps, is the
   constraint).
 
+### Fixed
+
+- **MCP/HTTP results are byte-faithful by default.** `result_format` now defaults
+  per upstream kind: `raw` for MCP/HTTP upstreams (their bytes are not ours to
+  rewrite — compacting a pretty-printed `read_file` result mangled the file's
+  real formatting and broke whitespace-sensitive `error_hints`/`verify`
+  matchers), `json` for spec upstreams (min-mcp builds that envelope, so
+  compacting stays free and safe). `result_format: json` remains the opt-in for
+  MCP servers whose results are JSON payloads rather than documents.
+- `Origin: http://[::1]` (bare IPv6 loopback, no port) was refused by the HTTP
+  transport's DNS-rebinding check — the port stripper cut inside the literal.
+- A timeout or transport failure on a pagination *follow-up* page discarded all
+  already-fetched pages as a protocol error; it now stops pagination and returns
+  the partial list with the PAGINATION notice.
+- An MCP result shaped like `{"status":…,"body":…}` was mistaken for the spec
+  envelope, so projections and workflow outputs silently ran against `body`
+  only. Envelope unwrapping is now gated on the upstream actually being a spec
+  backend, not on result shape.
+
 ### Docs
 
 - New [About tool search](docs/about-tool-search.md): what Claude and Codex now

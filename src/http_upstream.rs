@@ -53,7 +53,7 @@ impl HttpUpstream {
             .context("building HTTP client for upstream")?;
         let mut up = HttpUpstream {
             name: cfg.name.clone(),
-            result_format: cfg.result_format,
+            result_format: cfg.result_format(),
             client,
             url,
             headers,

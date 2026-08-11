@@ -10,7 +10,16 @@ use tokio::time::{timeout, Duration};
 use crate::config::UpstreamConfig;
 use crate::jsonrpc;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// The transport-level ceiling every per-call deadline is clamped to. An overlay
+/// `timeout_s` may tighten a call below this; nothing may exceed it.
+///
+/// KNOWN LIMIT: the deadline wraps `read_response`, which may itself WRITE to
+/// upstream stdin (replying to server pings). Expiry mid-write drops that reply,
+/// and in the worst case (reply > PIPE_BUF into a full pipe) could desync the
+/// frame stream until the upstream restarts. Restructuring server-request
+/// replies out of the deadline scope is tracked as future work.
+pub(crate) const TRANSPORT_CEILING_S: u64 = 120;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(TRANSPORT_CEILING_S);
 /// Typed marker for an overlay `timeout_s` deadline expiring — dispatch
 /// downcasts it into an agent-facing isError instead of a protocol error.
 #[derive(Debug)]
@@ -52,6 +61,13 @@ fn prompt_params(name: &str, arguments: Value) -> Value {
 /// protocol-shaped above it — tool listing, passthrough listing, resource and
 /// prompt fetches, tool calls — is provided ONCE here, so the stdio and HTTP
 /// clients cannot drift apart.
+/// Hard ceiling on `nextCursor` pages followed in one listing. Generous — a
+/// paginated upstream would need >100k tools to hit it — but it turns a buggy or
+/// adversarial upstream that echoes a cursor forever from a permanent wedge (the
+/// listing loop runs while rmcp_serve holds the shared Surface mutex, so every
+/// session's every call would block) into a truncated listing.
+const LIST_MAX_PAGES: usize = 1_000;
+
 #[allow(async_fn_in_trait)] // concrete impls only; no dyn use
 pub trait McpRpc {
     /// The upstream's public name (prefixes tool ids).
@@ -73,14 +89,17 @@ pub trait McpRpc {
     async fn list_tools(&mut self, upstream_idx: usize) -> Result<Vec<ToolDef>> {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..LIST_MAX_PAGES {
             let result = self.rpc("tools/list", cursor_params(&cursor), None).await?;
             let name = self.rpc_name().to_string();
-            cursor = push_tools_page(&result, &name, upstream_idx, &mut tools);
-            if cursor.is_none() {
+            let next = push_tools_page(&result, &name, upstream_idx, &mut tools);
+            // a non-advancing cursor would refetch the same page forever
+            if next.is_none() || next == cursor {
                 return Ok(tools);
             }
+            cursor = next;
         }
+        Ok(tools)
     }
 
     /// Best-effort passthrough listing: an upstream without the capability (or
@@ -89,18 +108,21 @@ pub trait McpRpc {
     async fn list_passthrough(&mut self, method: &str, key: &str) -> Vec<Value> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..LIST_MAX_PAGES {
             let Ok(mut r) = self.rpc(method, cursor_params(&cursor), None).await else {
                 return out;
             };
             if let Some(arr) = r.get_mut(key).and_then(Value::as_array_mut) {
                 out.append(arr); // take, don't clone — r is owned and dropped
             }
-            cursor = r.get("nextCursor").and_then(Value::as_str).map(str::to_string);
-            if cursor.is_none() {
+            let next = r.get("nextCursor").and_then(Value::as_str).map(str::to_string);
+            // stop on end-of-listing AND on a cursor that didn't advance
+            if next.is_none() || next == cursor {
                 return out;
             }
+            cursor = next;
         }
+        out
     }
 
     async fn read_resource(&mut self, uri: &str) -> Result<Value> {
@@ -198,7 +220,7 @@ impl Upstream {
         let stdout = child.stdout.take().context("upstream stdout")?;
         let mut up = Upstream {
             name: cfg.name.clone(),
-            result_format: cfg.result_format,
+            result_format: cfg.result_format(),
             _child: child,
             stdin,
             lines: BufReader::new(stdout).lines(),

@@ -190,7 +190,7 @@ impl Surface {
         let mut results = Vec::new();
         for (tool, check) in checks {
             let outcome = match self.route_call(&tool, check.arguments.clone(), &[]).await {
-                Ok(r) => eval_expect(&r, &check.expect),
+                Ok(r) => eval_expect(&r, self.tool_from_spec(&tool), &check.expect),
                 Err(e) => (false, vec![format!("call errored: {e}")]),
             };
             if outcome.0 {

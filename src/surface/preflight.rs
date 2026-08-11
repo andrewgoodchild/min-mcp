@@ -80,7 +80,7 @@ pub(super) fn preflight_walk(container: &Value, args: &Value, prefix: &str) -> O
             continue;
         }
         if let Some(en) = pschema.get("enum").and_then(Value::as_array) {
-            if !en.iter().any(|x| x == v) {
+            if !en.iter().any(|x| enum_value_matches(x, v)) {
                 return structured_field_error(container, name, &path, "invalid_enum_value");
             }
         }
@@ -91,6 +91,20 @@ pub(super) fn preflight_walk(container: &Value, args: &Value, prefix: &str) -> O
         }
     }
     None
+}
+
+/// Enum membership with JSON-Schema number semantics: `2` and `2.0` are the
+/// same number even though `serde_json::Value` equality says otherwise (a JS or
+/// YAML client that float-encodes an integer is spec-valid, and preflight must
+/// never reject a call the upstream accepts).
+fn enum_value_matches(allowed: &Value, got: &Value) -> bool {
+    if allowed == got {
+        return true;
+    }
+    match (allowed.as_f64(), got.as_f64()) {
+        (Some(a), Some(g)) => a == g,
+        _ => false,
+    }
 }
 
 /// Does this property schema explicitly admit null? (OpenAPI 3.0

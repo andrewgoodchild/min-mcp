@@ -18,7 +18,7 @@ impl Surface {
                     true,
                 ));
             }
-            let payload = result_payload(&result);
+            let payload = result_payload(&result, self.tool_from_spec(&step.tool));
             for (name, path) in &step.output {
                 if let Some(v) = get_path(&payload, path) {
                     outs.insert(format!("{}.{}", step.id, name), v.clone());

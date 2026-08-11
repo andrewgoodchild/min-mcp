@@ -34,7 +34,14 @@ impl Surface {
                 ov.and_then(|o| o.paginate.clone()),
             )
         };
-        let deadline = timeout_s.map(std::time::Duration::from_secs);
+        // Clamped to the transport ceiling: `timeout_s` TIGHTENS the 120s default,
+        // it never extends it. Unclamped, an HTTP/spec deadline replaced reqwest's
+        // client timeout (a timeout_s: 600 held the shared Surface mutex for ten
+        // minutes, freezing every session), while stdio's 120s per-line read made
+        // the same value unenforceable — the transports diverged and both
+        // contradicted the config doc.
+        let deadline = timeout_s
+            .map(|t| std::time::Duration::from_secs(t.min(crate::upstream::TRANSPORT_CEILING_S)));
         // Resolve the patched schema up front (owned) for pre-flight. Only when
         // preflight is enabled (skips the clone otherwise).
         let preflight_schema = if preflight_on {
@@ -49,7 +56,10 @@ impl Surface {
         let extra_headers: Vec<(String, String)> = match self.tool_headers.get(tool_id) {
             Some(hs) => {
                 let args_hash = if hs.iter().any(|(_, v)| v.contains("{{hash}}")) {
-                    format!("{:016x}", fnv1a(&serde_json::to_string(&arguments).unwrap_or_default()))
+                    // canonical (key-order-insensitive), matching the cache key:
+                    // a retry that reorders JSON keys must produce the SAME
+                    // idempotency key, or the upstream's dedup never fires
+                    format!("{:016x}", fnv1a(&cache::canonical_args(&arguments)))
                 } else {
                     String::new()
                 };
@@ -202,19 +212,25 @@ impl Surface {
             // Follow pagination and concatenate before any response shaping, so the
             // agent gets one complete list instead of hand-rolling a cursor loop.
             // (A cache hit already stored the merged list.)
+            let mut partial_pages = false;
             if let Some(p) = &paginate {
                 if !is_error {
-                    result = self
+                    let (merged, partial) = self
                         .paginate(idx, &original_name, arguments, &extra_headers, result, p, deadline)
                         .await?;
+                    result = merged;
+                    partial_pages = partial;
                     is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
                 }
             }
             // Cache only clean successes (an error result must never be
-            // replayed), and only reasonably-sized ones — 512 entries of
+            // replayed) — and a pagination run that stopped early is NOT clean:
+            // its merged list is known-incomplete, and serving it for the full
+            // TTL would replay the gap long after the upstream recovered.
+            // Only reasonably-sized ones — 512 entries of
             // multi-MB pre-truncation payloads would be a memory foot-gun.
             // (The size probe runs only when this call is actually cacheable.)
-            if !is_error {
+            if !is_error && !partial_pages {
                 if let Some(k) = cache_key {
                     const CACHE_ENTRY_MAX_BYTES: usize = 262_144;
                     if json_len(&result) <= CACHE_ENTRY_MAX_BYTES {
@@ -252,7 +268,9 @@ impl Surface {
         let has_transform = rt.map(|r| !r.is_noop()).unwrap_or(false);
         let keep: &[String] = if is_error { &[] } else { fields };
         if has_transform || !keep.is_empty() {
-            transform_result(&mut result, |payload| {
+            // provenance, not shape: only spec-backend results are envelopes
+            let from_spec = matches!(self.upstreams[idx], crate::backend::Backend::Spec(_));
+            transform_result(&mut result, from_spec, |payload| {
                 if let Some(rt) = rt {
                     apply_response_transform(payload, rt, is_error);
                 }
@@ -261,10 +279,12 @@ impl Surface {
                 }
             });
         }
-        // Final agent-facing budget: overlays/projection ran on the FULL body
-        // above; now bound whatever survives so a large unprojected result can't
-        // blow the context (char-boundary safe).
-        truncate_result_text(&mut result, AGENT_RESULT_BUDGET);
+        // NOTE: no truncation here. dispatch() serves two audiences — the agent
+        // (via Surface::call / cli_call) and internal machinery (workflow step
+        // outputs, verify assertions) that must read the FULL result: truncating
+        // here cut >8KB step results mid-JSON, every output path resolved to
+        // None, and the next step received the literal '$steps.…' placeholder.
+        // The agent-facing budget is applied at the boundary in Surface::call.
         self.apply_error_hints(tool_id, &mut result);
         // Nudge (law 6): a large result the caller didn't project is the teachable
         // moment to point at `fields`. Only in three_tool, where call_tool exists.
@@ -298,9 +318,10 @@ impl Surface {
         first: Value,
         p: &crate::config::Paginate,
         deadline: Option<std::time::Duration>,
-    ) -> Result<Value> {
+    ) -> Result<(Value, bool)> {
         // Parse each page's payload exactly once and carry it forward.
-        let mut payload = result_payload(&first);
+        let from_spec = matches!(self.upstreams[idx], crate::backend::Backend::Spec(_));
+        let mut payload = result_payload(&first, from_spec);
         let page_items = |pl: &Value| get_path(pl, &p.items).and_then(Value::as_array).cloned().unwrap_or_default();
         let mut items = page_items(&payload);
         let mut pages = 1usize;
@@ -326,12 +347,23 @@ impl Surface {
             }
             prev_cursor = Some(cursor.clone());
             crate::project::set(&mut args, &p.into, cursor);
-            let next = self.upstreams[idx].call_tool(name, args.clone(), headers, deadline).await?;
+            // A follow-up failure — isError, timeout, or transport — must NOT
+            // discard the pages already fetched. `?` here used to let a follow-up
+            // TimeoutElapsed escape as a protocol error, throwing away pages 1..k
+            // and skipping the PAGINATION notice; now every failure shape stops
+            // pagination and surfaces on the merged (partial) result instead.
+            let next = match self.upstreams[idx].call_tool(name, args.clone(), headers, deadline).await {
+                Ok(n) => n,
+                Err(_) => {
+                    partial_error = true;
+                    break;
+                }
+            };
             if next.get("isError").and_then(Value::as_bool).unwrap_or(false) {
                 partial_error = true; // don't swallow it — flagged on the merged result
                 break;
             }
-            let next_payload = result_payload(&next);
+            let next_payload = result_payload(&next, from_spec);
             let page = page_items(&next_payload);
             if page.is_empty() {
                 break;
@@ -345,7 +377,7 @@ impl Surface {
         let mut merged = first;
         let items_path = p.items.clone();
         let more_path = p.more.clone();
-        transform_result(&mut merged, |payload| {
+        transform_result(&mut merged, from_spec, |payload| {
             crate::project::set(payload, &items_path, Value::Array(items.clone()));
             if let Some(mf) = &more_path {
                 crate::project::set(payload, mf, Value::Bool(false));
@@ -356,12 +388,12 @@ impl Surface {
         if partial_error {
             if let Some(blocks) = merged.get_mut("content").and_then(Value::as_array_mut) {
                 blocks.push(json!({"type": "text", "text": format!(
-                    "PAGINATION: stopped after {pages} page(s) on an upstream error; the list may be incomplete."
+                    "PAGINATION: stopped after {pages} page(s) on an upstream error or timeout; the list may be incomplete."
                 )}));
             }
         }
         self.log_event("paginate", json!({"tool": name, "pages": pages, "items": count, "partial": partial_error}));
-        Ok(merged)
+        Ok((merged, partial_error))
     }
 
     /// Errors are continuation prompts (law 6): append recovery instructions

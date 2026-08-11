@@ -8,16 +8,21 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// How a tool-call result body is serialized back to the agent.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
+///
+/// The default depends on who owns the serialization. A **spec** upstream's
+/// response envelope is built by min-mcp, so compacting it is free and safe:
+/// default `json`. An **MCP/HTTP** upstream's result is someone else's bytes —
+/// compacting a `read_file` result that happens to be pretty-printed JSON
+/// destroys the file's real formatting, and the agent then edits or writes back
+/// mangled content. So for those upstreams the default is `raw`, and `json` is
+/// the explicit opt-in for servers whose results are JSON *payloads*, not
+/// documents.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultFormat {
-    /// Re-serialize the (parsed) response as compact JSON — the default: same
-    /// task success as raw pass-through, smaller than an API's pretty JSON, and
-    /// free (`serde_json::to_string`).
-    #[default]
+    /// Re-serialize JSON text as compact JSON (strip inter-token whitespace).
     Json,
-    /// Pass the upstream's response body through byte-for-byte (opt out of
-    /// re-serialization, e.g. for non-JSON responses).
+    /// Pass the upstream's result through byte-for-byte.
     Raw,
 }
 
@@ -85,10 +90,12 @@ pub struct UpstreamConfig {
     pub accept: Option<String>,
     /// How this upstream's response bodies are serialized to the agent. On spec
     /// upstreams `json` embeds the parsed body in the result envelope; on MCP /
-    /// HTTP upstreams `json` re-encodes JSON text blocks compactly (the free
-    /// token win) and `raw` passes results through byte-for-byte.
+    /// HTTP upstreams `json` re-encodes JSON text blocks compactly and `raw`
+    /// passes results through byte-for-byte. Defaults per upstream kind — spec:
+    /// `json` (we own that serialization), MCP/HTTP: `raw` (byte fidelity for
+    /// results we don't own). See [`UpstreamConfig::result_format`].
     #[serde(default)]
-    pub result_format: ResultFormat,
+    result_format: Option<ResultFormat>,
 }
 
 /// OAuth 2.0 client-credentials grant config for an upstream.
@@ -105,6 +112,18 @@ pub struct OAuthConfig {
 }
 
 impl UpstreamConfig {
+    /// The effective result format: the configured value, or the kind-dependent
+    /// default — `json` for spec upstreams (min-mcp builds that envelope, so
+    /// compacting is safe), `raw` for MCP/HTTP upstreams (their bytes are not
+    /// ours to rewrite; `json` is the opt-in).
+    pub fn result_format(&self) -> ResultFormat {
+        self.result_format.unwrap_or(if self.is_spec() {
+            ResultFormat::Json
+        } else {
+            ResultFormat::Raw
+        })
+    }
+
     pub fn is_spec(&self) -> bool {
         self.spec.is_some()
     }
@@ -473,11 +492,19 @@ pub struct Overlay {
     #[serde(default)]
     pub cacheable: Option<bool>,
     /// Per-tool call timeout (seconds) for the upstream call, tighter than the
-    /// transport's 120s default. On expiry the agent gets an isError result that
+    /// transport's 120s default. Values above 120 are clamped to 120 — the
+    /// transport ceiling is a ceiling, not a suggestion. On expiry the agent gets an isError result that
     /// says the operation may still have completed — never a silent hang eating
-    /// the turn budget. Applies to the primary call (not pagination follow-ups).
+    /// the turn budget. Applies to every upstream call, pagination follow-ups
+    /// included; a follow-up that times out stops pagination and the pages
+    /// already fetched are returned with a PAGINATION notice.
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// KNOWN LIMIT: `{{hash}}` headers combined with `paginate` reuse page 1's
+    /// key on every follow-up page (headers resolve once per call). Against an
+    /// idempotency-honouring API that replays page 1 — the non-advancing-cursor
+    /// guard then ends pagination with page 1 only. Don't combine the two; a
+    /// per-page re-resolution is tracked as future work.
     /// Circuit breaker: after `consecutive_failures` isError results this tool
     /// is paused for `cooldown_s` (then one probe call is let through). The
     /// structural fix for identical-retry loops — measured burning 15 turns in
@@ -667,6 +694,21 @@ impl Config {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config {path}"))?;
         let mut cfg: Config = serde_yaml::from_str(&text).context("invalid config yaml")?;
+        // Duplicate upstream names are a routing hazard, not a style nit: every
+        // per-tool map (by_id, origin_sha, patched schemas, headers) keys on
+        // `name.tool`, so two upstreams named the same silently last-wins — a
+        // call aimed at the first executes against the second. Refuse to start.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for up in &cfg.upstreams {
+                if !seen.insert(up.name.as_str()) {
+                    anyhow::bail!(
+                        "duplicate upstream name {:?}: tool ids are namespaced by upstream                          name, so duplicates would silently route one upstream's calls to                          the other. Rename one of them.",
+                        up.name
+                    );
+                }
+            }
+        }
         cfg.index_overlays();
         // Resolve upstream cwd to the config's directory so relative args
         // (e.g. `uv --directory research`) don't depend on minmcp's own CWD.
@@ -938,12 +980,15 @@ overlays:
     #[test]
     fn load_accepts_result_format_on_any_upstream_and_defaults_preflight_on() {
         let dir = std::env::temp_dir();
-        // result_format is now honored on MCP upstreams too (raw = opt out of
-        // the compact re-encode), so an explicit value must load cleanly.
+        // result_format defaults per upstream kind: raw for MCP/HTTP (byte
+        // fidelity for results we don't own — a read_file result is never
+        // rewritten), json for spec (min-mcp builds that envelope). Explicit
+        // values still win.
         let cfg_path = dir.join(format!("minmcp_cfg_rf_{}.yaml", std::process::id()));
-        std::fs::write(&cfg_path, "upstreams:\n  - name: srv\n    command: echo\n    result_format: raw\n").unwrap();
+        std::fs::write(&cfg_path, "upstreams:\n  - name: srv\n    command: echo\n  - name: exp\n    command: echo\n    result_format: json\n").unwrap();
         let cfg = Config::load(cfg_path.to_str().unwrap()).unwrap();
-        assert_eq!(cfg.upstreams[0].result_format, ResultFormat::Raw);
+        assert_eq!(cfg.upstreams[0].result_format(), ResultFormat::Raw, "MCP default is raw");
+        assert_eq!(cfg.upstreams[1].result_format(), ResultFormat::Json, "explicit json wins");
         // preflight defaults ON (the head-to-head correction); read cache OFF.
         assert!(cfg.preflight, "preflight must default on");
         assert_eq!(cfg.read_cache_ttl_s, 0, "read cache must default off");

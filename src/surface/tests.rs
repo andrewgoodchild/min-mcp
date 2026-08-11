@@ -117,7 +117,7 @@ fn transform_result_reaches_into_the_spec_envelope_body() {
     let envelope = json!({"status": 200, "body": body, "truncated": false}).to_string();
     let mut result = json!({"content": [{"type": "text", "text": envelope}], "isError": false});
 
-    transform_result(&mut result, |p| {
+    transform_result(&mut result, true, |p| {
         crate::project::prune(p, &["data[].x".to_string()]); // overlay-style drop
         *p = crate::project::project(p, &["data[].id".to_string(), "has_more".to_string()]);
     });
@@ -135,7 +135,7 @@ fn transform_result_leaves_non_json_body_untouched() {
     let envelope = json!({"status": 200, "body": "data[1]{id}:\n  a\n", "truncated": false}).to_string();
     let mut result = json!({"content": [{"type": "text", "text": envelope}], "isError": false});
     let before = result.clone();
-    transform_result(&mut result, |p| *p = crate::project::project(p, &["data".to_string()]));
+    transform_result(&mut result, true, |p: &mut Value| *p = crate::project::project(p, &["data".to_string()]));
     assert_eq!(result, before, "non-JSON body is left alone");
 }
 
@@ -284,7 +284,7 @@ fn workflow_expression_resolution_and_payload() {
     let body = json!({"id": "prod_1", "object": "product"}).to_string();
     let result = json!({"content": [{"type": "text",
         "text": json!({"status": 200, "body": body, "truncated": false}).to_string()}], "isError": false});
-    let p = result_payload(&result);
+    let p = result_payload(&result, true);
     assert_eq!(get_path(&p, "id"), Some(&json!("prod_1")));
 }
 
@@ -297,6 +297,10 @@ fn get_path_reads_plain_index_and_last_item() {
     assert_eq!(get_path(&v, "data[last].id"), Some(&json!("z")));
     assert_eq!(get_path(&v, "missing"), None);
     assert_eq!(get_path(&json!({"data": []}), "data[last].id"), None);
+}
+
+fn eval_expect_spec(result: &Value, e: &crate::config::Expect) -> (bool, Vec<String>) {
+    eval_expect(result, true, e)
 }
 
 #[test]
@@ -314,10 +318,10 @@ fn eval_expect_checks_status_error_paths_and_substring() {
         missing: vec!["nope".into()],
         contains: Some("accounts".into()),
     };
-    assert_eq!(eval_expect(&ok, &pass), (true, vec![]));
+    assert_eq!(eval_expect(&ok, true, &pass), (true, vec![]));
 
     // each assertion can fail independently
-    let (p, fails) = eval_expect(
+    let (p, fails) = eval_expect_spec(
         &ok,
         &Expect {
             status: Some(404),
@@ -332,7 +336,7 @@ fn eval_expect_checks_status_error_paths_and_substring() {
 
     // an isError result verifies against is_error:true (the negative-case fix test)
     let err = text_result("bad".into(), true);
-    assert_eq!(eval_expect(&err, &Expect { is_error: Some(true), ..Default::default() }), (true, vec![]));
+    assert_eq!(eval_expect(&err, true, &Expect { is_error: Some(true), ..Default::default() }), (true, vec![]));
 }
 
 #[test]
@@ -601,7 +605,7 @@ fn transform_result_reaches_embedded_json_body() {
     let mut r = json!({"content": [{"type": "text",
         "text": json!({"status": 200, "body": {"keep": 1, "drop": 2}, "truncated": false}).to_string()}],
         "isError": false});
-    transform_result(&mut r, |payload| {
+    transform_result(&mut r, true, |payload| {
         if let Some(o) = payload.as_object_mut() {
             o.remove("drop");
         }
@@ -611,7 +615,7 @@ fn transform_result_reaches_embedded_json_body() {
     assert_eq!(parsed["body"], json!({"keep": 1}));
     assert_eq!(parsed["status"], json!(200));
     // and result_payload unwraps the embedded body directly
-    assert_eq!(result_payload(&r), json!({"keep": 1}));
+    assert_eq!(result_payload(&r, true), json!({"keep": 1}));
 }
 
 #[tokio::test]
@@ -766,4 +770,28 @@ async fn failed_calls_do_not_feed_the_usage_prior() {
         after[0].0, "up.Alpha",
         "thirty REJECTED calls must not lift Zebra above Alpha — failures are not usage"
     );
+}
+
+/// Provenance beats shape: an MCP tool may legitimately return an
+/// http-fetch-style `{"status":…,"body":…}` object of its own. Before
+/// provenance-gating, `is_envelope` shape-sniffed it as a spec envelope, ran
+/// projections inside `body` only, and a caller asking for top-level `status`
+/// silently got nothing.
+#[test]
+fn mcp_result_shaped_like_an_envelope_is_not_unwrapped() {
+    let text = json!({"status": 200, "headers": {"x": "y"}, "body": {"id": "z1"}}).to_string();
+    let mut r = json!({"content": [{"type": "text", "text": text}], "isError": false});
+
+    // from_spec = false: the whole object is the payload
+    assert_eq!(
+        result_payload(&r, false),
+        json!({"status": 200, "headers": {"x": "y"}, "body": {"id": "z1"}})
+    );
+    // a top-level projection must see `status`
+    transform_result(&mut r, false, |p| {
+        *p = crate::project::project(p, &["status".to_string(), "body.id".to_string()]);
+    });
+    let parsed: Value =
+        serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed, json!({"status": 200, "body": {"id": "z1"}}));
 }
