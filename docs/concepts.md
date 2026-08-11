@@ -110,7 +110,9 @@ to *fix* and *compose* upstreams:
 - **Compose** — [composites](composites.md) expose a fixed multi-step chain as one
   tool.
 - **Gate** — [scopes and filters](transports-and-auth.md) decide what a caller can
-  even see.
+  even see. Gating doubles as a search-quality lever: every excluded tool is one
+  search can't confuse with the right answer
+  ([why](configuration.md#filters)).
 
 ## The verification-first ethos
 

@@ -115,6 +115,16 @@ filters:
 Patterns match a whole API (bare name `stripe`) or a tool id, with a trailing `*`
 as a prefix wildcard.
 
+**Filtering is a search-quality lever, not only an access-control one.** Every
+tool you exclude is a tool search can no longer confuse with the one the agent
+wanted — and shrinking the candidate pool consistently helps retrieval more than
+any ranking improvement. Two unrelated measurements agree: our mcp-compressor
+head-to-head found filters the strongest lever either proxy has, and a separate
+RAG study found its hard filter worth more relevance than every ranking change it
+tested combined ("isolation is not just compliance, it is relevance"). If you know
+your agents never delete or never touch a subsystem, saying so in `filters:` makes
+every remaining search better.
+
 ## Environment expansion
 
 `${VAR}` is expanded from the environment (at connect time) in **`headers`** values
