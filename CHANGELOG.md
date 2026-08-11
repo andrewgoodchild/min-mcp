@@ -36,8 +36,10 @@ All notable changes to min-mcp. Format loosely follows
 
 - New [About tool search](docs/about-tool-search.md): what Claude and Codex now
   do natively, verified against primary sources, and the four places their
-  limits bite. README and the mcp-compressor comparison reframed accordingly —
-  fixing leads, minification supports.
+  limits bite. The standalone mcp-compressor comparison is folded in as a
+  section — same measured record, framed as the proxy generation the platforms
+  absorbed — and its page retired. README reframed accordingly: fixing leads,
+  minification supports.
 - Filters documented as a search-quality lever, not only access control.
 
 ## [0.1.0] — 2026-08-09

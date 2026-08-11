@@ -1,4 +1,4 @@
-# About native tool search
+# About tool search — native, and the proxies before it
 
 Both major agent platforms now search a tool catalog and load definitions on demand.
 If you run a handful of ordinary MCP servers, **your client may already solve the
@@ -78,6 +78,59 @@ differences, both measured on our side:
 They also carry a *fielded* BM25 (`ext/skills/src/dynamic_skill_selector/fielded_bm25.rs`)
 and a shadow-mode selection experiment, because the `bm25` crate is single-field.
 
+## The proxy generation: mcp-compressor, measured head-to-head
+
+Before the platforms absorbed deferred loading, the same idea shipped as proxies —
+and Atlassian's [mcp-compressor](https://github.com/atlassian-labs/mcp-compressor)
+was the closest peer to min-mcp: sit between agent and servers, hide the catalog,
+hand out schemas on demand. We cloned it, built it (commit `74674d5`, 2026-07-27),
+and ran both binaries against the identical 587-tool Stripe upstream. The record is
+kept here because the two designs answered one question differently — **how does the
+agent find a tool?** — and that question outlived the proxies: the platforms faced
+it too, and chose search.
+
+**Their design:** two wrapper tools (`get_tool_schema`, `invoke_tool`), with the
+whole catalog riding inside `get_tool_schema`'s *description* as one
+`<tool>name(args): summary</tool>` line per backend tool. Four compression levels
+tune how much each line carries. **Ours:** three tools and no listing at all —
+backend tools grow an unseen index, and search returns ids that are directly
+callable.
+
+What the same-upstream measurements said, in brief:
+
+- **A listing is O(N); the levels change its slope, not its shape.** ~46
+  tokens/tool at the default level: 27,416 tokens upfront for 587 tools against
+  min-mcp's fixed 394 (70×), still 7,886 at its `max` floor (20×). And because the
+  listing lives in a tool description, any upstream change rewrites it and busts
+  the provider's prompt cache.
+- **Filters were the strongest lever either project had.** Their
+  `--include-tools`, curated to ten operations, cut the listing to **569 tokens** —
+  within 1.4× of min-mcp's surface. If you can hand-maintain the list, a filtered
+  listing is nearly as cheap as search and cannot miss; what you give up is the
+  long tail and the maintenance. (This result is why min-mcp's docs now present
+  `filters:` as a relevance lever, not just access control.)
+- **On ten tasks authored to make search miss** (zero-vocabulary-overlap
+  phrasings, verified against live Stripe state, no LLM judges): search went
+  **10/10 at ~20K tokens/task**; the listing arm went 9/10 at ~331K. Its failures
+  were wrapper-indirection errors, not discovery — a flash-tier model calling
+  listed names as if they were tools. Caveat as recorded then: a stronger model
+  would likely handle the indirection; the token cost of the listing, though,
+  scales with catalog size regardless of model.
+- **Giant schemas:** Stripe's 107KB checkout schema came back as one 18,522-token
+  tool result from their side; min-mcp's staged minification landed at 2,893 with
+  all 51 top-level field names present.
+- **Where they were ahead**, kept on the record: a listing cannot miss; they never
+  elide a schema field; a per-deployment verbosity knob; SDKs and generated
+  clients min-mcp doesn't have.
+
+Methodology honesty from the original write-up still applies: the upstream was a
+spec conversion (their harder case — over prose-rich servers their levels do real
+work), the live tasks used one flash-tier model, and both projects have moved
+since. Treat the numbers as a snapshot of a specific day, not current standings.
+The conclusion that outlived the snapshot is the section below: for a handful of
+ordinary MCP servers, neither proxy is needed anymore — and what still is, no
+compressor does.
+
 ## What this means for min-mcp
 
 **Take the honest version first: if your problem is "five MCP servers cost me 55k
@@ -145,5 +198,6 @@ average. See [Measurements](measurements.md) for the numbers and their limits.
 ## Sources
 
 - [Tool search tool — Claude Docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+- [atlassian-labs/mcp-compressor](https://github.com/atlassian-labs/mcp-compressor)
 - [`openai/codex` — `tool_search.rs`](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/tool_search.rs)
 - [`openai/codex` — `dynamic_tools.rs`](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/dynamic_tools.rs)

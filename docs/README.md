@@ -31,8 +31,9 @@ New here? Read [Getting started](getting-started.md), then [Concepts](concepts.m
   the ones that are reproducible, and an explicit list of what *isn't* measured.
 
 ## Background — the landscape, measured
-- **[About mcp-compressor](about-mcp-compressor.md)** — the closest peer to
-  min-mcp (same deferred-schema architecture, a listing instead of search):
-  what it is, and what a same-upstream head-to-head measured.
+- **[About tool search](about-tool-search.md)** — what Claude and Codex now do
+  natively (verified against primary sources), the closest peer proxy
+  (Atlassian's mcp-compressor) measured head-to-head on the same upstream, and
+  the four things that remain outside all of them.
 - **[About TOON](about-toon.md)** — the token-oriented serialization format,
   worked examples, four evaluations, and why min-mcp doesn't emit it.

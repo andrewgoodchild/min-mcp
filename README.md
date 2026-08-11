@@ -205,9 +205,8 @@ Full numbers, reproduction steps, and what is *not* measured →
 | [Composites](docs/composites.md) | multi-step chains as one tool, and their safety |
 | [Transports & auth](docs/transports-and-auth.md) | stdio/HTTP, OAuth, JWT scopes |
 | [CLI reference](docs/cli.md) | every command and flag |
-| [About tool search](docs/about-tool-search.md) | what Claude and Codex now do natively, and where that leaves this |
+| [About tool search](docs/about-tool-search.md) | what Claude and Codex do natively, the peer proxy measured head-to-head, and where that leaves this |
 | [About TOON](docs/about-toon.md) | what it is, what we measured, why we don't emit it |
-| [About mcp-compressor](docs/about-mcp-compressor.md) | the closest peer proxy, measured head-to-head |
 | [Measurements](docs/measurements.md) | every number, how to reproduce it, and what isn't measured |
 
 ## License

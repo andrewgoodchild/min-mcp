@@ -88,7 +88,7 @@ judges anywhere.
 - **Search beats an always-visible listing, end to end.** On ten tasks authored
   specifically to make search miss, the search surface scored **10/10 at ~20K
   tokens/task** against **9/10 at ~331K** for a full-catalog listing. Details:
-  [About mcp-compressor](about-mcp-compressor.md).
+  [About tool search](about-tool-search.md).
 
 ## Tool-search recall, split by query style
 
