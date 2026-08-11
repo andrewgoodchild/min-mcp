@@ -58,6 +58,23 @@ registry changes, and a `limit` parameter caps results. Schema migrations
 (`0004_thread_dynamic_tools` → `0019_…_defer_loading` → `0026_…_namespace`) show a
 maturing feature rather than an experiment.
 
+min-mcp uses the same crate, so the honest comparison is precise. Two deliberate
+differences, both measured on our side:
+
+- **Identifier tokenization.** The crate's tokenizer segments on Unicode word
+  boundaries, where `_` *joins* words — so `read_file` becomes the single opaque
+  token `read_fil`, unmatchable by the query "read a file". min-mcp splits
+  camelCase, snake_case, kebab-case, dotted ids and acronym runs before stemming;
+  fixing this measured **+15 points recall@1** on a snake_case MCP server. No such
+  splitting layer is visible in the Codex source ahead of their tokenizer — stated
+  as inference from reading, not as a measurement of their binary.
+- **Schema text in the index.** Codex indexes parameter names and descriptions;
+  we measured that three ways on single-API corpora and it lost every time (down
+  to 0.42 recall@1 at worst) — within one REST API, parameter vocabulary is nearly
+  uniform (`expand`, `metadata`, `currency`), so it dilutes without discriminating.
+  On a federated multi-server surface their choice may well be right; ours is the
+  measured choice for the spec-mounting case min-mcp exists for.
+
 They also carry a *fielded* BM25 (`ext/skills/src/dynamic_skill_selector/fielded_bm25.rs`)
 and a shadow-mode selection experiment, because the `bm25` crate is single-field.
 
@@ -106,11 +123,24 @@ thousands of tools."* Third-party evaluations circulating in mid-2026 report muc
 lower retrieval accuracy at that scale. We can't reconcile the two: there is no
 shared corpus, no shared query set, and no shared definition of a hit.
 
-We therefore don't publish a comparison. min-mcp's own recall is measured on our own
-harness against a labelled query set, and the honest summary is that lexical search
-finds the right tool at rank 1 roughly three times in four on a 589-operation Stripe
-surface, with most remaining failures being vocabulary mismatch rather than ranking.
-See [Measurements](measurements.md) for what is and isn't measured.
+We therefore don't publish a comparison against their numbers. min-mcp's own recall
+is measured on our own harness against labelled query sets **split by query style**,
+because a blended average hides the only structure that matters:
+
+- **Verbatim queries** (phrased with the operation's own vocabulary): recall@1
+  0.94–0.97 on a 589-operation Stripe surface, 1.00 on a 14-tool MCP server.
+- **Adversarial paraphrases** (business language deliberately avoiding the tool's
+  vocabulary): recall@10 as low as **0.00** on terse catalogs. This is not a
+  ranking deficiency — a tool document is a few id tokens and a one-line summary,
+  so a vocabulary-avoiding query has zero term overlap and the candidate set is
+  empty. Any BM25-based tool search has this failure mode, including the
+  platforms'; embeddings only dent it (we measured a small significant gain on
+  paraphrases at the cost of a significant regression on verbatim queries, so we
+  ship neither). The production mitigation is the loop: an empty result tells the
+  agent to re-query with resource/action vocabulary, and the caller is an LLM.
+
+Real traffic sits between the two arms; the adversarial floor is a floor, not an
+average. See [Measurements](measurements.md) for the numbers and their limits.
 
 ## Sources
 

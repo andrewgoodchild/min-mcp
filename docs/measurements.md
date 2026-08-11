@@ -90,6 +90,49 @@ judges anywhere.
   tokens/task** against **9/10 at ~331K** for a full-catalog listing. Details:
   [About mcp-compressor](about-mcp-compressor.md).
 
+## Tool-search recall, split by query style
+
+`search_tools` is the surface's front door, so its quality is measured — against
+labelled query sets whose answers are validated to exist on the live surface, and
+**split by query style**, because averaging across styles hides the only structure
+that matters:
+
+| corpus | query style | recall@1 | recall@10 |
+|---|---|---|---|
+| Stripe spec, 589 operations | verbatim (operation vocabulary) | 0.94–0.97 | 1.00 |
+| Stripe spec, 589 operations | adversarial paraphrase | **0.00** | **0.00–0.03** |
+| filesystem MCP server, 14 tools | verbatim | 1.00 | 1.00 |
+| filesystem MCP server, 14 tools | adversarial paraphrase | 0.54 | 0.69 |
+
+The paraphrase floor is structural, not a tuning gap: a tool document is a few id
+tokens plus a one-line summary, so a query that deliberately avoids that vocabulary
+("give the buyer their money back" for `PostRefunds`) has zero term overlap and the
+candidate set is empty. Any lexical tool search fails this way; how hard it fails
+tracks how much prose the upstream provides. The shipped mitigation is the loop: an
+empty result tells the agent to re-query with resource/action vocabulary, and the
+caller is an LLM. Embeddings were measured as the alternative and **not shipped**:
+a small significant gain on paraphrases (+15 points @1, to 0.15) at the price of a
+significant regression on verbatim queries (−21 points @1, p=0.012), plus a model
+download in a proxy that currently boots instantly and offline.
+
+Two search findings shipped as code because they measured:
+
+- **Convention-aware tokenization**: the `bm25` crate's tokenizer joins on `_`, so
+  every snake_case tool name was one opaque token. Splitting identifiers before
+  stemming measured **+15 points recall@1** on a snake_case MCP server (and nothing
+  on Stripe, whose camelCase already split — a convention bug is invisible to a
+  single-convention benchmark).
+- **The usage prior counts successes only.** It previously counted every attempt,
+  including calls rejected before reaching the upstream — so a tool could rise in
+  search ranking *by failing*, the opposite of what the circuit breaker exists to
+  prevent.
+
+These numbers come from a labelled harness that lives outside this repo; what ships
+*in* the repo is the instrument: set `shadow: true` and min-mcp scores alternative
+retrieval configurations against your real traffic without serving them, logging
+the rank each would have given the tool your agent actually called. Retrieval
+claims can then be checked on your workload, not ours.
+
 ## The harness catches our own overfits
 
 Three features were built, measured, and *removed* because they lost:
@@ -101,6 +144,10 @@ Three features were built, measured, and *removed* because they lost:
   exceeded the provider cap and lost on both tokens and success.
 - **TOON** as a result format cost *more* tokens than compact JSON on real
   nested payloads — see [About TOON](about-toon.md).
+- **Field weighting by repetition** (id ×3, summary ×2 in the search index) was
+  inherited from a prototype and shipped unmeasured; when finally tested it was
+  *worse* than flat indexing (repetition inflates document length, which BM25
+  penalises, while term-frequency saturation caps what the copies buy). Removed.
 
 Publishing those is the point: a benchmark that only ever confirms its author is
 not a benchmark.
@@ -118,6 +165,7 @@ Read this before trusting any number above:
 - **Untested in public CI**: the Streamable HTTP transport, `workflows:`,
   auto-pagination, `minmcp verify` against a live upstream, and JWT/OAuth flows
   end-to-end. Their logic is unit-tested (see `cargo test`), but there is no
-  fixture exercising them over the wire, and CI runs on Linux only.
+  fixture exercising them over the wire, and blocking CI covers Linux, macOS and Windows
+  (`http_e2e` is Unix-only — see [getting started](getting-started.md)).
 - **`timeout_s` and `breaker`** have unit and stdio end-to-end tests proving the
   mechanism; their *impact* on agent token spend is not yet measured.

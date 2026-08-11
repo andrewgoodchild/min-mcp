@@ -20,6 +20,7 @@ error_hints: [ ... ]      # fleet-wide error→recovery hints (all tools)
 preflight: true           # validate calls against the patched schema locally (default ON)
 read_cache_ttl_s: 0       # TTL cache for read-only tools' results (0 = off)
 log_file: events.ndjson   # optional NDJSON audit log of search/details/call
+shadow: false             # score alternative retrievers on real traffic (see below)
 ```
 
 | key | meaning |
@@ -36,6 +37,7 @@ log_file: events.ndjson   # optional NDJSON audit log of search/details/call
 | `preflight` | **On by default.** Validate each call against its (patched) input schema *before* the upstream call — a missing-required or out-of-enum value returns a structured error locally, with no round-trip. Makes the patched schema authoritative; where a spec over-declares `required`, disable per tool with an overlay's `preflight: false` (or globally here). |
 | `read_cache_ttl_s` | TTL (seconds) for caching results of **read-only** tools keyed by (tool, arguments): spec `GET` operations, MCP tools with `annotations.readOnlyHint`, or overlay `cacheable: true`. `0` (default) disables. Cached values are the raw pre-shaping result — each hit still gets this call's overlays and `fields` projection. Errors are never cached. |
 | `log_file` | If set, one NDJSON line per search/details/call — what the agent searched, selected, and called, its origin, and whether it was served from cache. |
+| `shadow` | **Off by default.** Score alternative retrieval configurations against real traffic without serving them; results land in `log_file` as `shadow` events. See [Shadow mode](#shadow-mode). |
 
 ## Upstreams
 
@@ -124,6 +126,23 @@ RAG study found its hard filter worth more relevance than every ranking change i
 tested combined ("isolation is not just compliance, it is relevance"). If you know
 your agents never delete or never touch a subsystem, saying so in `filters:` makes
 every remaining search better.
+
+## Shadow mode
+
+`shadow: true` builds a handful of alternative search indexes (different
+tokenization/weighting/corpus switches) alongside the served one. Every
+`search_tools` call runs them all; **none of their results are ever served**. When
+the agent then calls a tool, min-mcp logs — to `log_file`, as `shadow` events —
+the rank each alternative *would* have given that tool, alongside the served
+rank. The tool the agent actually chose is the label, so retrieval changes get
+judged on your real workload with no annotation effort.
+
+Off by default: each challenger is a full extra index, costing startup time and
+memory production shouldn't pay. Turn it on when evaluating an upgrade, read the
+NDJSON, turn it off. Interpretation caveat: it measures agreement with what the
+agent *did*, which is ideal for comparing rankers and catching regressions, but a
+consistently-wrong tool choice scores as a hit — absolute correctness still needs
+a labelled set.
 
 ## Environment expansion
 

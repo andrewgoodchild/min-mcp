@@ -6,7 +6,39 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Search, rebuilt on measurement
+
+- **BM25 core replaced** by the [`bm25`](https://crates.io/crates/bm25) crate (the
+  engine `openai/codex` uses for its tool search), at the crate's default
+  parameters — which beat our previous hand-tuned constants on the recall harness.
+- **Convention-aware tokenizer.** Identifiers split on camelCase, snake_case,
+  kebab-case, dots, slashes and acronym runs *before* stemming. Previously
+  snake_case tool names — most of the MCP ecosystem — indexed as single opaque
+  tokens (`read_file` → `read_fil`) and were unfindable by natural queries;
+  fixing it measured +15 points recall@1 on a snake_case server.
+- **Flat indexing.** Field weighting by repetition (id ×3, summary ×2) measured
+  worse than no weighting and was removed.
+- **Usage prior counts successes only.** A tool can no longer rise in search
+  ranking by being called and failing — previously preflight rejections and
+  upstream errors all counted as "usage".
+- **`shadow: true`** — score alternative retrieval configurations against real
+  traffic without serving them, logged per call as NDJSON `shadow` events. The
+  instrument that produced every claim above, shipped so the claims can be
+  re-checked on your workload.
+- Measured and **not** shipped, with numbers in
+  [docs/measurements.md](docs/measurements.md): schema/parameter-text indexing
+  (dilutes single-API corpora), embedding retrieval (significant regression on
+  verbatim queries), naive RRF fusion (poisoned by zero-signal lexical lists),
+  and larger description caps (upstream brevity, not our caps, is the
+  constraint).
+
+### Docs
+
+- New [About tool search](docs/about-tool-search.md): what Claude and Codex now
+  do natively, verified against primary sources, and the four places their
+  limits bite. README and the mcp-compressor comparison reframed accordingly —
+  fixing leads, minification supports.
+- Filters documented as a search-quality lever, not only access control.
 
 ## [0.1.0] — 2026-08-09
 

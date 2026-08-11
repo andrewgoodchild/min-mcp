@@ -68,11 +68,19 @@ The agent sees `search_tools` / `get_tool_details` / `call_tool`. It searches fo
 the operation it needs, pulls that one schema on demand, and calls it. This is
 tiered disclosure: three declarations regardless of upstream size.
 
-- `search_tools(query)` — BM25 (`K1=1.5`, `B=0.4`) over every upstream tool, plus
-  a damped usage prior (never dominant), a verb-affinity boost that favours the
-  right read/write sibling (a "create" query leans to `Post…` over `Get…`), and a
-  bias toward shorter/canonical ids (exact-score ties break alphabetically).
-  Returns ids + one-line summaries.
+- `search_tools(query)` — BM25 over every upstream tool (the [`bm25`](https://crates.io/crates/bm25)
+  crate at its default parameters — the same engine `openai/codex` uses for its own
+  tool search), behind a convention-aware tokenizer: `PostCheckoutSessions`,
+  `read_file`, `list-pull-requests`, and `getHTTPResponse` all split into their
+  words before stemming. That splitter is load-bearing, not cosmetic — a plain
+  Unicode tokenizer *joins* on `_`, which would make every snake_case tool name a
+  single opaque token no natural query can match. On top of the lexical score:
+  a damped usage prior counting **successful** calls only (a failing tool can
+  never rise by being retried), a verb-affinity boost that favours the right
+  read/write sibling (a "create" query leans to `Post…` over `Get…`), and a bias
+  toward shorter/canonical ids. Returns ids + one-line summaries; an empty result
+  tells the agent to retry with resource/action vocabulary rather than leaving it
+  guessing.
 - `get_tool_details(tool_id)` — the full input schema on demand (the source map).
   Very large schemas degrade in stages (prose-minified → structure-only →
   depth-pruned with explicit elision counts) so every field *name* survives the

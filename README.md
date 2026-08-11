@@ -86,8 +86,14 @@ It searches for the operation it needs, pulls that one schema, calls it, and kee
 only the fields it asked for. You point min-mcp at upstreams two ways — **proxy
 running MCP servers**, or **mount an OpenAPI spec directly** — through one config
 and one interface. Search is BM25 over the [`bm25`](https://crates.io/crates/bm25)
-crate, with a camelCase-aware tokenizer so `PostCheckoutSessions` is findable as
-"checkout session".
+crate — the same engine `openai/codex` uses for its own tool search — behind a
+convention-aware tokenizer: `PostCheckoutSessions`, `read_file`, and
+`list-pull-requests` are all findable by their words. (That splitter matters: a
+plain Unicode tokenizer joins on `_`, making every snake_case tool name a single
+opaque token — measured at 15 points of recall@1 on a real MCP server.) An
+opt-in `shadow: true` scores alternative retrieval configurations against your
+real traffic without serving them, so ranking changes are measured on your
+workload before anyone ships them.
 
 **3. Also.**
 
