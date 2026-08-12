@@ -137,7 +137,7 @@ demo config, annotated line by line (`examples/demo-overlays.yaml`):
 ```sh
 ./target/release/minmcp help --config examples/demo-overlays.yaml acme.widgets/create
 # the schema the agent sees: overlay-patched — undocumented param now required,
-# enum constrained, a secret field stripped so it can't be fabricated
+# enum constrained, an env-injected field stripped so the agent can't fabricate it
 ./target/release/minmcp lint --config examples/demo-overlays.yaml   # find what needs fixing
 ./target/release/minmcp map  --config examples/demo-overlays.yaml   # which tools an overlay touched
 ```
@@ -194,7 +194,7 @@ Full numbers, reproduction steps, and what is *not* measured →
 | [Composites](docs/composites.md) | multi-step chains as one tool, and their safety |
 | [Transports & auth](docs/transports-and-auth.md) | stdio/HTTP, OAuth, JWT scopes |
 | [CLI reference](docs/cli.md) | every command and flag |
-| [About tool search](docs/about-tool-search.md) | what Claude and Codex do natively, Atlassian's peer proxy measured head-to-head, and where that leaves this |
+| [About tool search](docs/about-tool-search.md) | **read this first** — what Claude and Codex do natively, Atlassian's peer proxy measured head-to-head, and when min-mcp fits alongside an agent with built-in catalog search |
 | [About TOON](docs/about-toon.md) | what it is, what we measured, why we don't emit it |
 | [Measurements](docs/measurements.md) | every number, how to reproduce it, and what isn't measured |
 

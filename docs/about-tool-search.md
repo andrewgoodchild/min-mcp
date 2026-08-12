@@ -10,7 +10,7 @@ actually bite.
 own, min-mcp gives it the same ability from the outside — point any MCP client at
 it and every upstream becomes searchable.
 
-If your agent already has one, don't stack the two search layers: each hides the
+If your agent already has one, **don't stack two search layers**: each hides the
 catalog from the other, and the agent ends up searching for the search tool.
 Turn one off. min-mcp still earns its place behind a search-capable client for
 the things the native layer doesn't do — fixing the tools, mounting an API that
