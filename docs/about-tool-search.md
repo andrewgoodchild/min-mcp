@@ -6,6 +6,16 @@ context-tax problem**, and you should know that before adopting anything. This p
 sets out what they do, verified against primary sources, and where the limits
 actually bite.
 
+**Where does that leave min-mcp?** If your agent has no catalog search of its
+own, min-mcp gives it the same ability from the outside — point any MCP client at
+it and every upstream becomes searchable. If your agent already has it, the
+reason to run min-mcp is the half nothing else does: fixing the tools.
+
+A note on provenance: I built min-mcp from the idea, and learned what the
+platforms and peers had shipped only afterwards — this page is the result of
+checking. At minimum, the repo is a measured, working reference for the pattern:
+point your coding agent at it and build the same capability into your own stack.
+
 Everything here was checked on 2026-08-10 against Anthropic's documentation and the
 `openai/codex` source. Where a claim is inference rather than documentation, it says
 so.

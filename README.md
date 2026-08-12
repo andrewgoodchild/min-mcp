@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml) ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Language](https://img.shields.io/badge/rust-2021-orange) ![MCP](https://img.shields.io/badge/MCP-2025--06--18-6E56CF)
 
-A repair-and-governance proxy for [Model Context Protocol](https://modelcontextprotocol.io)
+A repair-and-minification proxy for [Model Context Protocol](https://modelcontextprotocol.io)
 servers, written in Rust. You don't own the servers your agents depend on, and you
 can't edit them — so today you fork them, or paper over their flaws in every
 agent's prompt. min-mcp patches them *as they pass through*: a versioned,
@@ -86,30 +86,18 @@ It searches for the operation it needs, pulls that one schema, calls it, and kee
 only the fields it asked for. You point min-mcp at upstreams two ways — **proxy
 running MCP servers**, or **mount an OpenAPI spec directly** — through one config
 and one interface. Search is BM25 over the [`bm25`](https://crates.io/crates/bm25)
-crate — the same engine `openai/codex` uses for its own tool search — behind a
-convention-aware tokenizer: `PostCheckoutSessions`, `read_file`, and
-`list-pull-requests` are all findable by their words. (That splitter matters: a
-plain Unicode tokenizer joins on `_`, making every snake_case tool name a single
-opaque token — measured at 15 points of recall@1 on a real MCP server.) An
-opt-in `shadow: true` scores alternative retrieval configurations against your
-real traffic without serving them, so ranking changes are measured on your
-workload before anyone ships them.
+crate behind a convention-aware tokenizer: `PostCheckoutSessions`, `read_file`, and
+`list-pull-requests` are all findable by their words.
 
 **3. Also.**
-
-- **Stop fabrication, structurally.** Beyond documenting a field, `user_supplied`
-  strips it from the agent's schema (injected from the session/env, so it can't be
-  invented), and structured errors + default-on `preflight:` validation hand back
-  `{field, allowed_values, fix}` — which took a weak agent from **0%→100%** recovery
-  on a broken call where prose guidance did nothing. [Overlays](docs/overlays.md)
+- **Minify responses too.** Beyond the `fields` filter, overlays reshape any response
+  server-side (strip secrets/PII/noise, rename, project) — over *any* API, even ones
+  with no field-selection of their own.
 - **Detect → verify.** `minmcp lint` flags best-practice smells (thin descriptions,
   undocumented-required params, confusable tools); `minmcp verify` proves a fix with
   real calls and deterministic assertions — a CI / behavioural-drift gate.
 - **Compose.** A `workflows:` entry runs a fixed multi-step chain as one composite
   tool — a measured composite cut a 3-step task **6.8×** on tokens. [Composites](docs/composites.md)
-- **Minify responses too.** Beyond the `fields` filter, overlays reshape any response
-  server-side (strip secrets/PII/noise, rename, project) — over *any* API, even ones
-  with no field-selection of their own.
 - **Transports & auth.** Serve over stdio or Streamable HTTP; proxy a local
   subprocess, a remote MCP server over HTTP, or a spec — with per-upstream headers,
   outbound OAuth, and JWT-derived caller scopes. [Transports & auth](docs/transports-and-auth.md)
@@ -178,19 +166,9 @@ Full walkthrough → [Getting started](docs/getting-started.md).
 
 ## Proof it works
 
-Every claim here is falsifiable, so it gets measured. Fixing first, since that's
-the headline:
-
-- **A structured error beats prose guidance.** On a broken call where a prose hint
-  changed nothing, handing back `{field, allowed_values, fix}` took a weak agent
-  from **0% → 100%** recovery.
-- **A composite cut a 3-step task 6.8×** on tokens versus the same chain driven
-  step by step.
-- **Fixes are provable, not asserted.** `minmcp verify` runs an overlay's checks
-  against the live upstream with deterministic assertions — the same gate that
-  catches upstream drift in CI.
-
-And the minification, which is the supporting claim:
+The minification claim is falsifiable, so it gets measured (the fixing side —
+structured errors taking a weak agent 0%→100%, a composite cutting a task 6.8× —
+is measured too; see [Measurements](docs/measurements.md)):
 
 - **85 tools → 3** proxying GitHub's official MCP server: ~20,822 tokens of
   definitions → **~424** (49×). Add more upstreams and the 424 does not move.
@@ -216,7 +194,7 @@ Full numbers, reproduction steps, and what is *not* measured →
 | [Composites](docs/composites.md) | multi-step chains as one tool, and their safety |
 | [Transports & auth](docs/transports-and-auth.md) | stdio/HTTP, OAuth, JWT scopes |
 | [CLI reference](docs/cli.md) | every command and flag |
-| [About tool search](docs/about-tool-search.md) | what Claude and Codex do natively, the peer proxy measured head-to-head, and where that leaves this |
+| [About tool search](docs/about-tool-search.md) | what Claude and Codex do natively, Atlassian's peer proxy measured head-to-head, and where that leaves this |
 | [About TOON](docs/about-toon.md) | what it is, what we measured, why we don't emit it |
 | [Measurements](docs/measurements.md) | every number, how to reproduce it, and what isn't measured |
 
