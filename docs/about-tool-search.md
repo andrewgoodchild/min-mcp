@@ -8,8 +8,14 @@ actually bite.
 
 **Where does that leave min-mcp?** If your agent has no catalog search of its
 own, min-mcp gives it the same ability from the outside — point any MCP client at
-it and every upstream becomes searchable. If your agent already has it, the
-reason to run min-mcp is the half nothing else does: fixing the tools.
+it and every upstream becomes searchable.
+
+If your agent already has one, don't stack the two search layers: each hides the
+catalog from the other, and the agent ends up searching for the search tool.
+Turn one off. min-mcp still earns its place behind a search-capable client for
+the things the native layer doesn't do — fixing the tools, mounting an API that
+has no MCP server, and catalogs past the deferral ceiling — just not as a second
+deferral layer.
 
 A note on provenance: I built min-mcp from the idea, and learned what the
 platforms and peers had shipped only afterwards — this page is the result of
