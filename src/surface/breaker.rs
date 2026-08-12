@@ -34,7 +34,9 @@ const STALE_PROBE_AFTER: Duration = Duration::from_secs(180);
 pub(super) struct BreakerState {
     consecutive: u32,
     open_until: Option<Instant>,
-    probe_in_flight: bool,
+    /// A live half-open probe's start time; `Some` doubles as the in-flight
+    /// flag (one field can't disagree with itself, unlike the bool+time pair
+    /// this replaces).
     probe_started: Option<Instant>,
 }
 
@@ -50,7 +52,7 @@ impl BreakerState {
         }
         // Cooldown elapsed → half-open: exactly one probe at a time. A stale
         // in-flight probe (never reported back) is reclaimed, not honored.
-        if self.probe_in_flight {
+        if self.probe_started.is_some() {
             let stale = self
                 .probe_started
                 .map(|at| now.duration_since(at) >= STALE_PROBE_AFTER)
@@ -59,7 +61,6 @@ impl BreakerState {
                 return Decision::Block { failures: self.consecutive, retry_in_s: 1 };
             }
         }
-        self.probe_in_flight = true;
         self.probe_started = Some(now);
         Decision::Allow { probe: true }
     }
@@ -69,7 +70,6 @@ impl BreakerState {
     /// immediately for another full cooldown (no need to re-accumulate).
     pub(super) fn on_result(&mut self, cfg: &Breaker, is_error: bool, was_probe: bool, now: Instant) {
         if was_probe {
-            self.probe_in_flight = false;
             self.probe_started = None;
         }
         if !is_error {

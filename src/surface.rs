@@ -261,11 +261,7 @@ impl Surface {
     /// request). `event` is the kind (search/details/call); `fields` are merged in.
     fn log_event(&mut self, event: &str, fields: Value) {
         let Some(file) = self.log.as_mut() else { return };
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut line = json!({"ts_ms": ts, "event": event});
+        let mut line = json!({"ts_ms": generators::epoch_millis(), "event": event});
         if let (Some(obj), Some(extra)) = (line.as_object_mut(), fields.as_object()) {
             for (k, v) in extra {
                 obj.insert(k.clone(), v.clone());

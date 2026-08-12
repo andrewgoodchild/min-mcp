@@ -81,16 +81,11 @@ pub struct IndexOptions {
     /// saturation caps what the copies buy. Past a point the penalty exceeds the gain.
     /// Kept switchable so the comparison stays reproducible rather than folklore.
     pub field_weights: bool,
-    /// Raise the description caps. **Rejected**: mixed across corpora (+0.03 Stripe
-    /// verbatim, -0.077 filesystem paraphrase). Stripe's descriptions are terse at
-    /// source, so a larger cap harvests nothing; where prose is plentiful the extra
-    /// text dilutes. The cap was never the constraint — upstream brevity was.
-    pub rich: bool,
 }
 
 impl Default for IndexOptions {
     fn default() -> Self {
-        Self { rerank: true, params: false, field_weights: false, rich: false }
+        Self { rerank: true, params: false, field_weights: false }
     }
 }
 
@@ -415,10 +410,8 @@ fn weighted_contents(tool_id: &str, description: &str, params: &str, opts: Index
         Some((f, r)) => (f, r),
         None => (description, ""),
     };
-    let (summary_cap, body_cap) =
-        if opts.rich { (SUMMARY_CAP * 3, BODY_CAP * 6) } else { (SUMMARY_CAP, BODY_CAP) };
-    let summary: String = first.chars().take(summary_cap).collect();
-    let body: String = rest.chars().take(body_cap).collect();
+    let summary: String = first.chars().take(SUMMARY_CAP).collect();
+    let body: String = rest.chars().take(BODY_CAP).collect();
     let (id_repeats, summary_repeats) =
         if opts.field_weights { (ID_REPEATS, SUMMARY_REPEATS) } else { (1, 1) };
 
