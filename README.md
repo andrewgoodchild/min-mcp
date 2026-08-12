@@ -143,6 +143,17 @@ Explore that surface without an agent — the CLI mirrors the three tools:
 ./target/release/minmcp help   --config bench/bigapi.yaml "big.widgets/create"
 ```
 
+And see the headline feature — **fixing a tool you don't own** — on the bundled
+demo config, annotated line by line (`examples/demo-overlays.yaml`):
+
+```sh
+./target/release/minmcp help --config examples/demo-overlays.yaml acme.widgets/create
+# the schema the agent sees: overlay-patched — undocumented param now required,
+# enum constrained, a secret field stripped so it can't be fabricated
+./target/release/minmcp lint --config examples/demo-overlays.yaml   # find what needs fixing
+./target/release/minmcp map  --config examples/demo-overlays.yaml   # which tools an overlay touched
+```
+
 Or point it at a real public MCP server — GitHub's official one, all toolsets
 enabled (needs Docker and a GitHub token):
 
