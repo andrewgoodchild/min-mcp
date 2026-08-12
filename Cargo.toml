@@ -1,6 +1,6 @@
 [package]
 name = "min-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Minify your MCPs — a minifying, scope-aware proxy for MCP servers"
 license = "Apache-2.0"

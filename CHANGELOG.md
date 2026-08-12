@@ -6,6 +6,10 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.1] — 2026-08-12
+
 ### Search, rebuilt on measurement
 
 - **BM25 core replaced** by the [`bm25`](https://crates.io/crates/bm25) crate (the
