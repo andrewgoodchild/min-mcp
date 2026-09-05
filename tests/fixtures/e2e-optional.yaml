@@ -1,0 +1,11 @@
+# E2E fixture: one upstream that cannot start (the command does not exist) but
+# is `optional`, next to one that can. The proxy must come up with the second
+# upstream's tools and report the first as configured-but-inactive.
+mode: three_tool
+upstreams:
+  - name: ghost
+    command: /nonexistent/minmcp-no-such-binary
+    optional: true
+  - name: fixture
+    spec: mini-openapi.json
+    base_url: https://example.invalid

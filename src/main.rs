@@ -48,13 +48,21 @@ struct Common {
     #[arg(long, value_delimiter = ',', default_value = "")]
     scopes: Vec<String>,
     /// A caller JWT. Its scope claim (validated against the config/env secret)
-    /// becomes the granted scopes, overriding --scopes.
-    #[arg(long)]
+    /// becomes the granted scopes, overriding --scopes. Also read from
+    /// MINMCP_JWT, so the token need not appear in argv (`ps`, shell history).
+    #[arg(long, env = "MINMCP_JWT", hide_env_values = true)]
     jwt: Option<String>,
     /// serve only: expose the surface over Streamable HTTP at this address
-    /// (e.g. 127.0.0.1:8080) instead of stdio. Binds localhost; validates Origin.
+    /// (e.g. 127.0.0.1:8080) instead of stdio. Loopback only unless
+    /// --allow-remote is given; validates Origin.
     #[arg(long)]
     http: Option<String>,
+    /// serve --http only: allow binding a non-loopback address. The HTTP
+    /// transport has NO inbound authentication — every client that can reach
+    /// the port gets this process's scopes and upstream credentials — so only
+    /// do this behind an authenticating reverse proxy or on a private network.
+    #[arg(long, requires = "http")]
+    allow_remote: bool,
 }
 
 #[derive(Subcommand)]
@@ -123,11 +131,21 @@ enum Cmd {
 async fn build_verifier(cfg: &Config) -> Result<Option<auth::JwtVerifier>> {
     let a = &cfg.auth;
     if let Some(url) = &a.jwks_url {
-        let json = reqwest::get(url)
+        // Bounded like the OAuth token fetch: a hung JWKS endpoint must fail
+        // startup with a clear error, not stall it forever.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("building HTTP client for the JWKS fetch")?;
+        let json = client
+            .get(url)
+            .send()
             .await
+            .and_then(reqwest::Response::error_for_status)
             .with_context(|| format!("fetching JWKS from {url}"))?
             .text()
-            .await?;
+            .await
+            .with_context(|| format!("reading JWKS from {url}"))?;
         return Ok(Some(auth::jwks_from_json(&json)?));
     }
     if let Some(pem) = a.public_key_pem()? {
@@ -148,7 +166,11 @@ async fn resolve_scopes(cfg: &Config, common: &Common) -> Result<Vec<String>> {
                 "--jwt given but no verifier configured (auth.jwt_secret / jwt_public_key / jwks_url)"
             )
         })?;
-        return verifier.scopes(token, &cfg.auth.scope_claim);
+        let checks = auth::ClaimChecks {
+            audience: cfg.auth.audience.clone(),
+            issuer: cfg.auth.issuer.clone(),
+        };
+        return verifier.scopes(token, &cfg.auth.scope_claim, &checks);
     }
     Ok(clean(common.scopes.clone()))
 }
@@ -229,7 +251,7 @@ async fn main() -> Result<()> {
             // Both transports are served by the official MCP SDK (rmcp),
             // wrapping our Surface behind its ServerHandler.
             match &common.http {
-                Some(addr) => rmcp_serve::serve_http(surface, addr).await,
+                Some(addr) => rmcp_serve::serve_http(surface, addr, common.allow_remote).await,
                 None => rmcp_serve::serve_stdio(surface).await,
             }
         }
@@ -261,7 +283,7 @@ fn print_serve_banner(surface: &crate::surface::Surface) {
         "min-mcp: {} upstream tool(s) across {} upstream(s) → {} surface tool(s); ~{} tokens vs {bound}{} raw ({bound}{ratio})",
         s["upstream_tools"], s["upstreams_active"], s["surface_tools"], min, raw
     );
-    if s["mode"] == "ThreeTool" && exact && min >= raw && raw > 0 {
+    if s["mode"] == "three_tool" && exact && min >= raw && raw > 0 {
         eprintln!(
             "min-mcp: NOTE — at this size the minified surface is not smaller than declaring \
              every tool (~{min} vs ~{raw} tokens); consider `mode: passthrough` until the \

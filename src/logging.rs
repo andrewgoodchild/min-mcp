@@ -4,7 +4,7 @@
 //! `tracing` subscriber — which ALSO captures rmcp's own spans (the SDK logs via
 //! `tracing`). The threshold is read once from `MINMCP_LOG`:
 //!
-//!   MINMCP_LOG=off | error | warn | info | debug     (default: warn)
+//!   MINMCP_LOG=off | error | warn | info | debug | trace     (default: warn)
 //!
 //! These are for OPERATIONAL logs (connection/upstream/auth failures). Tool and
 //! upstream *call* errors are NOT logged here — they are returned to the agent
@@ -25,6 +25,7 @@ pub fn init() {
         Some("error") => (LevelFilter::ERROR, LevelFilter::OFF),
         Some("info") => (LevelFilter::INFO, LevelFilter::WARN),
         Some("debug") => (LevelFilter::DEBUG, LevelFilter::INFO),
+        Some("trace") => (LevelFilter::TRACE, LevelFilter::DEBUG),
         _ => (LevelFilter::WARN, LevelFilter::WARN), // default (and explicit "warn")
     };
     // `min_mcp` is this crate's module-path root (package `min-mcp`); the macros

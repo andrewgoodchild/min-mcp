@@ -4,7 +4,7 @@
 //! per-API special cases (design law 1). Ported/generalized from the Python
 //! executor (ported from a Python prototype).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::config::ResultFormat;
@@ -171,21 +171,24 @@ impl Executor {
         accept: Option<String>,
         headers: Vec<(String, String)>,
         result_format: ResultFormat,
-    ) -> Self {
-        Executor {
-            // Same 120s transport ceiling the MCP clients have — a spec upstream
-            // that accepts the connection but never responds must not wedge the
-            // whole proxy behind the surface mutex (reqwest has NO default).
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+    ) -> Result<Self> {
+        // Same 120s transport ceiling the MCP clients have — a spec upstream
+        // that accepts the connection but never responds must not wedge the
+        // whole proxy behind the surface mutex (reqwest has NO default). A
+        // builder failure is an error, not a silent fallback to a client
+        // WITHOUT the ceiling.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("building HTTP client for spec upstream")?;
+        Ok(Executor {
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             accept,
             headers,
             result_format,
-        }
+        })
     }
 
     // One HTTP call's inputs, threaded from dispatch. Grouping them into a
@@ -436,6 +439,23 @@ mod tests {
         let s = out.as_str().unwrap();
         assert_eq!(s.chars().count(), MAX_RESPONSE_CHARS);
         assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn format_body_json_preserves_number_literals_byte_for_byte() {
+        // The spec path's default `json` format parses the body into a Value and
+        // re-serializes it. Without serde_json's `arbitrary_precision` a 128-bit
+        // id became 3.4e38 and a 23-digit decimal lost six digits — the exact
+        // corruption the MCP path's lexical compactor guards against. This pins
+        // the feature so it can't be dropped from Cargo.toml unnoticed. (Digits
+        // are exact; an unsigned exponent is normalised to `1e+400`, same value.)
+        let raw = r#"{ "id": 340282366920938463463374607431768211455, "rate": 0.12345678901234567890123 }"#;
+        let (body, truncated) = format_body(raw, ResultFormat::Json);
+        assert!(!truncated);
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"id":340282366920938463463374607431768211455,"rate":0.12345678901234567890123}"#
+        );
     }
 
     #[test]

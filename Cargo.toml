@@ -2,6 +2,10 @@
 name = "min-mcp"
 version = "0.1.1"
 edition = "2021"
+# MSRV: `str::floor_char_boundary` (surface/minify.rs) is the newest std API in
+# use; older toolchains now fail with a clear "requires rustc 1.91" instead of a
+# confusing unresolved-method error. rmcp 3 itself needs 1.88.
+rust-version = "1.91"
 description = "Minify your MCPs — a minifying, scope-aware proxy for MCP servers"
 license = "Apache-2.0"
 
@@ -11,7 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+# `env`: lets `--jwt` fall back to MINMCP_JWT so a caller token never has to
+# sit in argv (visible to `ps` and shell history).
+clap = { version = "4", features = ["derive", "env"] }
 jaq-core = "1.5"
 jaq-interpret = "1.5"
 jaq-parse = "1.0"
@@ -39,7 +45,11 @@ getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: keep JSON object keys in source order so response bodies (and
 # TOON encodings) present fields as the API returned them, not alphabetized.
-serde_json = { version = "1", features = ["preserve_order"] }
+# arbitrary_precision: number literals round-trip byte-for-byte through `Value`.
+# Without it a 128-bit id or a 20-digit decimal is silently rewritten through
+# f64 on every path that parses a body (the spec envelope, `fields` projection,
+# overlay `response` transforms, pagination merge).
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 # serde_yaml_ng: the maintained fork of the (archived, deprecated) serde_yaml,
 # aliased to `serde_yaml` so call sites are unchanged. On the hot path — it
 # parses the config and every YAML OpenAPI spec (e.g. the 42 MB MS Graph doc).
@@ -58,3 +68,5 @@ serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 
 [profile.release]
 lto = true
+codegen-units = 1 # smaller, faster binary; costs release build time only
+strip = true      # release artefacts don't need debug symbols

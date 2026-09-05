@@ -1,0 +1,8 @@
+# E2E fixture: an MCP subprocess upstream that dies on its first tools/call.
+# The transport failure must reach the agent as an isError result with
+# guidance, not as a JSON-RPC protocol error.
+mode: three_tool
+upstreams:
+  - name: dying
+    command: sh
+    args: ["dying-server.sh"]

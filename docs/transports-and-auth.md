@@ -6,8 +6,13 @@ Both transports are served by the **official MCP SDK**
 ([`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)): min-mcp's surface is
 wrapped behind rmcp's `ServerHandler`, so protocol conformance — version
 negotiation, sessions, SSE, Host-header/DNS-rebinding defence — tracks the SDK
-rather than a bespoke implementation, and every request is handled on its own task
-(a health-check `ping` is answered while a slow `tools/call` is still in flight).
+rather than a bespoke implementation. Protocol-level requests (`initialize`,
+`ping`) are answered by the SDK concurrently, but everything that touches the
+surface — `tools/list`, `tools/call`, resources, prompts — runs behind one lock,
+one call at a time, across every session. A slow upstream call therefore holds
+up the others for as long as it runs (at most the 120s transport ceiling), which
+is what an overlay's [`timeout_s`](overlays.md#timeout_s-and-breaker--guard-a-slow-or-flaky-tool)
+is for.
 
 ### stdio (default)
 
@@ -24,8 +29,18 @@ minmcp serve --http 127.0.0.1:8080 --config myconfig.yaml
 ```
 
 rmcp's `StreamableHttpService` — JSON-RPC over POST, SSE replies, session ids, and
-Host-header validation (it binds localhost by default) — driven on a TCP listener
-by hyper. The MCP endpoint is served at the root path (`/`).
+Host-header validation — driven on a TCP listener by hyper. The MCP endpoint is
+served at the root path (`/`).
+
+**There is no inbound authentication on this transport, and no per-connection
+identity.** The scopes are the process's (`--jwt` / `--scopes`, resolved once at
+startup), so every client of one `serve --http` sees the same tools and calls
+them with the same upstream credentials. That is why the listener is
+**loopback-only**: a non-loopback bind (`0.0.0.0`, a LAN address, a public
+hostname) is refused unless you pass `--allow-remote`, which belongs only behind
+an authenticating reverse proxy or on a private network. Per-request bearer
+validation is future work; until then stdio — one process per caller — is the
+per-caller mode.
 
 ## Upstream kinds and their auth
 
@@ -88,7 +103,15 @@ auth:
   jwt_public_key_file: ./pub.pem              # RS256, from a file
   jwks_url: https://auth.example.com/.well-known/jwks.json  # JWKS, kid-selected
   scope_claim: scope                          # claim to read scopes from (default "scope")
+  # audience: minmcp                          # if set, `aud` must contain this (else unchecked)
+  # issuer: https://auth.example.com          # if set, `iss` must equal this (else unchecked)
 ```
+
+Signature and `exp` are always checked. `audience` and `issuer` are off unless
+set — an internal gateway with no audience discipline still works — but where
+one issuer mints tokens for several services, set both so a token for another
+service doesn't grant scopes here. A JWKS document is fetched once at startup
+(30s timeout); key rotation needs a restart.
 
 ### 2. Define scope rules (`scopes:`)
 
@@ -110,11 +133,17 @@ Tool patterns are exact (`up.tool`) or prefix (`up.Post*`).
 
 ```sh
 minmcp serve --config myconfig.yaml --jwt "$CALLER_JWT"
+# or, keeping the token out of argv / `ps` / shell history:
+MINMCP_JWT="$CALLER_JWT" minmcp serve --config myconfig.yaml
 ```
 
 The token's scope claim (validated against the configured verifier) becomes the
 granted scopes. For local dev without JWTs, `--scopes billing.read,billing.write`
 sets an identity directly (prefer `--jwt` in production).
+
+Scopes are resolved **once per process**. Over stdio that is one caller, which
+is the model this was built for; over HTTP it means every connecting client
+shares them (see [Streamable HTTP](#streamable-http)).
 
 ## `scopes` vs `filters`
 
@@ -128,9 +157,14 @@ sets an identity directly (prefer `--jwt` in production).
 
 - Agent-supplied path params on spec upstreams are strictly segment-encoded, so a
   value like `../` can't escape its endpoint.
-- HTTP serving binds localhost and validates **both** DNS-rebinding headers:
-  the `Host` header (by rmcp) and the `Origin` header (min-mcp — a *present*
-  Origin must be loopback; an absent one is allowed, since non-browser clients
-  don't send one). A cross-origin POST is refused with 403 and logged.
+- HTTP serving is loopback-only unless `--allow-remote` is given, has **no
+  inbound authentication**, and validates **both** DNS-rebinding headers: the
+  `Host` header (by rmcp) and the `Origin` header (min-mcp — a *present* Origin
+  must be loopback; an absent one is allowed, since non-browser clients don't
+  send one). A cross-origin POST is refused with 403 and logged.
+- A failed upstream call — transport error, timeout, or the upstream's own
+  `isError` — always comes back to the agent as an `isError` tool result with
+  guidance, never as a JSON-RPC protocol error, so a dead upstream is something
+  the model can route around rather than a hard stop.
 - Secrets are only ever referenced by env-var name; nothing sensitive belongs in
   the committed config.

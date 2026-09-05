@@ -113,8 +113,13 @@ install and no service to run:
 
 ```sh
 git clone https://github.com/andrewgoodchild/min-mcp && cd min-mcp
-cargo build --release          # ~2 min from cold; binary at ./target/release/minmcp
+cargo build --release          # a few minutes from cold; binary at ./target/release/minmcp
 ```
+
+Prefer not to build? Prebuilt binaries for Linux, Apple Silicon macOS, and
+Windows are on the [Releases](https://github.com/andrewgoodchild/min-mcp/releases)
+page, or `cargo install --git https://github.com/andrewgoodchild/min-mcp` puts
+`minmcp` on your PATH (Rust 1.91 or newer).
 
 Everything below runs from the repo root. See it work on the bundled
 120-operation spec — no network, no credentials:

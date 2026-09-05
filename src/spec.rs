@@ -173,26 +173,21 @@ impl Spec {
         // `resolve` expands $refs inline (needed for get_tool_details); skipping it
         // keeps load O(op) for huge specs — refs are expanded lazily on demand.
         let rb = if resolve { self.resolve(&rb, 0, &[]) } else { rb };
-        // pick application/json first, else the single declared media type
         let content = rb.get("content").and_then(Value::as_object);
         let Some(content) = content else { return Value::Null };
-        let media = content
-            .get("application/json")
-            .or_else(|| content.values().next())
-            .cloned()
-            .unwrap_or(Value::Null);
-        media.get("schema").cloned().unwrap_or(Value::Null)
+        pick_media(content)
+            .and_then(|(_, media)| media.get("schema").cloned())
+            .unwrap_or(Value::Null)
     }
 
     /// The media type an operation's request body is sent as (drives encoding).
+    /// Chosen by the SAME rule as [`Spec::body_schema`], so the schema the agent
+    /// fills and the encoding the request uses can never disagree (an op that
+    /// lists `application/x-www-form-urlencoded` before `application/json` used
+    /// to show the JSON schema but send form-encoded bytes).
     pub fn body_media_type(&self, op: &Operation) -> Option<String> {
-        op.raw
-            .get("requestBody")?
-            .get("content")?
-            .as_object()?
-            .keys()
-            .next()
-            .cloned()
+        let content = op.raw.get("requestBody")?.get("content")?.as_object()?;
+        pick_media(content).map(|(k, _)| k.clone())
     }
 
     /// Per-query-parameter wire serialization, resolved from each parameter's
@@ -331,6 +326,15 @@ impl Spec {
             }
         })
     }
+}
+
+/// One rule for choosing among a request body's declared media types:
+/// `application/json` if present, else the first declared. Shared by the
+/// schema view and the encoding choice so the two stay consistent.
+fn pick_media(content: &serde_json::Map<String, Value>) -> Option<(&String, &Value)> {
+    content
+        .get_key_value("application/json")
+        .or_else(|| content.iter().next())
 }
 
 fn param_explode(p: &Value, default: bool) -> bool {
@@ -557,6 +561,33 @@ mod tests {
         })).unwrap();
         assert!(s.body_media_type(s.get("J").unwrap()).unwrap().contains("json"));
         assert!(s.body_media_type(s.get("F").unwrap()).unwrap().contains("form-urlencoded"));
+    }
+
+    #[test]
+    fn body_schema_and_media_type_pick_the_same_content_entry() {
+        // form listed FIRST, json second: both views must land on json — the
+        // agent fills the JSON schema, so the request must be JSON-encoded.
+        let s = Spec::from_value(json!({
+            "info": {"title": "T", "version": "1"},
+            "paths": {"/x": {"post": {"operationId": "X", "requestBody": {"content": {
+                "application/x-www-form-urlencoded": {"schema": {"type": "object", "properties": {"form_only": {}}}},
+                "application/json": {"schema": {"type": "object", "properties": {"json_only": {}}}}
+            }}}}}
+        })).unwrap();
+        let op = s.get("X").unwrap();
+        assert_eq!(s.body_media_type(op).as_deref(), Some("application/json"));
+        assert!(s.body_schema(op, true)["properties"].get("json_only").is_some());
+        // no json declared: both fall back to the first entry
+        let s2 = Spec::from_value(json!({
+            "info": {"title": "T", "version": "1"},
+            "paths": {"/y": {"post": {"operationId": "Y", "requestBody": {"content": {
+                "multipart/form-data": {"schema": {"type": "object", "properties": {"file": {}}}},
+                "text/plain": {"schema": {"type": "string"}}
+            }}}}}
+        })).unwrap();
+        let op = s2.get("Y").unwrap();
+        assert_eq!(s2.body_media_type(op).as_deref(), Some("multipart/form-data"));
+        assert!(s2.body_schema(op, true)["properties"].get("file").is_some());
     }
 
     #[test]

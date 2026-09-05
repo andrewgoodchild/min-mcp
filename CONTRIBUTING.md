@@ -10,7 +10,8 @@ git clone https://github.com/andrewgoodchild/min-mcp && cd min-mcp
 cargo build --release
 ```
 
-Stable Rust; nothing else. Check it works:
+Stable Rust 1.91 or newer (`rust-version` in `Cargo.toml`); nothing else. Check
+it works:
 
 ```sh
 ./target/release/minmcp inspect --config bench/bigapi.yaml   # 120 tools → 3
@@ -40,12 +41,12 @@ keys beside it. Suites:
 | `cargo test --bin minmcp` | unit tests, including the surface internals |
 | `tests/stdio_e2e.rs` | the real binary over stdio: search → details → call, resources, breaker, timeout |
 | `tests/http_e2e.rs` | Streamable HTTP: handshake, session, Origin refusal |
-| `tests/features_e2e.rs` | composites, `verify`, pagination, JWT scopes, preflight opt-out |
+| `tests/features_e2e.rs` | composites, `verify`, pagination, JWT scopes, preflight opt-out, a dying upstream, `optional` upstreams, strict config |
 | `tests/cli_contract.rs` | flags, exit codes, the startup banner |
 | `tests/compression.rs` | the compression claim — this one is a published number, keep it honest |
 
-Tests needing `/bin/sh` or `curl` are `cfg(unix)`-gated, so Windows runs 17 of
-the 24 end-to-end tests — `http_e2e.rs` skips entirely. All three platforms are
+Tests needing `/bin/sh` or `curl` are `cfg(unix)`-gated, so Windows runs 20 of
+the 28 end-to-end tests — `http_e2e.rs` skips entirely. All three platforms are
 **blocking** in CI regardless, because `release.yml` publishes a binary for each
 one and none should ship from a tree nothing checked. If you port a fixture to
 Windows, drop its gate.
