@@ -25,10 +25,10 @@ runner that could execute Intel macOS builds, so shipping that binary would mean
 publishing one nothing had ever run. Intel Mac users build from source with the
 command above; it is a supported configuration, just not a prebuilt one.
 
-The test coverage behind the platforms is also not equal: 7 of the 24 end-to-end
+The test coverage behind the platforms is also not equal: 8 of the 28 end-to-end
 tests use a POSIX shell script or `curl` as their fixture, so they are
 `cfg(unix)`-gated and skip on Windows — including the whole Streamable HTTP
-suite. The Windows binary compiles, lints clean, and passes the other 17, but its
+suite. The Windows binary compiles, lints clean, and passes the other 20, but its
 HTTP transport has no end-to-end coverage on that platform. If you run min-mcp
 over HTTP on Windows, you are the first — please file what you find.
 
@@ -43,7 +43,7 @@ minification before wiring anything up:
 
 ```json
 {
-  "mode": "ThreeTool",
+  "mode": "three_tool",
   "upstreams_configured": 1,
   "upstreams_active": 1,
   "upstream_tools": 120,
@@ -168,9 +168,13 @@ so the nested-body calls that break a generated client work here.
 ## 5. Serve over HTTP instead of stdio
 
 ```sh
-# Streamable HTTP transport; binds localhost, validates Origin:
+# Streamable HTTP transport; loopback-only, validates Origin:
 ./target/release/minmcp serve --http 127.0.0.1:8080 --config myconfig.yaml
 ```
+
+The HTTP transport has no inbound authentication and one scope set per process,
+so a non-loopback bind is refused unless you pass `--allow-remote` — do that only
+behind an authenticating proxy.
 
 See [Transports & auth](transports-and-auth.md) for remote upstreams, outbound
 OAuth, and JWT-derived caller scopes.

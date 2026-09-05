@@ -101,6 +101,60 @@ overlays:
     let _ = std::fs::remove_file(&cfg);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_dead_mcp_upstream_is_an_iserror_result_not_a_protocol_error() {
+    // The subprocess exits on its first tools/call. A spec upstream's transport
+    // failure was always an isError result; an MCP upstream's used to escape as
+    // a JSON-RPC protocol error (non-zero exit here). Both must now be a result
+    // the agent can act on, carrying the write-safety guidance.
+    let (out, stderr, ok) =
+        run(&["call", "--config", "tests/fixtures/e2e-dying.yaml", "dying.boom", "--args", "{}"]);
+    assert!(ok, "a dead upstream must not be a protocol error: {stderr}");
+    assert!(out.contains("UPSTREAM_ERROR") && out.contains("dying.boom"), "{out}");
+    assert!(out.contains("may or may not have completed"), "write-safety guidance missing: {out}");
+}
+
+#[test]
+fn optional_upstream_that_fails_to_start_is_skipped_not_fatal() {
+    let (out, stderr, ok) = run(&["inspect", "--config", "tests/fixtures/e2e-optional.yaml"]);
+    assert!(ok, "optional upstream must not fail startup: {stderr}");
+    let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+    let n = |k: &str| v.get(k).and_then(serde_yaml::Value::as_u64).unwrap();
+    assert_eq!(n("upstreams_configured"), 2);
+    assert_eq!(n("upstreams_active"), 1, "the ghost is skipped, the fixture serves");
+    assert_eq!(n("upstream_tools"), 3, "the surviving upstream's tools are all there");
+    assert!(stderr.contains("optional upstream \"ghost\""), "the skip is logged: {stderr}");
+
+    // Same config without `optional`: the missing command is fatal, as before.
+    let dir = std::env::temp_dir();
+    let cfg = dir.join(format!("minmcp_required_{}.yaml", std::process::id()));
+    let spec = std::env::current_dir().unwrap().join("tests/fixtures/mini-openapi.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "upstreams:\n  - name: ghost\n    command: /nonexistent/minmcp-no-such-binary\n  - name: fixture\n    spec: {}\n    base_url: https://example.invalid\n",
+            spec.display()
+        ),
+    )
+    .unwrap();
+    let (_, stderr, ok) = run(&["inspect", "--config", cfg.to_str().unwrap()]);
+    assert!(!ok, "a required upstream that can't start must be fatal");
+    assert!(stderr.contains("ghost"), "{stderr}");
+    let _ = std::fs::remove_file(&cfg);
+}
+
+#[test]
+fn unknown_config_keys_are_a_startup_error_naming_the_key() {
+    let dir = std::env::temp_dir();
+    let cfg = dir.join(format!("minmcp_typo_{}.yaml", std::process::id()));
+    std::fs::write(&cfg, "upstreams: []\npreflght: false\n").unwrap();
+    let (_, stderr, ok) = run(&["inspect", "--config", cfg.to_str().unwrap()]);
+    assert!(!ok, "a misspelled key must not be a silent no-op");
+    assert!(stderr.contains("preflght"), "the error names the key: {stderr}");
+    let _ = std::fs::remove_file(&cfg);
+}
+
 #[test]
 fn jwt_scopes_filter_the_surface_per_caller() {
     // A caller sees ONLY what their scope grants: same config, two tokens,

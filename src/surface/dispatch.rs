@@ -171,20 +171,23 @@ impl Surface {
                         )
                     }
                     Err(e) => {
-                        // Transport failure (propagated as a protocol error):
-                        // still a FAILURE for the breaker — a hard-down upstream
-                        // must trip it, and a failed half-open probe must release
-                        // its in-flight slot — and still a write for coherence.
-                        if let Some(b) = &breaker_cfg {
-                            self.breakers
-                                .entry(tool_id.to_string())
-                                .or_default()
-                                .on_result(b, true, was_probe, std::time::Instant::now());
-                        }
-                        if !is_read {
-                            self.bust_upstream_cache(idx);
-                        }
-                        return Err(e);
+                        // Transport failure on an MCP upstream (the subprocess
+                        // died, the remote returned a non-2xx, the JSON-RPC layer
+                        // errored). Rendered as an isError result the agent can
+                        // act on — the same shape a spec upstream's transport
+                        // failure already took — instead of a JSON-RPC protocol
+                        // error, which many clients surface as a hard failure the
+                        // model never gets to reason about. Falling through the
+                        // normal path below keeps the breaker, cache-bust, hints,
+                        // and logging identical to any other failed call.
+                        text_result(
+                            format!(
+                                "UPSTREAM_ERROR: {tool_id} failed before returning a result: {e:#}. {} \
+                                 If this repeats, the upstream may be down — use a different tool or report it.",
+                                crate::upstream::TIMEOUT_GUIDANCE
+                            ),
+                            true,
+                        )
                     }
                 }
             }

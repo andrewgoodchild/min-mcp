@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// How a tool-call result body is serialized back to the agent.
@@ -31,7 +31,7 @@ pub enum ResultFormat {
 /// `passthrough` (plain federation). The `hotset` and `pd` (uniform progressive
 /// disclosure) experiments lost to tiering on held-out tasks and were removed —
 /// see the design notes.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     Passthrough,
@@ -44,8 +44,15 @@ pub enum Mode {
 /// (`spec` + `base_url` + `auth_env`). Secrets are never in config — `auth_env`
 /// names an env var, and `headers` values expand `${VAR}` from the environment.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     pub name: String,
+    /// Keep serving if this upstream can't be spawned, connected, or listed at
+    /// startup: it is skipped with a warning instead of failing the whole proxy,
+    /// and its tools are simply absent until the next restart. Off by default —
+    /// a missing upstream is usually a config error you want to hear about.
+    #[serde(default)]
+    pub optional: bool,
 
     // --- MCP-server (subprocess) mode ---
     #[serde(default)]
@@ -100,6 +107,7 @@ pub struct UpstreamConfig {
 
 /// OAuth 2.0 client-credentials grant config for an upstream.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct OAuthConfig {
     /// Token endpoint (the OAuth `token_url`).
     pub token_url: String,
@@ -145,7 +153,7 @@ pub fn expand_env(s: &str) -> Result<String> {
             .ok_or_else(|| anyhow::anyhow!("unterminated ${{...}} in {s:?}"))?;
         let var = &after[..end];
         let val = std::env::var(var)
-            .map_err(|_| anyhow::anyhow!("env var {var} referenced in config header is not set"))?;
+            .map_err(|_| anyhow::anyhow!("env var {var} referenced as ${{{var}}} in the config is not set"))?;
         out.push_str(&val);
         rest = &after[end + 1..];
     }
@@ -157,6 +165,7 @@ pub fn expand_env(s: &str) -> Result<String> {
 /// exposed to the agent as ONE tool that runs the chain internally, threading
 /// each step's outputs into the next step's inputs.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Workflow {
     /// The composite tool's id/name (what the agent calls).
     pub id: String,
@@ -172,6 +181,7 @@ pub struct Workflow {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Step {
     pub id: String,
     /// Tool id this step calls, e.g. "stripe.PostProducts".
@@ -187,6 +197,7 @@ pub struct Step {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeRule {
     pub scope: String,
     /// Tool-id patterns this scope grants: exact `up.tool` or prefix `up.Post*`.
@@ -194,6 +205,7 @@ pub struct ScopeRule {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorHint {
     /// Substring of the upstream error/result text that triggers the hint.
     pub contains: String,
@@ -218,6 +230,7 @@ pub struct ErrorHint {
 /// cursor and concatenate — so the agent gets one complete result instead of
 /// hand-rolling a cursor loop (and usually truncating). Applies to spec upstreams.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Paginate {
     /// Dotted path to the item array to accumulate across pages (e.g. `data`).
     pub items: String,
@@ -246,6 +259,7 @@ fn default_max_pages() -> usize {
 /// express. Paths are dotted; `[]` maps over an array element. Applied to every
 /// call (before any caller `fields` projection).
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseTransform {
     /// Allowlist: keep ONLY these field paths (projection), e.g. ["data[].id"].
     /// Applied server-side and always — an aggressive filter that can drop
@@ -345,6 +359,7 @@ pub enum FieldPatch {
 /// one input field. This is what makes the lint findings *fixable* — notably
 /// `required`, the fix for undocumented-required params.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FieldSpec {
     #[serde(default)]
     pub description: Option<String>,
@@ -394,6 +409,7 @@ impl FieldPatch {
 /// author time, guards against behavioural drift in CI, and can gate an
 /// agent-proposed patch. Assertions are deterministic (no LLM judge).
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VerifyCheck {
     /// Human label for the check (shown in the report).
     #[serde(default)]
@@ -408,6 +424,7 @@ pub struct VerifyCheck {
 /// Deterministic assertions on a tool result. All are optional; a check passes
 /// when every specified assertion holds.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Expect {
     /// Exact HTTP status (spec upstreams; the executor envelope's `status`).
     #[serde(default)]
@@ -427,6 +444,7 @@ pub struct Expect {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Overlay {
     /// Full tool id (`upstream.tool`) the overlay applies to.
     pub tool: String,
@@ -478,6 +496,12 @@ pub struct Overlay {
     #[serde(default)]
     pub verify: Vec<VerifyCheck>,
     /// Auto-follow pagination and concatenate results (spec upstreams).
+    ///
+    /// KNOWN LIMIT: combined with a `{{hash}}` header this reuses page 1's key
+    /// on every follow-up page (headers resolve once per call). Against an
+    /// idempotency-honouring API that replays page 1, the non-advancing-cursor
+    /// guard then ends pagination with page 1 only. Don't combine the two; a
+    /// per-page re-resolution is tracked as future work.
     #[serde(default)]
     pub paginate: Option<Paginate>,
     /// Per-tool preflight override: `false` disables local schema validation for
@@ -500,11 +524,6 @@ pub struct Overlay {
     /// already fetched are returned with a PAGINATION notice.
     #[serde(default)]
     pub timeout_s: Option<u64>,
-    /// KNOWN LIMIT: `{{hash}}` headers combined with `paginate` reuse page 1's
-    /// key on every follow-up page (headers resolve once per call). Against an
-    /// idempotency-honouring API that replays page 1 — the non-advancing-cursor
-    /// guard then ends pagination with page 1 only. Don't combine the two; a
-    /// per-page re-resolution is tracked as future work.
     /// Circuit breaker: after `consecutive_failures` isError results this tool
     /// is paused for `cooldown_s` (then one probe call is let through). The
     /// structural fix for identical-retry loops — measured burning 15 turns in
@@ -516,6 +535,7 @@ pub struct Overlay {
 
 /// Per-tool circuit-breaker thresholds (see `Overlay::breaker`).
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Breaker {
     /// Consecutive isError results that trip the breaker open (default 5).
     #[serde(default = "default_breaker_failures")]
@@ -545,6 +565,7 @@ impl Overlay {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Scopes {
     #[serde(default)]
     pub rules: Vec<ScopeRule>,
@@ -558,6 +579,7 @@ pub struct Scopes {
 /// tool id, with a trailing `*` acting as a prefix wildcard: `stripe.*` (whole
 /// API), `stripe.Post*` (a family), `stripe.PostCustomers` (one tool).
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Filters {
     /// Allowlist. If non-empty, ONLY tools matching one of these survive.
     #[serde(default)]
@@ -577,6 +599,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Auth {
     /// HS256 shared secret for validating caller JWTs. May also come from the
     /// MINMCP_JWT_SECRET env var (keeps the secret out of the committed config).
@@ -594,6 +617,13 @@ pub struct Auth {
     /// Claim the caller's scopes are read from (OAuth `scope` by default).
     #[serde(default = "default_scope_claim")]
     pub scope_claim: String,
+    /// If set, the token's `aud` claim must contain this value. Unset means the
+    /// audience is not checked (a token minted for another service validates).
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// If set, the token's `iss` claim must equal this value.
+    #[serde(default)]
+    pub issuer: Option<String>,
 }
 
 // Manual Default so an ABSENT `auth:` section still yields the "scope" claim
@@ -606,6 +636,8 @@ impl Default for Auth {
             jwt_public_key_file: None,
             jwks_url: None,
             scope_claim: default_scope_claim(),
+            audience: None,
+            issuer: None,
         }
     }
 }
@@ -631,6 +663,7 @@ impl Auth {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Score alternative retrievers against real traffic without serving them,
     /// logging what each *would* have ranked when the agent calls a tool. Off by
@@ -693,23 +726,7 @@ impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config {path}"))?;
-        let mut cfg: Config = serde_yaml::from_str(&text).context("invalid config yaml")?;
-        // Duplicate upstream names are a routing hazard, not a style nit: every
-        // per-tool map (by_id, origin_sha, patched schemas, headers) keys on
-        // `name.tool`, so two upstreams named the same silently last-wins — a
-        // call aimed at the first executes against the second. Refuse to start.
-        {
-            let mut seen = std::collections::HashSet::new();
-            for up in &cfg.upstreams {
-                if !seen.insert(up.name.as_str()) {
-                    anyhow::bail!(
-                        "duplicate upstream name {:?}: tool ids are namespaced by upstream                          name, so duplicates would silently route one upstream's calls to                          the other. Rename one of them.",
-                        up.name
-                    );
-                }
-            }
-        }
-        cfg.index_overlays();
+        let mut cfg = Self::from_yaml(&text)?;
         // Resolve upstream cwd to the config's directory so relative args
         // (e.g. `uv --directory research`) don't depend on minmcp's own CWD.
         let base = PathBuf::from(path)
@@ -740,6 +757,68 @@ impl Config {
             }
         }
         Ok(cfg)
+    }
+
+    /// Parse and validate a config document. Unknown keys are rejected by the
+    /// deserializer (`deny_unknown_fields` on every config struct), so a typo
+    /// like `overlay:` or `preflght:` is a startup error, not a silent no-op.
+    pub fn from_yaml(text: &str) -> Result<Self> {
+        let mut cfg: Config = serde_yaml::from_str(text).context("invalid config yaml")?;
+        cfg.validate()?;
+        cfg.index_overlays();
+        Ok(cfg)
+    }
+
+    /// Cross-field checks the deserializer can't express. Each one is a routing
+    /// hazard, not a style nit: every per-tool map keys on `upstream.tool`, so a
+    /// silent last-wins sends a call to the wrong place.
+    fn validate(&self) -> Result<()> {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for up in &self.upstreams {
+            if !seen.insert(up.name.as_str()) {
+                anyhow::bail!(
+                    "duplicate upstream name {:?}: tool ids are namespaced by upstream name, \
+                     so duplicates would silently route one upstream's calls to the other. \
+                     Rename one of them.",
+                    up.name
+                );
+            }
+            let kinds = [up.command.is_some(), up.url.is_some(), up.spec.is_some()];
+            match kinds.iter().filter(|k| **k).count() {
+                1 => {}
+                0 => anyhow::bail!(
+                    "upstream {:?} needs exactly one of `command` (MCP server subprocess), \
+                     `url` (remote MCP server), or `spec` (OpenAPI document)",
+                    up.name
+                ),
+                _ => anyhow::bail!(
+                    "upstream {:?} sets more than one of `command`, `url`, and `spec`; an \
+                     upstream is exactly one kind — split it into separate upstreams",
+                    up.name
+                ),
+            }
+            if up.is_spec() && up.base_url.is_none() {
+                anyhow::bail!("spec upstream {:?} needs `base_url`", up.name);
+            }
+        }
+        let mut seen = HashSet::new();
+        for o in &self.overlays {
+            if !seen.insert(o.tool.as_str()) {
+                anyhow::bail!(
+                    "duplicate overlay for tool {:?}: only one would apply (last wins, \
+                     silently). Merge them into one entry.",
+                    o.tool
+                );
+            }
+        }
+        let mut seen = HashSet::new();
+        for w in &self.workflows {
+            if !seen.insert(w.id.as_str()) {
+                anyhow::bail!("duplicate workflow id {:?}: only one would be callable. Rename one.", w.id);
+            }
+        }
+        Ok(())
     }
 
     /// Error hints matching a result for `tool_id`: global hints plus this
@@ -837,7 +916,60 @@ mod tests {
     use super::*;
 
     fn cfg(yaml: &str) -> Config {
-        serde_yaml::from_str(yaml).unwrap()
+        Config::from_yaml(yaml).unwrap()
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_at_every_level() {
+        // A typo used to be a silent no-op; every config struct now denies
+        // unknown fields, so it is a startup error naming the key.
+        let top = Config::from_yaml("upstreams: []\npreflght: false\n").unwrap_err();
+        assert!(format!("{top:#}").contains("preflght"), "{top:#}");
+        let up = Config::from_yaml("upstreams:\n  - name: a\n    command: x\n    comand: y\n").unwrap_err();
+        assert!(format!("{up:#}").contains("comand"), "{up:#}");
+        let ov = Config::from_yaml(
+            "upstreams: []\noverlays:\n  - tool: a.b\n    descripton: nope\n",
+        )
+        .unwrap_err();
+        assert!(format!("{ov:#}").contains("descripton"), "{ov:#}");
+        let auth = Config::from_yaml("upstreams: []\nauth:\n  jwt_secrets: x\n").unwrap_err();
+        assert!(format!("{auth:#}").contains("jwt_secrets"), "{auth:#}");
+    }
+
+    #[test]
+    fn upstream_must_be_exactly_one_kind() {
+        let both = Config::from_yaml(
+            "upstreams:\n  - name: a\n    command: x\n    spec: s.json\n    base_url: http://h\n",
+        )
+        .unwrap_err();
+        assert!(format!("{both:#}").contains("more than one"), "{both:#}");
+        let none = Config::from_yaml("upstreams:\n  - name: a\n").unwrap_err();
+        assert!(format!("{none:#}").contains("exactly one"), "{none:#}");
+        let no_base = Config::from_yaml("upstreams:\n  - name: a\n    spec: s.json\n").unwrap_err();
+        assert!(format!("{no_base:#}").contains("base_url"), "{no_base:#}");
+        // each kind alone is fine
+        for body in ["command: x", "url: http://h/mcp", "spec: s.json\n    base_url: http://h"] {
+            assert!(Config::from_yaml(&format!("upstreams:\n  - name: a\n    {body}\n")).is_ok(), "{body}");
+        }
+    }
+
+    #[test]
+    fn duplicate_names_overlays_and_workflows_are_rejected() {
+        let ups = Config::from_yaml(
+            "upstreams:\n  - name: a\n    command: x\n  - name: a\n    command: y\n",
+        )
+        .unwrap_err();
+        assert!(format!("{ups:#}").contains("duplicate upstream name"), "{ups:#}");
+        let ovs = Config::from_yaml(
+            "upstreams: []\noverlays:\n  - tool: a.b\n  - tool: a.b\n",
+        )
+        .unwrap_err();
+        assert!(format!("{ovs:#}").contains("duplicate overlay"), "{ovs:#}");
+        let wfs = Config::from_yaml(
+            "upstreams: []\nworkflows:\n  - id: w\n    steps: []\n  - id: w\n    steps: []\n",
+        )
+        .unwrap_err();
+        assert!(format!("{wfs:#}").contains("duplicate workflow"), "{wfs:#}");
     }
 
     #[test]

@@ -113,14 +113,34 @@ impl Surface {
             // skipped upstreams would misalign it); stamped onto each ToolDef so
             // dispatch routes back to the right backend.
             let backend_idx = upstreams.len();
-            let mut up = if ucfg.is_spec() {
-                Backend::Spec(SpecBackend::new(ucfg)?)
-            } else if ucfg.is_http() {
-                Backend::Http(HttpUpstream::connect(ucfg).await?)
-            } else {
-                Backend::Mcp(Upstream::spawn(ucfg).await?)
+            let connected: Result<(Backend, Vec<ToolDef>)> = async {
+                let mut up = if ucfg.is_spec() {
+                    Backend::Spec(SpecBackend::new(ucfg)?)
+                } else if ucfg.is_http() {
+                    Backend::Http(HttpUpstream::connect(ucfg).await?)
+                } else {
+                    Backend::Mcp(Upstream::spawn(ucfg).await?)
+                };
+                let listed = up.list_tools(backend_idx).await?;
+                Ok((up, listed))
+            }
+            .await;
+            let (up, listed) = match connected {
+                Ok(v) => v,
+                // `optional: true` — degrade instead of refusing to start: the
+                // rest of the surface serves, this upstream's tools are absent,
+                // and the warning says why. Nothing was pushed, so indices of
+                // the upstreams that DID connect stay aligned.
+                Err(e) if ucfg.optional => {
+                    crate::log_warn!(
+                        "optional upstream {:?} unavailable and skipped: {e:#}",
+                        ucfg.name
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
-            for mut t in up.list_tools(backend_idx).await? {
+            for mut t in listed {
                 // static include/exclude: a filtered tool never enters the
                 // surface — not listed, searchable, or callable, for any caller.
                 if !config.passes_filter(&ucfg.name, t.id()) {
@@ -545,6 +565,9 @@ impl Surface {
     /// Returns the agent-facing text and the ids it served, in rank order. The ids
     /// are what shadow mode compares its challengers against.
     fn search_text(&self, query: &str, k: usize) -> (String, Vec<String>) {
+        // k=0 used to yield "no matches", which reads as a search failure; treat
+        // it as "the default", like an omitted k.
+        let k = if k == 0 { DEFAULT_SEARCH_K } else { k };
         // over-fetch so scope filtering can't starve the result list
         // (saturating: k is client-controlled, must not overflow)
         let hits = self.index.search(query, k.saturating_mul(3));
@@ -575,8 +598,9 @@ impl Surface {
     }
 
     fn details_text(&self, tool_id: &str) -> String {
-        // composite workflow: describe its declared inputs
-        if let Some(&i) = self.workflow_by_id.get(tool_id) {
+        // composite workflow: describe its declared inputs. Scope-gated like a
+        // tool (search already hides it; details and call must agree).
+        if let Some(&i) = self.visible_workflow(tool_id) {
             let wf = &self.config.workflows[i];
             let schema = if wf.inputs.is_null() { json!({"type": "object"}) } else { wf.inputs.clone() };
             return serde_json::to_string_pretty(&json!({
@@ -661,16 +685,22 @@ impl Surface {
         let candidates = self
             .by_id
             .keys()
-            .filter(|id| self.allowed(id))
             .chain(self.workflow_by_id.keys())
+            .filter(|id| self.allowed(id))
             .map(String::as_str);
         ids::did_you_mean(wrong, candidates)
     }
 
 
+    /// The composite's index, only if the current caller is allowed to see it —
+    /// the workflow twin of [`Surface::visible_def`].
+    fn visible_workflow(&self, id: &str) -> Option<&usize> {
+        self.workflow_by_id.get(id).filter(|_| self.allowed(id))
+    }
+
     /// Route a call to a composite workflow if the id names one, else a tool.
     async fn route_call(&mut self, id: &str, args: Value, fields: &[String]) -> Result<Value> {
-        if let Some(&i) = self.workflow_by_id.get(id) {
+        if let Some(&i) = self.visible_workflow(id) {
             let wf = self.config.workflows[i].clone(); // small; frees the borrow for &mut dispatch
             return self.execute_workflow(&wf, args).await;
         }

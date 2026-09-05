@@ -53,6 +53,43 @@ fn search_and_help_cli_mirror_the_meta_tools() {
 }
 
 #[test]
+fn serve_http_refuses_a_non_loopback_bind_without_allow_remote() {
+    // The HTTP transport has no inbound auth, so "everyone" (0.0.0.0) must be
+    // an explicit choice. Port 0 so the bind itself succeeds anywhere; the
+    // refusal happens on the resolved address, after binding.
+    let mut child = Command::new(BIN)
+        .args(["serve", "--http", "0.0.0.0:0", "--config", "tests/fixtures/ci-server.yaml"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve --http");
+    // Bounded wait: a guard that DOESN'T fire leaves a server running forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break Some(s);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let status = status.expect("serve --http 0.0.0.0 must exit (refused), not keep serving");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    assert!(!status.success(), "non-loopback bind must be refused: {stderr}");
+    assert!(stderr.contains("refusing") && stderr.contains("--allow-remote"), "{stderr}");
+
+    // and the override flag is tied to --http
+    let (_, stderr, ok) = run(&["serve", "--allow-remote", "--config", "tests/fixtures/ci-server.yaml"]);
+    assert!(!ok);
+    assert!(stderr.contains("--http"), "--allow-remote without --http is a usage error: {stderr}");
+}
+
+#[test]
 fn serve_prints_an_honest_banner_to_stderr() {
     // stdout is the protocol; the banner must go to stderr, and on a tiny
     // surface it must ADMIT the minified surface isn't smaller (the

@@ -166,7 +166,7 @@ impl SpecBackend {
                 cfg.accept.clone(),
                 crate::exec::resolve_headers(&cfg.headers)?,
                 cfg.result_format(),
-            ),
+            )?,
         })
     }
 

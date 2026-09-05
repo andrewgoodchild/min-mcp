@@ -13,6 +13,17 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::Value;
 
+/// Optional registered-claim checks applied on top of the signature and `exp`.
+/// Both default to off so an internal gateway with no audience discipline still
+/// works; set them where tokens are minted for several services.
+#[derive(Debug, Default, Clone)]
+pub struct ClaimChecks {
+    /// The token's `aud` must contain this value.
+    pub audience: Option<String>,
+    /// The token's `iss` must equal this value.
+    pub issuer: Option<String>,
+}
+
 /// Resolved key material for validating caller JWTs.
 pub enum JwtVerifier {
     Hs256(Vec<u8>),
@@ -25,13 +36,13 @@ impl JwtVerifier {
     /// Validate `token` and return the scopes named by `claim` (an OAuth-style
     /// space-delimited string or a JSON array). A valid token with no such
     /// claim yields an empty list (sees only unscoped tools).
-    pub fn scopes(&self, token: &str, claim: &str) -> Result<Vec<String>> {
+    pub fn scopes(&self, token: &str, claim: &str, checks: &ClaimChecks) -> Result<Vec<String>> {
         let token = token.trim();
         let claims = match self {
             JwtVerifier::Hs256(secret) => {
-                verify(token, Algorithm::HS256, &DecodingKey::from_secret(secret))
+                verify(token, Algorithm::HS256, &DecodingKey::from_secret(secret), checks)
             }
-            JwtVerifier::Rs256(key) => verify(token, Algorithm::RS256, key),
+            JwtVerifier::Rs256(key) => verify(token, Algorithm::RS256, key, checks),
             JwtVerifier::Jwks(keys) => {
                 let hdr = decode_header(token).context("unreadable JWT header")?;
                 let kid = hdr
@@ -40,18 +51,33 @@ impl JwtVerifier {
                 let key = keys
                     .get(&kid)
                     .ok_or_else(|| anyhow!("no JWKS key for kid {kid:?}"))?;
-                verify(token, Algorithm::RS256, key)
+                verify(token, Algorithm::RS256, key, checks)
             }
         }?;
         Ok(extract_scopes(&claims, claim))
     }
 }
 
-fn verify(token: &str, alg: Algorithm, key: &DecodingKey) -> Result<Value> {
+fn verify(token: &str, alg: Algorithm, key: &DecodingKey, checks: &ClaimChecks) -> Result<Value> {
     let mut validation = Validation::new(alg);
-    validation.validate_aud = false; // audience isn't checked here
+    match &checks.audience {
+        // jsonwebtoken rejects ANY `aud` when none is expected, which would
+        // refuse every token from an issuer that stamps one — so unset means
+        // "don't check", not "must be absent".
+        None => validation.validate_aud = false,
+        Some(aud) => {
+            validation.set_audience(&[aud.as_str()]);
+            // set_audience only checks the claim IF present; a token with no
+            // `aud` at all must not pass an audience check
+            validation.required_spec_claims.insert("aud".into());
+        }
+    }
+    if let Some(iss) = &checks.issuer {
+        validation.set_issuer(&[iss.as_str()]);
+        validation.required_spec_claims.insert("iss".into());
+    }
     Ok(decode::<Value>(token, key, &validation)
-        .context("JWT validation failed (signature or expiry)")?
+        .context("JWT validation failed (signature, expiry, audience, or issuer)")?
         .claims)
 }
 
@@ -154,30 +180,46 @@ lwIDAQAB
     #[test]
     fn hs256_space_delimited_scope_string() {
         let t = mint_hs(json!({"exp": exp(), "scope": "payments.read payments.write"}));
-        assert_eq!(hs().scopes(&t, "scope").unwrap(), vec!["payments.read", "payments.write"]);
+        assert_eq!(hs().scopes(&t, "scope", &ClaimChecks::default()).unwrap(), vec!["payments.read", "payments.write"]);
     }
 
     #[test]
     fn hs256_scope_array_and_missing_claim() {
         let t = mint_hs(json!({"exp": exp(), "scopes": ["a", "b"]}));
-        assert_eq!(hs().scopes(&t, "scopes").unwrap(), vec!["a", "b"]);
+        assert_eq!(hs().scopes(&t, "scopes", &ClaimChecks::default()).unwrap(), vec!["a", "b"]);
         let t2 = mint_hs(json!({"exp": exp()}));
-        assert!(hs().scopes(&t2, "scope").unwrap().is_empty());
+        assert!(hs().scopes(&t2, "scope", &ClaimChecks::default()).unwrap().is_empty());
     }
 
     #[test]
     fn hs256_rejects_wrong_secret_and_expired() {
         let t = mint_hs(json!({"exp": exp(), "scope": "a"}));
-        assert!(JwtVerifier::Hs256(b"other".to_vec()).scopes(&t, "scope").is_err());
+        assert!(JwtVerifier::Hs256(b"other".to_vec()).scopes(&t, "scope", &ClaimChecks::default()).is_err());
         let expired = mint_hs(json!({"exp": 1, "scope": "a"}));
-        assert!(hs().scopes(&expired, "scope").is_err());
+        assert!(hs().scopes(&expired, "scope", &ClaimChecks::default()).is_err());
+    }
+
+    #[test]
+    fn audience_and_issuer_are_enforced_only_when_configured() {
+        let t = mint_hs(json!({"exp": exp(), "scope": "a", "aud": "minmcp", "iss": "https://idp"}));
+        // unset: a token carrying aud/iss still validates (not "must be absent")
+        assert_eq!(hs().scopes(&t, "scope", &ClaimChecks::default()).unwrap(), vec!["a"]);
+        let ok = ClaimChecks { audience: Some("minmcp".into()), issuer: Some("https://idp".into()) };
+        assert_eq!(hs().scopes(&t, "scope", &ok).unwrap(), vec!["a"]);
+        let wrong_aud = ClaimChecks { audience: Some("other-service".into()), issuer: None };
+        assert!(hs().scopes(&t, "scope", &wrong_aud).is_err(), "foreign audience must be refused");
+        let wrong_iss = ClaimChecks { audience: None, issuer: Some("https://evil".into()) };
+        assert!(hs().scopes(&t, "scope", &wrong_iss).is_err(), "foreign issuer must be refused");
+        // configured but the token has no such claim → refused
+        let bare = mint_hs(json!({"exp": exp(), "scope": "a"}));
+        assert!(hs().scopes(&bare, "scope", &ok).is_err(), "missing aud/iss must be refused when required");
     }
 
     #[test]
     fn rs256_validates_with_pem_public_key() {
         let v = rs256_from_pem(PUB_PEM).unwrap();
         let t = mint_rs(json!({"exp": exp(), "scope": "payments.write"}), None);
-        assert_eq!(v.scopes(&t, "scope").unwrap(), vec!["payments.write"]);
+        assert_eq!(v.scopes(&t, "scope", &ClaimChecks::default()).unwrap(), vec!["payments.write"]);
     }
 
     #[test]
@@ -185,7 +227,7 @@ lwIDAQAB
         let v = rs256_from_pem(PUB_PEM).unwrap();
         // an HS256 token must not validate against an RS256 verifier
         let hs_tok = mint_hs(json!({"exp": exp(), "scope": "a"}));
-        assert!(v.scopes(&hs_tok, "scope").is_err());
+        assert!(v.scopes(&hs_tok, "scope", &ClaimChecks::default()).is_err());
     }
 
     #[test]
@@ -208,8 +250,8 @@ lwIDAQAB
         let header = b64url(br#"{"alg":"none","typ":"JWT"}"#);
         let payload = b64url(br#"{"exp":4000000000,"scope":"admin"}"#);
         let forged = format!("{header}.{payload}."); // empty signature
-        assert!(hs().scopes(&forged, "scope").is_err(), "HS256 verifier must reject alg:none");
-        assert!(rs256_from_pem(PUB_PEM).unwrap().scopes(&forged, "scope").is_err(), "RS256 verifier must reject alg:none");
+        assert!(hs().scopes(&forged, "scope", &ClaimChecks::default()).is_err(), "HS256 verifier must reject alg:none");
+        assert!(rs256_from_pem(PUB_PEM).unwrap().scopes(&forged, "scope", &ClaimChecks::default()).is_err(), "RS256 verifier must reject alg:none");
     }
 
     #[test]
@@ -219,7 +261,7 @@ lwIDAQAB
         );
         let v = jwks_from_json(&jwks).unwrap();
         let t = mint_rs(json!({"exp": exp(), "scope": "reports.read"}), Some("key-1"));
-        assert_eq!(v.scopes(&t, "scope").unwrap(), vec!["reports.read"]);
+        assert_eq!(v.scopes(&t, "scope", &ClaimChecks::default()).unwrap(), vec!["reports.read"]);
     }
 
     #[test]
@@ -227,8 +269,8 @@ lwIDAQAB
         let jwks = format!(r#"{{"keys":[{{"kty":"RSA","kid":"key-1","n":"{JWK_N}","e":"{JWK_E}"}}]}}"#);
         let v = jwks_from_json(&jwks).unwrap();
         let wrong_kid = mint_rs(json!({"exp": exp(), "scope": "a"}), Some("key-9"));
-        assert!(v.scopes(&wrong_kid, "scope").is_err());
+        assert!(v.scopes(&wrong_kid, "scope", &ClaimChecks::default()).is_err());
         let no_kid = mint_rs(json!({"exp": exp(), "scope": "a"}), None);
-        assert!(v.scopes(&no_kid, "scope").is_err());
+        assert!(v.scopes(&no_kid, "scope", &ClaimChecks::default()).is_err());
     }
 }

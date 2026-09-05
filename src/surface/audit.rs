@@ -82,7 +82,7 @@ impl Surface {
             })
             .collect();
         json!({
-            "mode": format!("{:?}", self.config.mode),
+            "mode": self.config.mode,
             "tool_count": tools.len(),
             "exposed_by_name": self.exposed.len(),
             "renamed_collisions": collisions,
@@ -234,7 +234,9 @@ impl Surface {
         let minified_count = minified["tools"].as_array().map(Vec::len).unwrap_or(0);
         let min_chars = json_len(&minified);
         json!({
-            "mode": format!("{:?}", self.config.mode),
+            // serialized like the config key (`three_tool`), not the Rust
+            // variant name, so inspect output and config speak one vocabulary
+            "mode": self.config.mode,
             "upstreams_configured": self.config.upstreams.len(),
             // active = configured minus any fully filtered-out upstreams
             "upstreams_active": self.upstreams.len(),

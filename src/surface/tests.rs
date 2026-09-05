@@ -772,6 +772,64 @@ async fn failed_calls_do_not_feed_the_usage_prior() {
     );
 }
 
+#[test]
+fn search_k_zero_means_the_default_not_no_matches() {
+    let cfg: Config = Config::from_yaml("mode: three_tool\nupstreams: []\n").unwrap();
+    let tools = vec![ToolDef {
+        upstream_idx: 0,
+        name: "GetX".into(),
+        description: "get x".into(),
+        input_schema: json!({"type": "object"}),
+        id: "up.GetX".into(),
+        read_only: None,
+    }];
+    let mut s = test_surface(cfg, tools);
+    s.index = Index::build(&[crate::index::IndexedTool {
+        id: "up.GetX".into(),
+        description: "get x".into(),
+        params: String::new(),
+    }]);
+    assert!(s.cli_search("get x", 0).contains("up.GetX"), "k=0 used to read as a search failure");
+}
+
+#[tokio::test]
+async fn a_scoped_out_composite_is_hidden_from_details_and_call_like_search() {
+    // Scopes hid a composite from search_tools but get_tool_details and
+    // call_tool still honoured it; the three must agree.
+    let yaml = "mode: three_tool\nupstreams: []\nscopes:\n  rules:\n    - scope: w\n      tools: [\"wf.*\"]\nworkflows:\n  - id: wf.chain\n    description: a chain\n    steps: []\n";
+    let mk = |granted: Vec<String>| {
+        let mut s = test_surface(Config::from_yaml(yaml).unwrap(), vec![]);
+        s.granted = granted;
+        s.workflow_by_id.insert("wf.chain".into(), 0);
+        s
+    };
+    let mut hidden = mk(vec![]);
+    assert!(hidden.cli_details("wf.chain").contains("unknown tool_id"), "no scope → not described");
+    let r = hidden.call("call_tool", json!({"tool_id": "wf.chain", "arguments": {}})).await.unwrap();
+    assert_eq!(r["isError"], json!(true), "no scope → not callable: {r}");
+    assert!(result_text(&r).contains("unknown tool_id"), "{r}");
+
+    let mut visible = mk(vec!["w".into()]);
+    assert!(visible.cli_details("wf.chain").contains("\"composite\": true"), "granted → described");
+    let r = visible.call("call_tool", json!({"tool_id": "wf.chain", "arguments": {}})).await.unwrap();
+    assert_eq!(r["isError"], json!(false), "granted → runs (an empty chain succeeds): {r}");
+}
+
+#[test]
+fn projection_and_transforms_preserve_number_literals() {
+    // Every parse→serialize path (projection here) must carry a 128-bit id and
+    // a long decimal through digit-for-digit — the arbitrary_precision guard.
+    let big = "{\"id\":340282366920938463463374607431768211455,\"rate\":0.12345678901234567890123,\"noise\":1}";
+    let mut result = json!({"content": [{"type": "text", "text": big}], "isError": false});
+    transform_result(&mut result, false, |payload| {
+        *payload = crate::project::project(payload, &["id".to_string(), "rate".to_string()]);
+    });
+    assert_eq!(
+        result_text(&result),
+        "{\"id\":340282366920938463463374607431768211455,\"rate\":0.12345678901234567890123}"
+    );
+}
+
 /// Provenance beats shape: an MCP tool may legitimately return an
 /// http-fetch-style `{"status":…,"body":…}` object of its own. Before
 /// provenance-gating, `is_envelope` shape-sniffed it as a spec envelope, ran

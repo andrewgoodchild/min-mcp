@@ -81,7 +81,7 @@ impl ServerHandler for MinMcpServer {
             .await
             .read_resource(&request.uri)
             .await
-            .map_err(|e| ErrorData::resource_not_found(e.to_string(), None))?;
+            .map_err(|e| ErrorData::resource_not_found(format!("{e:#}"), None))?;
         let result: ReadResourceResult = serde_json::from_value(v)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(result.into())
@@ -108,7 +108,7 @@ impl ServerHandler for MinMcpServer {
             .await
             .get_prompt(&request.name, args)
             .await
-            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
         let result: GetPromptResult = serde_json::from_value(v)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(result.into())
@@ -140,9 +140,12 @@ impl ServerHandler for MinMcpServer {
             let mut surface = self.surface.lock().await;
             surface.call(&name, args).await
         };
-        // A genuine upstream/transport failure is a protocol error; the surface
-        // already returns client-side/tool errors as isError results (Ok).
-        let result = result.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        // The surface returns every tool-level outcome — client-side argument
+        // errors, upstream isError, timeouts, AND transport failures — as an
+        // isError result (Ok), so the agent can reason about it. Only a failure
+        // of min-mcp itself reaches this branch; `{:#}` keeps the cause chain
+        // (`e.to_string()` printed just the outermost context).
+        let result = result.map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?;
         Ok(value_to_call_result(&result).into())
     }
 }
@@ -259,7 +262,12 @@ pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
 /// TCP listener by hyper, with an added `Origin` check (see
 /// [`origin_allowed`]). One shared `Surface` backs every session (the
 /// per-session factory just clones the handle).
-pub async fn serve_http(surface: Surface, addr: &str) -> Result<()> {
+///
+/// There is no inbound authentication on this transport, and the scopes are
+/// the process's (`--jwt` / `--scopes`), not the connecting client's. So the
+/// listener is loopback-only unless `allow_remote` is set — anyone who can
+/// reach the port gets every upstream credential this process holds.
+pub async fn serve_http(surface: Surface, addr: &str, allow_remote: bool) -> Result<()> {
     use anyhow::Context;
     use hyper::server::conn::http1;
     use hyper_util::rt::TokioIo;
@@ -276,11 +284,35 @@ pub async fn serve_http(surface: Surface, addr: &str) -> Result<()> {
     );
 
     let listener = TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
-    let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.to_string());
-    eprintln!("min-mcp: Streamable HTTP (rmcp) listening on http://{bound}/");
+    let local = listener.local_addr().context("reading the bound address")?;
+    // Checked on the RESOLVED address, so every spelling of loopback passes
+    // (`localhost`, `127.0.0.1`, `[::1]`) and every spelling of "everyone" is
+    // caught (`0.0.0.0`, `[::]`, a LAN ip, a public hostname).
+    if !local.ip().is_loopback() && !allow_remote {
+        anyhow::bail!(
+            "refusing to serve HTTP on non-loopback address {local}: this transport has no \
+             inbound authentication, so every client that can reach it would get this \
+             process's scopes and upstream credentials. Bind 127.0.0.1, or pass \
+             --allow-remote if an authenticating proxy or a private network is in front."
+        );
+    }
+    if !local.ip().is_loopback() {
+        crate::log_warn!("serving HTTP on non-loopback {local} with NO inbound authentication (--allow-remote)");
+    }
+    eprintln!("min-mcp: Streamable HTTP (rmcp) listening on http://{local}/");
 
     loop {
-        let (tcp, _peer) = listener.accept().await.context("accepting connection")?;
+        // A transient accept failure (EMFILE, a reset mid-handshake) must not
+        // take the whole server down; log it and keep accepting, with a short
+        // pause so a persistent condition can't spin the loop.
+        let (tcp, _peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                crate::log_warn!("accepting connection failed: {e}; continuing");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let io = TokioIo::new(tcp);
         let inner = TowerToHyperService::new(service.clone());
         // Gate on Origin before the request reaches the MCP service, then hand

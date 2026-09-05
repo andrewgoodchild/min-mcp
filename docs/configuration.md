@@ -5,6 +5,11 @@ min-mcp is configured with a single YAML file (default `min.yaml`, or
 embedded. Paths (`spec:`, `jwt_public_key_file:`, `log_file:`) resolve relative to
 the config file's directory, so the binary can be launched from anywhere.
 
+Every key is checked. An unknown or misspelled key anywhere in the file
+(`overlay:`, `preflght:`) is a startup error that names it, never a silent
+no-op. So is a duplicate upstream `name`, overlay `tool`, or workflow `id`, and
+an upstream that sets more than one of `command` / `url` / `spec`.
+
 ## Top-level keys
 
 ```yaml
@@ -41,8 +46,13 @@ shadow: false             # score alternative retrievers on real traffic (see be
 
 ## Upstreams
 
-An upstream is one of **three kinds**, distinguished by which key you set. All
-share `name` (the prefix for its tool ids, e.g. `stripe.PostCustomers`).
+An upstream is one of **three kinds**, distinguished by which key you set —
+exactly one of `command`, `url`, or `spec`. All share `name` (the prefix for its
+tool ids, e.g. `stripe.PostCustomers`) and `optional`: with `optional: true` an
+upstream that can't be spawned, connected, or listed at startup is skipped with a
+warning instead of failing the whole proxy, and its tools are simply absent
+until the next restart. Off by default, because a missing upstream is usually a
+config error you want to hear about.
 
 ### a) MCP server subprocess
 
@@ -53,6 +63,7 @@ upstreams:
     args: ["-y", "@some/mcp-server"]
     env: { LOG_LEVEL: debug }           # optional literal env vars set on the child
     # cwd: ./subdir                      # optional; defaults to the config's dir
+    # optional: true                     # skip with a warning if it can't start (any kind)
     # result_format: raw                 # raw (default for MCP/HTTP): results pass
     #                                    # through byte-for-byte — a read_file result
     #                                    # is never rewritten. json: opt in to compact
@@ -161,7 +172,9 @@ either.
 
 ## Examples
 
-The [`examples/`](../examples/) directory has one config per shape:
-`proxy-mcp-server.yaml`, `stripe-from-spec.yaml`, `github-from-spec.yaml`,
-`oauth-upstream.yaml`, `stripe-narrow-filter.yaml`, `stripe-composite.yaml`,
-`stripe-faithful-proxy.yaml`.
+The [`examples/`](../examples/) directory has one config per shape — offline
+demos (`demo-overlays.yaml`, `demo-workflow.yaml`, `demo-scopes.yaml`) and
+real-API ones (`proxy-mcp-server.yaml`, `github-mcp-server.yaml`,
+`stripe-from-spec.yaml`, `github-from-spec.yaml`, `github-fixups.yaml`,
+`oauth-upstream.yaml`, `stripe-narrow-filter.yaml`, `stripe-composite.yaml`).
+See [`examples/README.md`](../examples/README.md).

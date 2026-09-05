@@ -6,7 +6,67 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Security
+
+- **HTTP serving is loopback-only.** `serve --http` refuses a non-loopback
+  bind (`0.0.0.0`, a LAN address) unless `--allow-remote` is passed. The
+  transport has no inbound authentication and one scope set per process, so a
+  reachable port handed every client this process's upstream credentials — and
+  the CLI help said "binds localhost" while binding whatever it was given.
+- `auth.audience` / `auth.issuer` — optional `aud` / `iss` checks on caller
+  JWTs. Both were unchecked, so a token minted for another service validated.
+- `--jwt` can be supplied as `MINMCP_JWT`, keeping the token out of argv.
+- The JWKS fetch at startup is bounded (30s), like the OAuth token fetch.
+
+### Fixed
+
+- **Number literals survive every path.** serde_json's `arbitrary_precision`
+  is on: a 128-bit id or a 23-digit decimal is no longer rewritten through f64
+  by the spec envelope (default `json`), `fields` projection, overlay
+  `response` transforms, or the pagination merge. The MCP path's lexical
+  compactor already guarded this; the other paths did not. (jq programs still
+  compute in f64, as jq does.)
+- An MCP upstream's transport failure (subprocess died, remote non-2xx) reached
+  the agent as a JSON-RPC protocol error, while a spec upstream's identical
+  failure was an `isError` result. Both are now `UPSTREAM_ERROR` results with
+  the write-safety guidance, so breaker, cache-bust, and error hints apply
+  alike.
+- A request body declaring form-encoding before JSON showed the JSON schema
+  but was sent form-encoded: schema and encoding now pick the same media type.
+- Protocol error messages carried only the outermost context; the cause chain
+  is included.
+- A transient `accept()` failure ended the HTTP server; it is logged and the
+  loop continues.
+- `search_tools` with `k: 0` reported "no matches"; it now uses the default.
+- Composite tools hidden by scopes from `search_tools` were still reachable via
+  `get_tool_details` / `call_tool`; the three now agree.
+- The duplicate-upstream error printed runs of literal spaces; the `${VAR}`
+  and missing-`command` errors named the wrong thing.
+
+### Changed
+
+- **Config is strict.** Unknown or misspelled keys anywhere in the file are a
+  startup error naming the key (they were silently ignored). Duplicate overlay
+  `tool`s and workflow `id`s, and an upstream setting more than one of
+  `command` / `url` / `spec`, are rejected too.
+- `inspect` / `map` report `"mode": "three_tool"` (the config spelling)
+  instead of the Rust variant name `"ThreeTool"`.
+- `MINMCP_LOG=trace` is accepted.
+- jq programs are compiled once per process instead of on every call.
+- `rust-version = "1.91"` declares the MSRV; release binaries are stripped and
+  built with `codegen-units = 1`.
+
+### Added
+
+- `optional: true` on an upstream — skip it with a warning when it can't be
+  spawned, connected, or listed, instead of failing the whole proxy.
+
+### Docs
+
+- Transports: the claim that every request runs on its own task is corrected —
+  surface requests are serialized behind one lock, and `timeout_s` is the
+  mitigation. The HTTP transport's no-auth, per-process-scope model is stated.
+- Configuration: the examples list no longer names a file that isn't shipped.
 
 ## [0.1.1] — 2026-08-12
 

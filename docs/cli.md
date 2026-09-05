@@ -10,8 +10,9 @@ All commands share these options (via `--config`'s command group):
 |---|---|---|
 | `--config <path>` | `min.yaml` | the config file to load |
 | `--scopes a,b` | *(empty)* | granted scopes for this session (local-dev identity; prefer `--jwt`) |
-| `--jwt <token>` | — | a caller JWT; its validated scope claim overrides `--scopes` |
-| `--http <addr>` | — | *(serve only)* expose over Streamable HTTP at e.g. `127.0.0.1:8080` instead of stdio |
+| `--jwt <token>` | `$MINMCP_JWT` | a caller JWT; its validated scope claim overrides `--scopes`. The env var keeps it out of argv |
+| `--http <addr>` | — | *(serve only)* expose over Streamable HTTP at e.g. `127.0.0.1:8080` instead of stdio. Loopback only |
+| `--allow-remote` | off | *(serve --http only)* permit a non-loopback bind. The HTTP transport has no inbound auth — see [Transports & auth](transports-and-auth.md#streamable-http) |
 
 ## Commands
 
@@ -22,6 +23,7 @@ with `--http`. This is what your agent/MCP client connects to.
 ```sh
 minmcp serve --config myconfig.yaml
 minmcp serve --config myconfig.yaml --http 127.0.0.1:8080
+minmcp serve --config myconfig.yaml --http 0.0.0.0:8080 --allow-remote   # only behind an authenticating proxy
 ```
 
 ### `inspect`

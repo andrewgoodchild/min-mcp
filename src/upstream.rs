@@ -203,7 +203,7 @@ impl Upstream {
         let command = cfg
             .command
             .as_ref()
-            .ok_or_else(|| anyhow!("upstream {} has neither `command` nor `spec`", cfg.name))?;
+            .ok_or_else(|| anyhow!("upstream {} has no `command` (expected an MCP server subprocess; `url` and `spec` are the other kinds)", cfg.name))?;
         let mut cmd = Command::new(command);
         cmd.args(&cfg.args).envs(&cfg.env);
         if let Some(dir) = &cfg.cwd {

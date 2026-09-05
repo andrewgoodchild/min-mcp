@@ -48,9 +48,12 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 20
+      # Pinned: this runs third-party code against a checkout, and `@latest`
+      # would silently change what is executed (and what the report measures).
+      # Bump deliberately.
       - name: Run @yawlabs/mcp-compliance
         run: |
-          npx --yes @yawlabs/mcp-compliance@latest test \
+          npx --yes @yawlabs/mcp-compliance@0.17.1 test \
             ./target/release/minmcp serve --config tests/fixtures/ci-server.yaml \
             --format markdown | tee compliance-report.md || true
       - name: Upload compliance report
