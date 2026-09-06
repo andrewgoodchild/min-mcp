@@ -35,6 +35,23 @@ use crate::caller::Caller;
 use crate::config::TrustedHeaders;
 use crate::surface::Surface;
 
+/// How long a TLS handshake may take before the connection is dropped. Not
+/// configurable on purpose: it bounds an allocation no legitimate client comes
+/// near, and a knob here is one more thing to get wrong.
+/// How long a client may take to complete the TLS handshake. Short on purpose:
+/// an un-handshaked socket is the cheapest thing for an attacker to create and
+/// carries no legitimate reason to stall.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a connection may go without producing a request head, on either
+/// scheme. This bounds the same "opens a socket and sends nothing" hazard, but
+/// hyper applies it to EVERY head on a connection, not just the first — so it
+/// doubles as the idle keep-alive timeout, and a value as short as the handshake
+/// deadline would drop a connection whenever an agent paused to think, charging
+/// a fresh TCP (and TLS) handshake to the next tool call. 30s keeps the bound
+/// while leaving normal think-time alone.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// rmcp `ServerHandler` over a shared `Surface`.
 #[derive(Clone)]
 pub struct MinMcpServer {
@@ -393,9 +410,11 @@ pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
 /// (see [`HttpIdentity::authenticate`]) in front of every request; the caller
 /// rides the request into the handler. One shared `Surface` backs every session.
 ///
-/// The listener is loopback-only unless `allow_remote` is set OR identity is
-/// enforced on every request — without one of those, anyone who can reach the
-/// port gets the process's scopes and every upstream credential it holds.
+/// The listener is loopback-only unless `allow_remote` is set, identity is
+/// enforced on every request, OR mutual TLS is required (`http.tls.client_ca_file`
+/// — a real authentication boundary, though a channel-level one) — without one
+/// of those, anyone who can reach the port gets the process's scopes and every
+/// upstream credential it holds.
 ///
 /// DNS-rebinding defences depend on the bind. A **loopback** server validates
 /// both headers: `Host` (rmcp's allow-list) and `Origin` (see
@@ -414,6 +433,7 @@ pub async fn serve_http(
     identity: HttpIdentity,
     addr: &str,
     allow_remote: bool,
+    http_cfg: &crate::config::HttpConfig,
 ) -> Result<()> {
     use anyhow::Context;
     use hyper::server::conn::http1;
@@ -422,6 +442,7 @@ pub async fn serve_http(
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
     use tokio::net::TcpListener;
+    use tower::Layer;
 
     let server = MinMcpServer::new(surface, process_caller, identity.enforced());
     let process_caller = server.process_caller.clone();
@@ -432,13 +453,25 @@ pub async fn serve_http(
     // Checked on the RESOLVED address, so every spelling of loopback passes
     // (`localhost`, `127.0.0.1`, `[::1]`) and every spelling of "everyone" is
     // caught (`0.0.0.0`, `[::]`, a LAN ip, a public hostname).
-    if !local.ip().is_loopback() && !allow_remote && !identity.enforced() {
+    // Built before the guard so the guard can ask it what it enforces, rather
+    // than re-deriving that from config (see `crate::tls::Tls`). A bad
+    // certificate is a deployment error: failing every handshake is worse than
+    // never binding.
+    let tls = http_cfg.tls.as_ref().map(crate::tls::acceptor).transpose()?;
+    // Mutual TLS authenticates the CHANNEL: only a client holding a certificate
+    // signed by the configured CA can open a connection at all. That is a real
+    // authentication boundary, so it satisfies the non-loopback guard the same
+    // way per-request identity does — though every such client still shares the
+    // process's scopes, which is why it is not a substitute for `auth:`.
+    let mutual_tls = tls.as_ref().is_some_and(|t| t.requires_client_cert);
+    if !local.ip().is_loopback() && !allow_remote && !identity.enforced() && !mutual_tls {
         anyhow::bail!(
             "refusing to serve HTTP on non-loopback address {local} without caller identity: \
              every client that can reach it would get this process's scopes and upstream \
              credentials. Either configure `auth:` (a JWT verifier or trusted_headers, \
-             without allow_anonymous) so each request is authenticated, bind 127.0.0.1, or \
-             pass --allow-remote if an authenticating proxy or a private network is in front."
+             without allow_anonymous) so each request is authenticated, require client \
+             certificates (`http.tls.client_ca_file`), bind 127.0.0.1, or pass \
+             --allow-remote if an authenticating proxy or a private network is in front."
         );
     }
     let remote = !local.ip().is_loopback();
@@ -451,17 +484,50 @@ pub async fn serve_http(
     }
     // See the doc comment above for why these follow the bind.
     let check_origin = !(remote && identity.enforced());
+    let limits = &http_cfg.limits;
+    let max_body = limits.max_body_bytes;
     let http_config = if remote {
         StreamableHttpServerConfig::default().disable_allowed_hosts()
     } else {
         StreamableHttpServerConfig::default()
-    };
+    }
+    // rmcp enforces the body cap itself while it streams the POST body, and it
+    // has its OWN default (4 MiB). Handing it the configured value is what makes
+    // `max_body_bytes` real at every size — left at the default, anything above
+    // 4 MiB is refused by rmcp with a 413 quoting a number nobody configured —
+    // and it renders both the declared and the chunked case as a proper 413.
+    .with_max_request_body_bytes(max_body);
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(LocalSessionManager::default()),
         http_config,
     );
-    eprintln!("min-mcp: Streamable HTTP (rmcp) listening on http://{local}/");
+    // One shared semaphore bounds how many requests rmcp is inside at once, over
+    // every connection; past the cap a request waits rather than failing.
+    //
+    // Measured caveat, so nobody reads more into the knob than it does: tower
+    // releases the permit when the response FUTURE resolves, and rmcp answers a
+    // POST with an SSE stream that resolves as soon as the stream handle is
+    // returned — before the tool call runs. So this bounds request *handling*,
+    // NOT concurrent upstream calls. With `max_in_flight: 1`, three concurrent
+    // 4s tool calls still complete in ~4s, not ~12s. Bounding upstream
+    // concurrency belongs in the dispatch path, beside the per-caller buckets,
+    // breakers and timeouts that already govern it.
+    let service = tower::limit::GlobalConcurrencyLimitLayer::new(limits.max_in_flight).layer(service);
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    // Everything the guard needed from `Tls` has been read; the accept loop
+    // only needs the acceptor itself (an `Arc<ServerConfig>` bump per clone).
+    let tls = tls.map(|t| t.acceptor);
+    if tls.is_none() && remote {
+        crate::log_warn!(
+            "serving PLAINTEXT HTTP on non-loopback {local}: bearer tokens and gateway identity \
+             headers cross the network in the clear unless something in front terminates TLS"
+        );
+    }
+    if mutual_tls {
+        crate::log_info!("requiring a client certificate on every connection (mutual TLS)");
+    }
+    eprintln!("min-mcp: Streamable HTTP (rmcp) listening on {scheme}://{local}/");
 
     loop {
         // A transient accept failure (EMFILE, a reset mid-handshake) must not
@@ -475,10 +541,13 @@ pub async fn serve_http(
                 continue;
             }
         };
-        let io = TokioIo::new(tcp);
-        let inner = TowerToHyperService::new(service.clone());
+        // Arc, not a per-request clone: `TowerToHyperService::call` already
+        // clones the stack internally (hyper-util's `Oneshot`), and each clone
+        // copies rmcp's config Vec. One atomic bump per request instead.
+        let inner = Arc::new(TowerToHyperService::new(service.clone()));
         let identity = identity.clone();
         let process_caller = process_caller.clone();
+        let tls = tls.clone();
         // Gate on Origin and identity before the request reaches the MCP
         // service, then hand it off with the caller attached. One task per
         // connection; a slow request never blocks the accept loop.
@@ -487,13 +556,15 @@ pub async fn serve_http(
             let identity = identity.clone();
             let process_caller = process_caller.clone();
             async move {
-                let origin =
-                    req.headers().get(hyper::header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_string);
-                if check_origin && !origin_allowed(origin.as_deref()) {
-                    crate::log_warn!(
-                        "refused an HTTP request from Origin {:?} (DNS-rebinding defence)",
-                        origin.unwrap_or_default()
-                    );
+                // Borrowed, and only owned on the refusal path; the flag is
+                // tested first so an identity-enforced remote bind (where the
+                // check is off) never reads the header at all.
+                let refused = {
+                    let origin = req.headers().get(hyper::header::ORIGIN).and_then(|v| v.to_str().ok());
+                    (check_origin && !origin_allowed(origin)).then(|| origin.unwrap_or_default().to_string())
+                };
+                if let Some(origin) = refused {
+                    crate::log_warn!("refused an HTTP request from Origin {origin:?} (DNS-rebinding defence)");
                     return Ok(plain_response(hyper::StatusCode::FORBIDDEN, None, "forbidden: Origin not allowed"));
                 }
                 let caller = match identity.authenticate(req.headers(), &process_caller).await {
@@ -504,11 +575,46 @@ pub async fn serve_http(
                     }
                 };
                 req.extensions_mut().insert(caller);
-                hyper::service::Service::call(&inner, req).await
+                // The body cap is rmcp's, from `with_max_request_body_bytes`
+                // above: it refuses on the first frame that would exceed, so
+                // declared and chunked bodies alike get a 413 and nothing past
+                // the cap is buffered. One limit, one enforcement point.
+                hyper::service::Service::call(&*inner, req).await
             }
         });
+        // The handshake happens in the connection's own task: doing it in the
+        // accept loop would let one slow or hostile client stall every other
+        // connection's accept.
+        //
+        // The invariant both arms hold: an accepted socket that does not produce
+        // a request is dropped. Otherwise a client can open connections and send
+        // nothing, pinning a task and a file descriptor each — the one
+        // allocation `http.limits` cannot bound, because no request ever exists
+        // to be counted. hyper sets no such deadline by default, so
+        // `header_read_timeout` covers what hyper can see and the explicit
+        // timeout covers the handshake, which it cannot. A long-lived SSE stream
+        // is unaffected: the deadline is on reading a request head, not on
+        // writing a response (verified — a GET stream held well past it).
         tokio::spawn(async move {
-            let _ = http1::Builder::new().serve_connection(io, guarded).await;
+            let conn = || {
+                let mut b = http1::Builder::new();
+                b.timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
+                b
+            };
+            match tls {
+                None => {
+                    let _ = conn().serve_connection(TokioIo::new(tcp), guarded).await;
+                }
+                Some(tls) => match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, tls.accept(tcp)).await {
+                    Ok(Ok(stream)) => {
+                        let _ = conn().serve_connection(TokioIo::new(stream), guarded).await;
+                    }
+                    // Includes a client that presented no certificate, or one
+                    // that did not chain to the configured CA, under mutual TLS.
+                    Ok(Err(e)) => crate::log_info!("TLS handshake failed: {e}"),
+                    Err(_) => crate::log_info!("TLS handshake timed out after {TLS_HANDSHAKE_TIMEOUT:?}"),
+                },
+            }
         });
     }
 }

@@ -20,6 +20,7 @@ mod rmcp_serve;
 mod secrets;
 mod spec;
 mod sync;
+mod tls;
 // note: `jsonrpc` stays — the upstream MCP clients (upstream.rs / http_upstream.rs)
 // still frame JSON-RPC by hand; only the *server* side moved to rmcp.
 mod surface;
@@ -187,6 +188,9 @@ struct Built {
     surface: Arc<Surface>,
     caller: Caller,
     identity: rmcp_serve::HttpIdentity,
+    /// Transport hardening for `serve --http`, lifted out before the config is
+    /// consumed by the surface.
+    http: config::HttpConfig,
 }
 
 async fn build(common: &Common) -> Result<Built> {
@@ -198,8 +202,20 @@ async fn build(common: &Common) -> Result<Built> {
     let verifier = build_verifier(&cfg, &secrets, needs_verifier).await?.map(Arc::new);
     let caller = resolve_caller(&cfg, common, verifier.as_deref()).await?;
     let identity = rmcp_serve::HttpIdentity::from_auth(&cfg.auth, verifier);
+    let http = cfg.http.clone();
+    // Rate limits key on the caller's subject, so a deployment that configures
+    // limits but supplies no subject silently gets ONE bucket for everyone.
+    // That is documented, but it is a genuine surprise when the callers *are*
+    // authenticated — a gateway forwarding scopes without an identity header.
+    if common.http.is_some() && cfg.rate_limits.any() && !cfg.auth.names_the_caller() {
+        crate::log_warn!(
+            "rate limits are configured but nothing supplies a caller subject, so every caller \
+             shares one bucket: set `auth.trusted_headers.subject`, or use bearer tokens (whose \
+             `auth.subject_claim` defaults to `sub`)"
+        );
+    }
     let surface = Arc::new(Surface::build(cfg, secrets).await?);
-    Ok(Built { surface, caller, identity })
+    Ok(Built { surface, caller, identity, http })
 }
 
 // Multi-threaded runtime: the surface is shared, not locked, so concurrent
@@ -276,7 +292,15 @@ async fn main() -> Result<()> {
             // wrapping our Surface behind its ServerHandler.
             match &common.http {
                 Some(addr) => {
-                    rmcp_serve::serve_http(b.surface, b.caller, b.identity, addr, common.allow_remote).await
+                    rmcp_serve::serve_http(
+                        b.surface,
+                        b.caller,
+                        b.identity,
+                        addr,
+                        common.allow_remote,
+                        &b.http,
+                    )
+                    .await
                 }
                 None => rmcp_serve::serve_stdio(b.surface, b.caller).await,
             }

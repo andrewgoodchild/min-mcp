@@ -7,7 +7,8 @@
 #   minmcp inspect --config examples/enterprise.yaml
 #   minmcp serve   --config examples/enterprise.yaml --http 0.0.0.0:8080
 # The non-loopback bind is accepted WITHOUT --allow-remote because every
-# request must carry identity (auth below, no allow_anonymous).
+# request must carry identity (auth below, no allow_anonymous). Requiring client
+# certificates (http.tls.client_ca_file) satisfies that guard the same way.
 
 mode: three_tool
 
@@ -50,6 +51,27 @@ scopes:
       tools: ["acme.widgets/list", "acme.widgets/get"]
     - scope: store.write
       tools: ["acme.widgets/create", "acme.orders/create"]
+
+# --- The listener itself ------------------------------------------------------
+http:
+  # TLS terminated here rather than only at the gateway. Commented out so this
+  # file stays offline-runnable; point them at real PEM files to enable. Paths
+  # are relative to THIS config file.
+  # tls:
+  #   cert_file: /etc/minmcp/server.crt   # chain: server certificate first
+  #   key_file: /etc/minmcp/server.key    # PKCS#8, PKCS#1 or SEC1
+  #   # Mutual TLS. This is what makes `trusted_headers` above safe to believe:
+  #   # with it, only a holder of a certificate signed by this CA can open a
+  #   # connection at all, so nothing can reach the port and set its own
+  #   # X-Auth-Scopes. It authenticates the CHANNEL, never the caller.
+  #   client_ca_file: /etc/minmcp/gateway-ca.crt
+  limits:
+    max_body_bytes: 1048576                # 1 MiB; a larger body is 413'd unread
+    max_in_flight: 256                     # requests inside the MCP service at
+                                           # once, all connections; over this
+                                           # they queue rather than fail. Bounds
+                                           # request handling, NOT concurrent
+                                           # upstream calls — see the docs.
 
 # --- Limits -----------------------------------------------------------------------
 rate_limits:

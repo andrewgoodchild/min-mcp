@@ -318,12 +318,15 @@ response:
 > `response` transforms are server-side and apply to everyone; `fields` is the
 > caller's choice for one call. Both run before the agent-budget truncation.
 
-> min-mcp is a proxy, not a security product — argument-level injection blocking,
-> poisoning scanners, and secret redaction are deliberately **out of scope** (that's
-> what dedicated security tools are for). The overlay's job is to *fix*
-> a tool you don't own — patch its description, its errors, and reshape its response
-> — not to be a WAF. (An earlier experiment in taint-blocking + description scanning
-> was cut for exactly this reason.)
+> min-mcp is a proxy, not a security product — argument-level injection blocking
+> and secret redaction are deliberately **out of scope** (that's what dedicated
+> security tools are for). The overlay's job is to *fix* a tool you don't own —
+> patch its description, its errors, and reshape its response — not to be a WAF.
+> (An earlier taint-blocking experiment was cut for exactly this reason.) The one
+> thing that did survive is static: `lint` reports three tool-poisoning smells it
+> can decide from a tool *definition* — see
+> [CLI → lint](cli.md#lint). It flags a poisoned description; it does not inspect
+> arguments or responses.
 
 ## Binding safely against upstream drift
 
