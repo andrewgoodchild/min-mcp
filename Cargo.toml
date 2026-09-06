@@ -1,6 +1,6 @@
 [package]
 name = "min-mcp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 # MSRV: `str::floor_char_boundary` (surface/minify.rs) is the newest std API in
 # use; older toolchains now fail with a clear "requires rustc 1.91" instead of a
@@ -8,6 +8,13 @@ edition = "2021"
 rust-version = "1.91"
 description = "Minify your MCPs — a minifying, scope-aware proxy for MCP servers"
 license = "Apache-2.0"
+repository = "https://github.com/andrewgoodchild/min-mcp"
+homepage = "https://github.com/andrewgoodchild/min-mcp"
+documentation = "https://github.com/andrewgoodchild/min-mcp/tree/main/docs"
+# Without this the crates.io page body is blank.
+readme = "README.md"
+keywords = ["mcp", "llm", "agent", "proxy", "openapi"]
+categories = ["command-line-utilities", "network-programming", "api-bindings"]
 
 [[bin]]
 name = "minmcp"

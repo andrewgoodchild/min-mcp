@@ -6,6 +6,10 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] — 2026-09-06
+
 ### Added — the control layer for running behind a gateway
 
 - **Per-request caller identity over HTTP.** With `auth:` configured, each
