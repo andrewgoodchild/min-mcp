@@ -121,6 +121,14 @@ to *fix* and *compose* upstreams:
   even see. Gating doubles as a search-quality lever: every excluded tool is one
   search can't confuse with the right answer
   ([why](configuration.md#filters)).
+- **Govern** — over HTTP each request carries its own
+  [caller identity](transports-and-auth.md#caller-identity) (a validated bearer,
+  or headers from a gateway), so one process serves many callers with different
+  surfaces; [rate limits](transports-and-auth.md#rate-limits) refuse with a
+  retry-after the agent can act on; the [audit stream](transports-and-auth.md#audit-log)
+  names who called what, and credentials are
+  [references](transports-and-auth.md#secrets) into the environment, mounted
+  files, or Vault — never values in the config.
 
 ## The verification-first ethos
 

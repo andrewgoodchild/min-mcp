@@ -137,12 +137,3 @@ pub(super) fn nav_ref<'a>(schema: &'a Value, path: &str) -> Option<(&'a Value, S
     }
     Some((node, field))
 }
-
-/// Resolve a `user_supplied` source to its value. MVP: `env:VAR` from the
-/// process environment. Unset/empty → None (the call fails with a clear error).
-pub(super) fn resolve_user_source(source: &str) -> Option<String> {
-    source
-        .strip_prefix("env:")
-        .and_then(|var| std::env::var(var).ok())
-        .filter(|s| !s.is_empty())
-}

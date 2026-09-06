@@ -1,22 +1,24 @@
-//! Server-facing stdio transport via the official MCP SDK (`rmcp`).
+//! Server-facing transports via the official MCP SDK (`rmcp`).
 //!
 //! min-mcp's `Surface` stays the single source of truth for the tool catalog
-//! and dispatch; this module only puts it *behind* rmcp's `ServerHandler`, so
-//! the agent-facing wire protocol is the SDK's (spec-tracked) rather than our
+//! and dispatch; this module puts it *behind* rmcp's `ServerHandler`, so the
+//! agent-facing wire protocol is the SDK's (spec-tracked) rather than our
 //! hand-rolled JSON-RPC. The upstream clients, the OpenAPI spec executor, and
 //! the whole minify/overlay/projection surface are unchanged — rmcp has no
 //! concept of relaying arbitrary upstream tools, so that half remains ours.
 //!
-//! We convert at the boundary: `Surface::list_tools()` / `Surface::call()`
-//! speak `serde_json::Value` (MCP-shaped), which maps cleanly onto rmcp's typed
-//! `Tool` / `CallToolResult` (content blocks deserialize straight from our
-//! already-MCP-shaped JSON, so images/audio survive, not just text).
+//! **Identity.** Every handler resolves a `Caller` per request. Over HTTP the
+//! guard in [`serve_http`] authenticates the request (a validated bearer, or
+//! identity headers from a trusted gateway) and attaches the caller to the
+//! request; rmcp carries the request parts into the handler's context. Over
+//! stdio there are no request parts, so the caller is the process identity
+//! (`--jwt` / `--scopes`). The surface is shared (`Arc`), not locked: a slow
+//! call blocks only its own caller.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
@@ -28,19 +30,52 @@ use rmcp::service::RequestContext;
 use rmcp::transport::io::stdio;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 
+use crate::auth::{ClaimChecks, JwtVerifier};
+use crate::caller::Caller;
+use crate::config::TrustedHeaders;
 use crate::surface::Surface;
 
-/// rmcp `ServerHandler` wrapping a shared `Surface`. The handler methods take
-/// `&self`, but dispatch mutates the surface (usage priors, logging), so it's
-/// behind a `tokio::Mutex`.
+/// rmcp `ServerHandler` over a shared `Surface`.
 #[derive(Clone)]
 pub struct MinMcpServer {
-    surface: Arc<Mutex<Surface>>,
+    surface: Arc<Surface>,
+    /// The identity used when a request carries none: stdio, or HTTP with no
+    /// identity configured (or `allow_anonymous`).
+    process_caller: Arc<Caller>,
+    /// True when every HTTP request must carry its own identity.
+    identity_enforced: bool,
 }
 
 impl MinMcpServer {
-    pub fn new(surface: Surface) -> Self {
-        Self { surface: Arc::new(Mutex::new(surface)) }
+    pub fn new(surface: Arc<Surface>, process_caller: Caller, identity_enforced: bool) -> Self {
+        Self { surface, process_caller: Arc::new(process_caller), identity_enforced }
+    }
+
+    /// The caller for this request: what the HTTP guard attached, else the
+    /// process identity (stdio has no request parts).
+    ///
+    /// When identity is enforced, a request that reaches a handler *without*
+    /// one is refused rather than silently served as the process — the process
+    /// may hold broader scopes (`--scopes admin`) than any real caller, so
+    /// falling back would hand them to whoever slipped past the guard. Today
+    /// rmcp attaches request parts on every HTTP path; this makes a future one
+    /// that doesn't a 400, not a privilege escalation.
+    fn caller(&self, ctx: &RequestContext<RoleServer>) -> Result<Arc<Caller>, ErrorData> {
+        if let Some(c) = ctx
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|p| p.extensions.get::<Arc<Caller>>().cloned())
+        {
+            return Ok(c);
+        }
+        if self.identity_enforced {
+            crate::log_warn!("refusing a request that carried no caller identity");
+            return Err(ErrorData::invalid_request(
+                "unauthenticated: this request carried no caller identity",
+                None,
+            ));
+        }
+        Ok(self.process_caller.clone())
     }
 }
 
@@ -61,9 +96,10 @@ impl ServerHandler for MinMcpServer {
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let v = self.surface.lock().await.list_resources().await;
+        let caller = self.caller(&context)?;
+        let v = self.surface.list_resources(&caller).await;
         // Per-entry tolerant, like list_tools below: one malformed upstream
         // entry (missing `name`, wrong-typed field) must drop THAT entry, not
         // fail the whole merged listing (min-mcp's own resource included).
@@ -73,13 +109,12 @@ impl ServerHandler for MinMcpServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        let caller = self.caller(&context)?;
         let v = self
             .surface
-            .lock()
-            .await
-            .read_resource(&request.uri)
+            .read_resource(&caller, &request.uri)
             .await
             .map_err(|e| ErrorData::resource_not_found(format!("{e:#}"), None))?;
         let result: ReadResourceResult = serde_json::from_value(v)
@@ -90,23 +125,23 @@ impl ServerHandler for MinMcpServer {
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let v = self.surface.lock().await.list_prompts().await;
+        let caller = self.caller(&context)?;
+        let v = self.surface.list_prompts(&caller).await;
         Ok(ListPromptsResult::with_all_items(collect_valid(&v, "prompts")))
     }
 
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
+        let caller = self.caller(&context)?;
         let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
         let v = self
             .surface
-            .lock()
-            .await
-            .get_prompt(&request.name, args)
+            .get_prompt(&caller, &request.name, args)
             .await
             .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
         let result: GetPromptResult = serde_json::from_value(v)
@@ -117,9 +152,10 @@ impl ServerHandler for MinMcpServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let listing = self.surface.lock().await.list_tools();
+        let caller = self.caller(&context)?;
+        let listing = self.surface.list_tools(&caller);
         let tools = listing
             .get("tools")
             .and_then(Value::as_array)
@@ -132,20 +168,20 @@ impl ServerHandler for MinMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let caller = self.caller(&context)?;
         let name = request.name.to_string();
         let args = request.arguments.map(Value::Object).unwrap_or_else(|| json!({}));
-        let result = {
-            let mut surface = self.surface.lock().await;
-            surface.call(&name, args).await
-        };
         // The surface returns every tool-level outcome — client-side argument
         // errors, upstream isError, timeouts, AND transport failures — as an
         // isError result (Ok), so the agent can reason about it. Only a failure
-        // of min-mcp itself reaches this branch; `{:#}` keeps the cause chain
-        // (`e.to_string()` printed just the outermost context).
-        let result = result.map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?;
+        // of min-mcp itself reaches the Err branch; `{:#}` keeps the cause chain.
+        let result = self
+            .surface
+            .call(&caller, &name, args)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?;
         Ok(value_to_call_result(&result).into())
     }
 }
@@ -207,11 +243,108 @@ fn value_to_call_result(result: &Value) -> CallToolResult {
 }
 
 /// Serve the minified surface over stdio using rmcp's transport, running until
-/// the client disconnects.
-pub async fn serve_stdio(surface: Surface) -> Result<()> {
-    let running = MinMcpServer::new(surface).serve(stdio()).await?;
+/// the client disconnects. One process, one caller.
+pub async fn serve_stdio(surface: Arc<Surface>, caller: Caller) -> Result<()> {
+    // stdio is one process, one caller: there is no per-request identity to
+    // enforce, so the process identity is the caller by definition.
+    let running = MinMcpServer::new(surface, caller, false).serve(stdio()).await?;
     running.waiting().await?;
     Ok(())
+}
+
+/// How HTTP requests are authenticated, from `auth:`.
+pub struct HttpIdentity {
+    pub verifier: Option<Arc<JwtVerifier>>,
+    pub checks: ClaimChecks,
+    pub scope_claim: String,
+    pub subject_claim: String,
+    pub trusted: Option<TrustedHeaders>,
+    pub allow_anonymous: bool,
+}
+
+/// Why a request was refused, rendered as a 401.
+#[derive(Debug)]
+struct Refusal {
+    /// The `WWW-Authenticate` challenge.
+    challenge: &'static str,
+    reason: String,
+}
+
+impl HttpIdentity {
+    /// Everything the request guard needs, from one `auth:` section — so a new
+    /// auth knob is added in `Auth` and here, never copied field by field at
+    /// the call site (where the HTTP path could silently keep a default).
+    pub fn from_auth(a: &crate::config::Auth, verifier: Option<Arc<JwtVerifier>>) -> Self {
+        HttpIdentity {
+            verifier,
+            checks: ClaimChecks { audience: a.audience.clone(), issuer: a.issuer.clone() },
+            scope_claim: a.scope_claim.clone(),
+            subject_claim: a.subject_claim.clone(),
+            trusted: a.trusted_headers.clone(),
+            allow_anonymous: a.allow_anonymous,
+        }
+    }
+
+    /// Is any identity source configured? Without one every request is the
+    /// process caller (the local-dev model).
+    pub fn required(&self) -> bool {
+        self.verifier.is_some() || self.trusted.is_some()
+    }
+
+    /// Do requests HAVE to authenticate (identity configured, no anonymous
+    /// fallback)? This is what lets a non-loopback bind stand without
+    /// `--allow-remote`.
+    pub fn enforced(&self) -> bool {
+        self.required() && !self.allow_anonymous
+    }
+
+    /// The caller a request identifies, in precedence: a bearer validated by
+    /// the verifier; identity headers from the trusted gateway; the process
+    /// identity when nothing is configured (or anonymous is allowed); else 401.
+    async fn authenticate(&self, headers: &hyper::HeaderMap, process: &Arc<Caller>) -> Result<Arc<Caller>, Refusal> {
+        let bearer = headers
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| {
+                let (scheme, tok) = v.trim().split_once(' ')?;
+                scheme.eq_ignore_ascii_case("bearer").then_some(tok.trim())
+            });
+        if let (Some(tok), Some(verifier)) = (bearer, &self.verifier) {
+            return match verifier.caller(tok, &self.scope_claim, &self.subject_claim, &self.checks).await {
+                Ok(c) => Ok(Arc::new(c)),
+                Err(e) => Err(Refusal {
+                    challenge: "Bearer error=\"invalid_token\"",
+                    reason: format!("invalid bearer token: {e:#}"),
+                }),
+            };
+        }
+        if let Some(t) = &self.trusted {
+            if let Some(raw) = headers.get(t.scopes.as_str()).and_then(|v| v.to_str().ok()) {
+                let scopes = raw
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let subject = t
+                    .subject
+                    .as_deref()
+                    .and_then(|h| headers.get(h))
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                return Ok(Arc::new(Caller::new(scopes, subject)));
+            }
+        }
+        if !self.required() || self.allow_anonymous {
+            return Ok(process.clone());
+        }
+        Err(Refusal {
+            challenge: "Bearer",
+            reason: "unauthorized: this server requires an Authorization: Bearer token (or identity \
+                     headers from the configured gateway)"
+                .to_string(),
+        })
+    }
 }
 
 /// Is this `Origin` header value acceptable for a locally-bound MCP server?
@@ -237,9 +370,7 @@ pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
     // Port stripping that survives IPv6. A bracketed literal keeps everything up
     // to `]` (a port can only follow the bracket); otherwise exactly one colon
     // means host:port, while zero or several means there is no port to strip
-    // (several = a bare unbracketed IPv6 like `::1`). The previous rsplit-based
-    // guard got `http://[::1]` (no port) wrong: it split inside the literal,
-    // compared the host `[:`, and refused a legitimate loopback origin.
+    // (several = a bare unbracketed IPv6 like `::1`).
     let host = if host.starts_with('[') {
         match host.find(']') {
             Some(i) => &host[..=i],
@@ -258,16 +389,32 @@ pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
 
 /// Serve the minified surface over Streamable HTTP using rmcp's
 /// `StreamableHttpService` (JSON-RPC over POST, SSE for streamed replies,
-/// session ids, Host-header validation for DNS-rebinding defence), driven on a
-/// TCP listener by hyper, with an added `Origin` check (see
-/// [`origin_allowed`]). One shared `Surface` backs every session (the
-/// per-session factory just clones the handle).
+/// session ids), driven on a TCP listener by hyper, with caller authentication
+/// (see [`HttpIdentity::authenticate`]) in front of every request; the caller
+/// rides the request into the handler. One shared `Surface` backs every session.
 ///
-/// There is no inbound authentication on this transport, and the scopes are
-/// the process's (`--jwt` / `--scopes`), not the connecting client's. So the
-/// listener is loopback-only unless `allow_remote` is set — anyone who can
-/// reach the port gets every upstream credential this process holds.
-pub async fn serve_http(surface: Surface, addr: &str, allow_remote: bool) -> Result<()> {
+/// The listener is loopback-only unless `allow_remote` is set OR identity is
+/// enforced on every request — without one of those, anyone who can reach the
+/// port gets the process's scopes and every upstream credential it holds.
+///
+/// DNS-rebinding defences depend on the bind. A **loopback** server validates
+/// both headers: `Host` (rmcp's allow-list) and `Origin` (see
+/// [`origin_allowed`]) — that is the attack's shape: a page on
+/// `evil.example` resolving to 127.0.0.1. A **non-loopback** server cannot
+/// validate `Host` — clients address it by whatever name or address they
+/// reach it on, and rmcp's loopback-only default would 403 every one of them —
+/// so Host validation is off. The `Origin` check stays on under
+/// `--allow-remote` (no auth, so a rebinding page must still be refused) and
+/// is off when identity is enforced: a rebinding page cannot present a
+/// bearer, and a legitimate browser-based client with one must not be refused
+/// for having a non-loopback origin.
+pub async fn serve_http(
+    surface: Arc<Surface>,
+    process_caller: Caller,
+    identity: HttpIdentity,
+    addr: &str,
+    allow_remote: bool,
+) -> Result<()> {
     use anyhow::Context;
     use hyper::server::conn::http1;
     use hyper_util::rt::TokioIo;
@@ -276,29 +423,44 @@ pub async fn serve_http(surface: Surface, addr: &str, allow_remote: bool) -> Res
     use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
     use tokio::net::TcpListener;
 
-    let server = MinMcpServer::new(surface);
-    let service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
-    );
+    let server = MinMcpServer::new(surface, process_caller, identity.enforced());
+    let process_caller = server.process_caller.clone();
+    let identity = Arc::new(identity);
 
     let listener = TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
     let local = listener.local_addr().context("reading the bound address")?;
     // Checked on the RESOLVED address, so every spelling of loopback passes
     // (`localhost`, `127.0.0.1`, `[::1]`) and every spelling of "everyone" is
     // caught (`0.0.0.0`, `[::]`, a LAN ip, a public hostname).
-    if !local.ip().is_loopback() && !allow_remote {
+    if !local.ip().is_loopback() && !allow_remote && !identity.enforced() {
         anyhow::bail!(
-            "refusing to serve HTTP on non-loopback address {local}: this transport has no \
-             inbound authentication, so every client that can reach it would get this \
-             process's scopes and upstream credentials. Bind 127.0.0.1, or pass \
-             --allow-remote if an authenticating proxy or a private network is in front."
+            "refusing to serve HTTP on non-loopback address {local} without caller identity: \
+             every client that can reach it would get this process's scopes and upstream \
+             credentials. Either configure `auth:` (a JWT verifier or trusted_headers, \
+             without allow_anonymous) so each request is authenticated, bind 127.0.0.1, or \
+             pass --allow-remote if an authenticating proxy or a private network is in front."
         );
     }
-    if !local.ip().is_loopback() {
-        crate::log_warn!("serving HTTP on non-loopback {local} with NO inbound authentication (--allow-remote)");
+    let remote = !local.ip().is_loopback();
+    if remote {
+        if identity.enforced() {
+            crate::log_info!("serving HTTP on non-loopback {local}; every request must authenticate");
+        } else {
+            crate::log_warn!("serving HTTP on non-loopback {local} with NO inbound authentication (--allow-remote)");
+        }
     }
+    // See the doc comment above for why these follow the bind.
+    let check_origin = !(remote && identity.enforced());
+    let http_config = if remote {
+        StreamableHttpServerConfig::default().disable_allowed_hosts()
+    } else {
+        StreamableHttpServerConfig::default()
+    };
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        http_config,
+    );
     eprintln!("min-mcp: Streamable HTTP (rmcp) listening on http://{local}/");
 
     loop {
@@ -315,26 +477,33 @@ pub async fn serve_http(surface: Surface, addr: &str, allow_remote: bool) -> Res
         };
         let io = TokioIo::new(tcp);
         let inner = TowerToHyperService::new(service.clone());
-        // Gate on Origin before the request reaches the MCP service, then hand
-        // it off untouched. One task per connection; a slow request never
-        // blocks the accept loop.
-        let guarded = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let identity = identity.clone();
+        let process_caller = process_caller.clone();
+        // Gate on Origin and identity before the request reaches the MCP
+        // service, then hand it off with the caller attached. One task per
+        // connection; a slow request never blocks the accept loop.
+        let guarded = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
             let inner = inner.clone();
+            let identity = identity.clone();
+            let process_caller = process_caller.clone();
             async move {
                 let origin =
                     req.headers().get(hyper::header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_string);
-                if !origin_allowed(origin.as_deref()) {
+                if check_origin && !origin_allowed(origin.as_deref()) {
                     crate::log_warn!(
                         "refused an HTTP request from Origin {:?} (DNS-rebinding defence)",
                         origin.unwrap_or_default()
                     );
-                    let body = http_body_util::BodyExt::boxed(http_body_util::Full::new(
-                        bytes::Bytes::from_static(b"forbidden: Origin not allowed"),
-                    ));
-                    let mut res = hyper::Response::new(body);
-                    *res.status_mut() = hyper::StatusCode::FORBIDDEN;
-                    return Ok(res);
+                    return Ok(plain_response(hyper::StatusCode::FORBIDDEN, None, "forbidden: Origin not allowed"));
                 }
+                let caller = match identity.authenticate(req.headers(), &process_caller).await {
+                    Ok(c) => c,
+                    Err(r) => {
+                        crate::log_info!("refused an HTTP request: {}", r.reason);
+                        return Ok(plain_response(hyper::StatusCode::UNAUTHORIZED, Some(r.challenge), &r.reason));
+                    }
+                };
+                req.extensions_mut().insert(caller);
                 hyper::service::Service::call(&inner, req).await
             }
         });
@@ -344,9 +513,27 @@ pub async fn serve_http(surface: Surface, addr: &str, allow_remote: bool) -> Res
     }
 }
 
+/// A plain-text response in the same body shape rmcp's service returns.
+fn plain_response(
+    status: hyper::StatusCode,
+    www_authenticate: Option<&'static str>,
+    body: &str,
+) -> hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>> {
+    let body = http_body_util::BodyExt::boxed(http_body_util::Full::new(bytes::Bytes::from(body.to_string())));
+    let mut res = hyper::Response::new(body);
+    *res.status_mut() = status;
+    if let Some(ch) = www_authenticate {
+        if let Ok(v) = hyper::header::HeaderValue::from_str(ch) {
+            res.headers_mut().insert(hyper::header::WWW_AUTHENTICATE, v);
+        }
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
-    use super::origin_allowed;
+    use super::*;
+    use jsonwebtoken::{encode, EncodingKey, Header};
 
     #[test]
     fn origin_allows_absent_and_loopback_only() {
@@ -360,8 +547,6 @@ mod tests {
             "http://localhost:8080",
             "https://127.0.0.1:3000",
             "http://[::1]:9000",
-            // bare IPv6 loopback, NO port — the case the old port-stripper
-            // mangled into `[:` and refused
             "http://[::1]",
             "http://[0:0:0:0:0:0:0:1]",
             "http://[0:0:0:0:0:0:0:1]:8080",
@@ -376,11 +561,95 @@ mod tests {
             "https://localhost.evil.example",
             "http://169.254.169.254",
             "https://sub.localhost.attacker.com",
-            // IPv6 non-loopback, bracketed both ways
             "http://[2001:db8::1]",
             "http://[2001:db8::1]:8080",
         ] {
             assert!(!origin_allowed(Some(bad)), "should refuse {bad}");
         }
+    }
+
+    const SECRET: &str = "test-secret";
+
+    fn mint(claims: Value) -> String {
+        encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET.as_bytes())).unwrap()
+    }
+
+    fn identity(verifier: bool, trusted: bool, allow_anonymous: bool) -> HttpIdentity {
+        HttpIdentity {
+            verifier: verifier.then(|| Arc::new(JwtVerifier::Hs256(SECRET.as_bytes().to_vec()))),
+            checks: ClaimChecks::default(),
+            scope_claim: "scope".into(),
+            subject_claim: "sub".into(),
+            trusted: trusted.then(|| TrustedHeaders { scopes: "X-Scopes".into(), subject: Some("X-User".into()) }),
+            allow_anonymous,
+        }
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, hyper::header::HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[tokio::test]
+    async fn bearer_is_validated_and_becomes_the_caller() {
+        let id = identity(true, false, false);
+        let process = Arc::new(Caller::with_scopes(vec!["process".into()]));
+        let tok = mint(json!({"exp": 4_000_000_000u64, "scope": "store.read", "sub": "alice"}));
+        let c = id.authenticate(&headers(&[("authorization", &format!("Bearer {tok}"))]), &process).await.unwrap();
+        assert_eq!(c.scopes, vec!["store.read"]);
+        assert_eq!(c.label(), "alice");
+        // scheme is case-insensitive
+        let c = id.authenticate(&headers(&[("authorization", &format!("bearer {tok}"))]), &process).await.unwrap();
+        assert_eq!(c.label(), "alice");
+        // a bad token is refused with an invalid_token challenge, never the process identity
+        let r = id.authenticate(&headers(&[("authorization", "Bearer not.a.jwt")]), &process).await.unwrap_err();
+        assert!(r.challenge.contains("invalid_token"), "{}", r.challenge);
+        // no token at all → 401 (identity is required, anonymous not allowed)
+        let r = id.authenticate(&headers(&[]), &process).await.unwrap_err();
+        assert_eq!(r.challenge, "Bearer");
+        assert!(r.reason.contains("requires"), "{}", r.reason);
+    }
+
+    #[tokio::test]
+    async fn no_identity_configured_means_the_process_caller() {
+        let id = identity(false, false, false);
+        let process = Arc::new(Caller::with_scopes(vec!["process".into()]));
+        assert!(!id.required() && !id.enforced());
+        let c = id.authenticate(&headers(&[]), &process).await.unwrap();
+        assert_eq!(c.scopes, vec!["process"]);
+        // a stray bearer with no verifier is ignored, not an error
+        let c = id.authenticate(&headers(&[("authorization", "Bearer whatever")]), &process).await.unwrap();
+        assert_eq!(c.scopes, vec!["process"]);
+    }
+
+    #[tokio::test]
+    async fn allow_anonymous_falls_back_to_the_process_caller() {
+        let id = identity(true, false, true);
+        assert!(id.required() && !id.enforced(), "anonymous allowed → not enforced");
+        let process = Arc::new(Caller::with_scopes(vec!["process".into()]));
+        let c = id.authenticate(&headers(&[]), &process).await.unwrap();
+        assert_eq!(c.scopes, vec!["process"]);
+        // but a PRESENT bad token is still refused — anonymous is not "any token"
+        assert!(id.authenticate(&headers(&[("authorization", "Bearer bad")]), &process).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn trusted_gateway_headers_carry_scopes_and_subject() {
+        let id = identity(false, true, false);
+        let process = Arc::new(Caller::default());
+        let c = id
+            .authenticate(&headers(&[("x-scopes", "store.read, store.write"), ("x-user", "bob@corp")]), &process)
+            .await
+            .unwrap();
+        assert_eq!(c.scopes, vec!["store.read", "store.write"]);
+        assert_eq!(c.label(), "bob@corp");
+        // header present but empty → a caller with no scopes (sees only unscoped tools)
+        let c = id.authenticate(&headers(&[("x-scopes", "")]), &process).await.unwrap();
+        assert!(c.scopes.is_empty() && c.subject.is_none());
+        // no identity header → refused
+        assert!(id.authenticate(&headers(&[]), &process).await.is_err());
     }
 }

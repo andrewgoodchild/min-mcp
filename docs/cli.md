@@ -10,9 +10,9 @@ All commands share these options (via `--config`'s command group):
 |---|---|---|
 | `--config <path>` | `min.yaml` | the config file to load |
 | `--scopes a,b` | *(empty)* | granted scopes for this session (local-dev identity; prefer `--jwt`) |
-| `--jwt <token>` | `$MINMCP_JWT` | a caller JWT; its validated scope claim overrides `--scopes`. The env var keeps it out of argv |
-| `--http <addr>` | — | *(serve only)* expose over Streamable HTTP at e.g. `127.0.0.1:8080` instead of stdio. Loopback only |
-| `--allow-remote` | off | *(serve --http only)* permit a non-loopback bind. The HTTP transport has no inbound auth — see [Transports & auth](transports-and-auth.md#streamable-http) |
+| `--jwt <token>` | `$MINMCP_JWT` | the PROCESS caller's JWT; its validated scope claim overrides `--scopes`. Over HTTP with `auth:` configured each request brings its own token instead. The env var keeps it out of argv |
+| `--http <addr>` | — | *(serve only)* expose over Streamable HTTP at e.g. `127.0.0.1:8080` instead of stdio. Loopback only unless every request must authenticate |
+| `--allow-remote` | off | *(serve --http only)* permit a non-loopback bind WITHOUT caller identity — only behind an authenticating proxy. Not needed when `auth:` makes every request authenticate. See [Transports & auth](transports-and-auth.md#streamable-http) |
 
 ## Commands
 
@@ -28,7 +28,9 @@ minmcp serve --config myconfig.yaml --http 0.0.0.0:8080 --allow-remote   # only 
 
 ### `inspect`
 Print surface statistics (tool counts, modes, upstreams) without serving — a quick
-sanity check on a config.
+sanity check on a config. `upstreams_stale` lists upstreams that announced a
+catalog change since startup (restart to pick it up); `visible_after_scopes` is
+for the process caller (`--jwt` / `--scopes`).
 
 ```sh
 minmcp inspect --config myconfig.yaml

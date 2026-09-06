@@ -162,10 +162,19 @@ Read this before trusting any number above:
 - **The live task harness is not in this repo** — the reproducible artefacts are
   `bench/compression.sh`, `tests/compression.rs`, and the GitHub MCP example
   above.
-- **Untested in public CI**: the Streamable HTTP transport, `workflows:`,
-  auto-pagination, `minmcp verify` against a live upstream, and JWT/OAuth flows
-  end-to-end. Their logic is unit-tested (see `cargo test`), but there is no
-  fixture exercising them over the wire, and blocking CI covers Linux, macOS and Windows
-  (`http_e2e` is Unix-only — see [getting started](getting-started.md)).
-- **`timeout_s` and `breaker`** have unit and stdio end-to-end tests proving the
-  mechanism; their *impact* on agent token spend is not yet measured.
+- **Covered by offline end-to-end fixtures, not by live systems**: the
+  Streamable HTTP transport (including per-request bearer identity),
+  `workflows:`, auto-pagination, `minmcp verify`, JWT scopes, upstream respawn,
+  and `optional` upstreams all run over the wire in CI against scripted
+  upstreams (`tests/`). Not exercised against anything real: OAuth
+  client-credentials and JWKS against a live identity provider, `${vault:…}`
+  against a live Vault (the reference parser and the no-store errors are
+  unit-tested; the vaultrs calls are not), and trusted gateway headers behind an
+  actual gateway. Blocking CI covers Linux, macOS and Windows; the shell and
+  `curl` fixtures are Unix-only — see [getting started](getting-started.md).
+- **`timeout_s`, `breaker`, and `rate_limits`** have unit and end-to-end tests
+  proving the mechanism; their *impact* on agent token spend is not measured.
+- **Concurrency is not benchmarked.** The surface is shared rather than locked
+  and the stdio client multiplexes requests, so a slow call should block only
+  its caller; that is asserted by design and by tests of the parts, not by a
+  throughput measurement under load.

@@ -35,6 +35,9 @@ for exact versions. Principal crates and their licences:
 | `serde`, `serde_json`, `serde_yaml_ng` | (de)serialisation | MIT / Apache-2.0 |
 | `jaq-*` | jq engine (response `jq` transform) | MIT |
 | `jsonwebtoken` | JWT validation | MIT |
+| `vaultrs` | HashiCorp Vault / OpenBao client (`${vault:…}` secrets) | MIT |
+| `secrecy` | `SecretString` for resolved credentials | MIT / Apache-2.0 |
+| `http` | request parts carrying the per-request caller | MIT / Apache-2.0 |
 | `clap` | CLI parsing | MIT / Apache-2.0 |
 | `tracing` / `tracing-subscriber` | logging | MIT |
 | `anyhow` | error handling | MIT / Apache-2.0 |

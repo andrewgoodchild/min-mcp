@@ -5,6 +5,16 @@ use serde_json::{json, Value};
 
 pub const METHOD_NOT_FOUND: i64 = -32601;
 
+/// A message's `id` as i64 — tolerating the float/string echoes some servers
+/// produce (`1.0`, `"1"`) for the integer ids we send. Shared by both client
+/// transports so one server is not matched by two different rules.
+pub fn response_id(v: &Value) -> Option<i64> {
+    let id = v.get("id")?;
+    id.as_i64()
+        .or_else(|| id.as_f64().map(|f| f as i64))
+        .or_else(|| id.as_str().and_then(|s| s.parse().ok()))
+}
+
 pub fn result(id: &Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -33,6 +43,15 @@ mod tests {
         assert_eq!(e["error"]["code"], json!(-32601));
         assert_eq!(e["error"]["message"], "nope");
         assert!(e.get("result").is_none());
+    }
+
+    #[test]
+    fn response_ids_tolerate_float_and_string_echoes() {
+        assert_eq!(response_id(&json!({"id": 7})), Some(7));
+        assert_eq!(response_id(&json!({"id": 7.0})), Some(7));
+        assert_eq!(response_id(&json!({"id": "7"})), Some(7));
+        assert_eq!(response_id(&json!({"id": null})), None);
+        assert_eq!(response_id(&json!({"method": "x"})), None);
     }
 
     #[test]

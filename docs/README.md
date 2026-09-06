@@ -21,8 +21,10 @@ New here? Read [Getting started](getting-started.md), then [Concepts](concepts.m
   field docs, and errors; reshape responses; inject request defaults; bind safely.
 - **[Composites](composites.md)** — expose a fixed multi-step chain as one tool
   (`workflows:`), and the write-safety rules that keep it honest.
-- **[Transports & auth](transports-and-auth.md)** — stdio vs Streamable HTTP,
-  remote MCP upstreams, outbound OAuth, JWT-derived caller scopes, security.
+- **[Transports, identity & ops](transports-and-auth.md)** — stdio vs Streamable HTTP,
+  per-request caller identity (JWT or gateway headers), rate limits, the audit
+  stream, secret references (env / file / Vault), upstream health, remote MCP
+  upstreams, outbound OAuth, security notes.
 - **[CLI reference](cli.md)** — `serve`, `inspect`, `map`, `verify`, `lint`,
   `search`, `help`, `call`, and their flags.
 

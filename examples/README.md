@@ -21,6 +21,7 @@ minmcp search  --config examples/demo-overlays.yaml "look up a widget"  # search
 | `demo-overlays.yaml` | **Every overlay feature**, one per comment: `description`, `fields` (required / enum / example / **hide** / **`user_supplied`**), `defaults`, per-endpoint `headers` (with `{{uuid}}`/`{{hash}}` generators), `error_hints` (prose + structured **`field:`** + `retryable`), **`preflight`**, `paginate`, `response` (remove/rename/set/`when`), `aliases`, `verify`, and a `strong` binding. |
 | `demo-workflow.yaml` | A **composite** `workflows:` tool (`orderNewWidget`) collapsing widget-create → order-create into one call, threading the created id between steps. |
 | `demo-scopes.yaml` | Gate visibility: static `filters:` (drop a tool for everyone) + per-caller `scopes:` (default-deny). Try `minmcp map --config examples/demo-scopes.yaml --scopes store.write`. |
+| `enterprise.yaml` | **The deployment shape behind a gateway**: identity from trusted headers (or a JWT verifier), per-caller scopes, per-caller / per-tool rate limits, an NDJSON audit stream to stderr, secret references (env / file / Vault), and an `optional` upstream that may be down. Runs offline. |
 
 ## Real-API examples
 

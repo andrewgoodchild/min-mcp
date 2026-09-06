@@ -50,14 +50,14 @@ pub(super) fn canonical_args(v: &Value) -> String {
 impl Surface {
     /// Drop every cached read belonging to upstream `idx` (write-through
     /// coherence: a write through this proxy must not leave stale reads behind).
-    pub(super) fn bust_upstream_cache(&mut self, idx: usize) {
-        if self.read_cache.is_empty() {
+    pub(super) fn bust_upstream_cache(&self, idx: usize) {
+        let mut cache = lock(&self.read_cache);
+        if cache.is_empty() {
             return;
         }
         // O(cache entries) via the existing id index — no per-write set build.
         let (by_id, tools) = (&self.by_id, &self.tools);
-        self.read_cache
-            .retain(|(id, _), _| by_id.get(id).is_none_or(|&i| tools[i].upstream_idx != idx));
+        cache.retain(|(id, _), _| by_id.get(id).is_none_or(|&i| tools[i].upstream_idx != idx));
     }
 
     /// May this tool's results be served from the read cache? Overlay

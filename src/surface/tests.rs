@@ -14,7 +14,7 @@ fn test_surface(cfg: Config, tools: Vec<ToolDef>) -> Surface {
     }
     Surface {
         config: cfg,
-        granted: vec![],
+        secrets: Secrets::env_only(),
         upstreams: vec![],
         tools,
         by_id,
@@ -27,11 +27,17 @@ fn test_surface(cfg: Config, tools: Vec<ToolDef>) -> Surface {
         patched_schemas: std::collections::HashMap::new(),
         tool_headers: std::collections::HashMap::new(),
         user_supplied: std::collections::HashMap::new(),
-        read_cache: std::collections::HashMap::new(),
-        resource_origin: std::collections::HashMap::new(),
-        breakers: std::collections::HashMap::new(),
-        resolved_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        read_cache: Mutex::new(std::collections::HashMap::new()),
+        resource_origin: Mutex::new(std::collections::HashMap::new()),
+        breakers: Mutex::new(std::collections::HashMap::new()),
+        limits: super::ratelimit::Buckets::default(),
+        resolved_cache: RwLock::new(std::collections::HashMap::new()),
     }
+}
+
+/// The unscoped, unnamed caller most tests use.
+fn anon() -> Caller {
+    Caller::default()
 }
 
 use crate::upstream::ToolDef;
@@ -89,7 +95,7 @@ fn source_map_covers_every_tool_and_reverses_exposure() {
     let mut s = test_surface(cfg, tools);
     s.origin_sha = origin_sha;
     s.build_exposed();
-    let map = s.source_map(false);
+    let map = s.source_map(None);
 
     assert_eq!(map["tool_count"], 2);
     let entries = map["tools"].as_array().unwrap();
@@ -258,10 +264,7 @@ fn user_supplied_strips_field_from_agent_schema() {
     let body = &schema["properties"]["body"];
     assert!(body["properties"].get("zone").is_none(), "zone stripped from schema");
     assert_eq!(body["required"], json!(["name"]), "zone removed from required");
-
-    // The resolver: env:VAR only; unknown scheme / unset → None.
-    assert_eq!(resolve_user_source("literal:x"), None);
-    assert_eq!(resolve_user_source("env:__minmcp_definitely_unset__"), None);
+    // (source resolution — env/file/vault, unset → None — is tested in secrets.rs)
 }
 
 #[test]
@@ -471,17 +474,20 @@ async fn observability_logs_search_and_details_events() {
     let _ = std::fs::remove_file(&path);
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
     let mut s = test_surface(cfg, tools);
-    s.log = Some(file);
+    s.log = Some(AuditSink::File(Mutex::new(file)));
     s.index = Index::build(&corpus);
-    s.call("search_tools", json!({"query": "x"})).await.unwrap();
-    s.call("get_tool_details", json!({"tool_id": "up.GetX"})).await.unwrap();
+    let alice = Caller::new(vec![], Some("alice".into()));
+    s.call(&alice, "search_tools", json!({"query": "x"})).await.unwrap();
+    s.call(&anon(), "get_tool_details", json!({"tool_id": "up.GetX"})).await.unwrap();
     drop(s); // close the file
 
     let logged = std::fs::read_to_string(&path).unwrap();
     let lines: Vec<&str> = logged.lines().collect();
     assert_eq!(lines.len(), 2, "one NDJSON event per meta-tool call");
     assert!(lines[0].contains("\"event\":\"search\"") && lines[0].contains("\"query\":\"x\""));
+    assert!(lines[0].contains("\"caller\":\"alice\""), "every audit line names the caller: {}", lines[0]);
     assert!(lines[1].contains("\"event\":\"details\"") && lines[1].contains("up.GetX"));
+    assert!(lines[1].contains("\"caller\":\"anonymous\""), "{}", lines[1]);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -631,14 +637,14 @@ async fn unknown_tool_error_suggests_near_miss() {
     let mut by_id = std::collections::HashMap::new();
     by_id.insert("stripe.PostCustomers".to_string(), 0);
     let cfg: Config = serde_yaml::from_str("mode: three_tool\nupstreams: []\n").unwrap();
-    let mut s = test_surface(cfg, tools);
+    let s = test_surface(cfg, tools);
     // the exact slip the mcp-compressor probe hit: underscore for dot
-    let r = s.call("call_tool", json!({"tool_id": "stripe_PostCustomers"})).await.unwrap();
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "stripe_PostCustomers"})).await.unwrap();
     let text = r["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("did you mean \"stripe.PostCustomers\"?"), "{text}");
     assert!(text.contains("search_tools"), "recovery hint still present: {text}");
     // details path too
-    let d = s.details_text("stripe.PostCustomer");
+    let d = s.details_text(&anon(), "stripe.PostCustomer");
     assert!(d.contains("did you mean \"stripe.PostCustomers\"?"), "{d}");
 }
 
@@ -651,14 +657,14 @@ fn write_through_busts_only_the_written_upstreams_cache() {
     let mut by_id = std::collections::HashMap::new();
     for (i, t) in tools.iter().enumerate() { by_id.insert(t.id().to_string(), i); }
     let cfg: Config = serde_yaml::from_str("mode: three_tool\nupstreams: []\nread_cache_ttl_s: 60\n").unwrap();
-    let mut s = test_surface(cfg, tools);
+    let s = test_surface(cfg, tools);
     let now = std::time::Instant::now();
-    s.read_cache.insert(("a.GetA".into(), "{}".into()), (now, json!({"x": 1})));
-    s.read_cache.insert(("b.GetB".into(), "{}".into()), (now, json!({"y": 2})));
+    lock(&s.read_cache).insert(("a.GetA".into(), "{}".into()), (now, json!({"x": 1})));
+    lock(&s.read_cache).insert(("b.GetB".into(), "{}".into()), (now, json!({"y": 2})));
     // a write to upstream 0 busts a.* cached reads and leaves b.* alone
     s.bust_upstream_cache(0);
-    assert!(!s.read_cache.contains_key(&("a.GetA".to_string(), "{}".to_string())));
-    assert!(s.read_cache.contains_key(&("b.GetB".to_string(), "{}".to_string())));
+    assert!(!lock(&s.read_cache).contains_key(&("a.GetA".to_string(), "{}".to_string())));
+    assert!(lock(&s.read_cache).contains_key(&("b.GetB".to_string(), "{}".to_string())));
 }
 
 #[test]
@@ -755,7 +761,7 @@ async fn failed_calls_do_not_feed_the_usage_prior() {
 
     for _ in 0..30 {
         let r = s
-            .call("call_tool", json!({"tool_id": "up.Zebra", "arguments": {}}))
+            .call(&anon(), "call_tool", json!({"tool_id": "up.Zebra", "arguments": {}}))
             .await
             .unwrap();
         assert_eq!(
@@ -789,7 +795,131 @@ fn search_k_zero_means_the_default_not_no_matches() {
         description: "get x".into(),
         params: String::new(),
     }]);
-    assert!(s.cli_search("get x", 0).contains("up.GetX"), "k=0 used to read as a search failure");
+    assert!(s.cli_search(&anon(), "get x", 0).contains("up.GetX"), "k=0 used to read as a search failure");
+}
+
+#[tokio::test]
+async fn rate_limited_calls_are_refused_per_caller_before_preflight() {
+    let cfg = Config::from_yaml("mode: three_tool\nupstreams: []\nrate_limits:\n  per_caller: {calls: 2, per_s: 60}\n").unwrap();
+    let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]});
+    let tools = vec![ToolDef {
+        upstream_idx: 0,
+        name: "X".into(),
+        description: "x".into(),
+        input_schema: schema.clone(),
+        id: "up.X".into(),
+        read_only: None,
+    }];
+    let mut s = test_surface(cfg, tools);
+    s.patched_schemas.insert("up.X".into(), schema); // preflight resolves locally — no backend
+    let alice = Caller::new(vec![], Some("alice".into()));
+    let call = json!({"tool_id": "up.X", "arguments": {}});
+    for _ in 0..2 {
+        let r = s.call(&alice, "call_tool", call.clone()).await.unwrap();
+        assert!(result_text(&r).contains("PREFLIGHT_ERROR"), "within budget → reaches preflight: {r}");
+    }
+    let r = s.call(&alice, "call_tool", call.clone()).await.unwrap();
+    let t = result_text(&r);
+    assert!(t.contains("RATE_LIMITED") && t.contains("alice") && t.contains("retry in"), "{t}");
+    // another caller has an untouched bucket
+    let bob = Caller::new(vec![], Some("bob".into()));
+    let r = s.call(&bob, "call_tool", call).await.unwrap();
+    assert!(result_text(&r).contains("PREFLIGHT_ERROR"), "bob is not limited by alice: {r}");
+}
+
+#[tokio::test]
+async fn a_refused_call_does_not_spend_the_callers_wider_budget() {
+    // A per-tool refusal used to also drain the per-caller bucket, so hammering
+    // one tool locked the caller out of every other tool. A refused call must
+    // cost nothing.
+    let cfg = Config::from_yaml(
+        "mode: three_tool\nupstreams: []\nrate_limits:\n  per_caller: {calls: 10, per_s: 60}\n  per_tool: {calls: 1, per_s: 60}\n",
+    )
+    .unwrap();
+    let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]});
+    let mk = |id: &str| ToolDef {
+        upstream_idx: 0,
+        name: id.into(),
+        description: "x".into(),
+        input_schema: schema.clone(),
+        id: format!("up.{id}"),
+        read_only: None,
+    };
+    let mut s = test_surface(cfg, vec![mk("X"), mk("Y")]);
+    for id in ["up.X", "up.Y"] {
+        s.patched_schemas.insert(id.into(), schema.clone()); // preflight resolves locally
+    }
+    let alice = Caller::new(vec![], Some("alice".into()));
+    let call = |id: &str| json!({"tool_id": id, "arguments": {}});
+    // one call to X is admitted (and preflight-rejected); the next five are
+    // refused by the per-TOOL budget
+    let r = s.call(&alice, "call_tool", call("up.X")).await.unwrap();
+    assert!(result_text(&r).contains("PREFLIGHT_ERROR"), "{r}");
+    for _ in 0..5 {
+        let r = s.call(&alice, "call_tool", call("up.X")).await.unwrap();
+        assert!(result_text(&r).contains("on up.X"), "expected the per-tool refusal: {r}");
+    }
+    // alice's overall budget is 10 and only ONE call was ever admitted, so a
+    // different tool must still be reachable
+    let r = s.call(&alice, "call_tool", call("up.Y")).await.unwrap();
+    assert!(
+        result_text(&r).contains("PREFLIGHT_ERROR"),
+        "refused calls must not have drained the caller budget: {r}"
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_passthrough_tool_is_shaped_like_one_that_does_not_exist() {
+    // Resolving the exposed name before checking visibility answered with
+    // `unknown tool_id \"up.GetX\" — did you mean …`, handing a scoped-out caller
+    // the canonical id (and its neighbours) that tools/list withholds.
+    let yaml = "mode: passthrough\nupstreams: []\nscopes:\n  rules:\n    - scope: read\n      tools: [\"up.Get*\"]\n";
+    let tools = vec![ToolDef {
+        upstream_idx: 0,
+        name: "GetSecretReport".into(),
+        description: "get".into(),
+        input_schema: json!({"type": "object"}),
+        id: "up.GetSecretReport".into(),
+        read_only: None,
+    }];
+    let mut s = test_surface(Config::from_yaml(yaml).unwrap(), tools);
+    s.build_exposed();
+
+    let hidden = s.call(&anon(), "up_GetSecretReport", json!({})).await.unwrap();
+    let hidden = result_text(&hidden).to_string();
+    let absent = s.call(&anon(), "up_NoSuchTool", json!({})).await.unwrap();
+    let absent = result_text(&absent).to_string();
+    assert!(hidden.starts_with("unknown tool \"up_GetSecretReport\""), "{hidden}");
+    assert!(absent.starts_with("unknown tool \"up_NoSuchTool\""), "{absent}");
+    assert!(!hidden.contains("up.GetSecretReport"), "the canonical id must not leak: {hidden}");
+    assert!(!hidden.contains("did you mean"), "nor a near-miss naming it: {hidden}");
+
+    // with the scope the same tool is visible again (details, which needs no
+    // backend, stands in for the call this bare test surface cannot dial)
+    let granted = Caller::with_scopes(vec!["read".into()]);
+    assert!(
+        s.cli_details(&granted, "up.GetSecretReport").contains("input_schema"),
+        "granted → visible"
+    );
+}
+
+#[test]
+fn passthrough_listing_is_filtered_per_caller() {
+    let yaml = "mode: passthrough\nupstreams: []\nscopes:\n  rules:\n    - scope: read\n      tools: [\"up.Get*\"]\n    - scope: write\n      tools: [\"up.Post*\"]\n";
+    let tools = vec![
+        ToolDef { upstream_idx: 0, name: "GetX".into(), description: "get".into(), input_schema: json!({"type": "object"}), id: "up.GetX".into(), read_only: None },
+        ToolDef { upstream_idx: 0, name: "PostY".into(), description: "post".into(), input_schema: json!({"type": "object"}), id: "up.PostY".into(), read_only: None },
+    ];
+    let mut s = test_surface(Config::from_yaml(yaml).unwrap(), tools);
+    s.build_exposed();
+    let names = |c: &Caller| -> Vec<String> {
+        s.list_tools(c)["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(names(&Caller::with_scopes(vec!["read".into()])), vec!["up_GetX"]);
+    assert_eq!(names(&Caller::with_scopes(vec!["write".into()])), vec!["up_PostY"]);
+    assert!(names(&anon()).is_empty(), "no scope, no tools (rules are default-deny)");
+    // one surface, two callers, two different listings — the per-request model
+    assert_eq!(s.exposed.len(), 2, "the exposed map itself covers every tool");
 }
 
 #[tokio::test]
@@ -797,21 +927,17 @@ async fn a_scoped_out_composite_is_hidden_from_details_and_call_like_search() {
     // Scopes hid a composite from search_tools but get_tool_details and
     // call_tool still honoured it; the three must agree.
     let yaml = "mode: three_tool\nupstreams: []\nscopes:\n  rules:\n    - scope: w\n      tools: [\"wf.*\"]\nworkflows:\n  - id: wf.chain\n    description: a chain\n    steps: []\n";
-    let mk = |granted: Vec<String>| {
-        let mut s = test_surface(Config::from_yaml(yaml).unwrap(), vec![]);
-        s.granted = granted;
-        s.workflow_by_id.insert("wf.chain".into(), 0);
-        s
-    };
-    let mut hidden = mk(vec![]);
-    assert!(hidden.cli_details("wf.chain").contains("unknown tool_id"), "no scope → not described");
-    let r = hidden.call("call_tool", json!({"tool_id": "wf.chain", "arguments": {}})).await.unwrap();
+    let mut s = test_surface(Config::from_yaml(yaml).unwrap(), vec![]);
+    s.workflow_by_id.insert("wf.chain".into(), 0);
+    let hidden = Caller::with_scopes(vec![]);
+    assert!(s.cli_details(&hidden, "wf.chain").contains("unknown tool_id"), "no scope → not described");
+    let r = s.call(&hidden, "call_tool", json!({"tool_id": "wf.chain", "arguments": {}})).await.unwrap();
     assert_eq!(r["isError"], json!(true), "no scope → not callable: {r}");
     assert!(result_text(&r).contains("unknown tool_id"), "{r}");
 
-    let mut visible = mk(vec!["w".into()]);
-    assert!(visible.cli_details("wf.chain").contains("\"composite\": true"), "granted → described");
-    let r = visible.call("call_tool", json!({"tool_id": "wf.chain", "arguments": {}})).await.unwrap();
+    let visible = Caller::with_scopes(vec!["w".into()]);
+    assert!(s.cli_details(&visible, "wf.chain").contains("\"composite\": true"), "granted → described");
+    let r = s.call(&visible, "call_tool", json!({"tool_id": "wf.chain", "arguments": {}})).await.unwrap();
     assert_eq!(r["isError"], json!(false), "granted → runs (an empty chain succeeds): {r}");
 }
 

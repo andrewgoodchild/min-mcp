@@ -24,7 +24,9 @@ binding_policy: warn      # warn (default) | strict — how broken overlays beha
 error_hints: [ ... ]      # fleet-wide error→recovery hints (all tools)
 preflight: true           # validate calls against the patched schema locally (default ON)
 read_cache_ttl_s: 0       # TTL cache for read-only tools' results (0 = off)
-log_file: events.ndjson   # optional NDJSON audit log of search/details/call
+log_file: events.ndjson   # NDJSON audit stream — a path, or `stderr` for containers
+rate_limits: { ... }      # token buckets per caller / per (caller, tool)
+secrets: { ... }          # secret stores for ${…} references (Vault); env/file need none
 shadow: false             # score alternative retrievers on real traffic (see below)
 ```
 
@@ -34,14 +36,16 @@ shadow: false             # score alternative retrievers on real traffic (see be
 | `upstreams` | The servers/specs to proxy. See below. |
 | `filters` | Static allow/deny of tools, for everyone. See [Filters](#filters). |
 | `scopes` | Per-caller visibility, keyed off JWT scopes. See [Transports & auth](transports-and-auth.md). |
-| `auth` | How caller JWTs are validated. See [Transports & auth](transports-and-auth.md). |
+| `auth` | How callers are identified: a JWT verifier (HS256 / RS256 / JWKS, with optional `audience` / `issuer` / `subject_claim`), or `trusted_headers` from a gateway; `allow_anonymous`. Over HTTP identity is per request. See [Transports & auth](transports-and-auth.md#caller-identity). |
 | `overlays` | Per-tool fixes for a server you don't own: patch descriptions, the input schema (`fields`: required/example/enum/hide/`user_supplied`), errors (`error_hints` + `retryable` + structured `field`), responses, request `defaults`/`headers` (with `{{uuid}}`/`{{hash}}` generators), `aliases`, `paginate`, `verify` checks, and per-tool guards — `timeout_s` (call deadline) and `breaker` (circuit breaker on consecutive failures). See [Overlays](overlays.md). |
 | `workflows` | Composite tools. See [Composites](composites.md). |
 | `binding_policy` | Default reaction when an overlay no longer matches the live schema: `warn` (serve, skip broken parts) or `strict` (refuse to start). Overridable per overlay. |
 | `error_hints` | Recovery instructions appended to any tool result whose text contains a substring. Per-tool overlay hints stack on top. A hint with a `field:` pointer renders a machine-shaped error from the patched schema. |
 | `preflight` | **On by default.** Validate each call against its (patched) input schema *before* the upstream call — a missing-required or out-of-enum value returns a structured error locally, with no round-trip. Makes the patched schema authoritative; where a spec over-declares `required`, disable per tool with an overlay's `preflight: false` (or globally here). |
 | `read_cache_ttl_s` | TTL (seconds) for caching results of **read-only** tools keyed by (tool, arguments): spec `GET` operations, MCP tools with `annotations.readOnlyHint`, or overlay `cacheable: true`. `0` (default) disables. Cached values are the raw pre-shaping result — each hit still gets this call's overlays and `fields` projection. Errors are never cached. |
-| `log_file` | If set, one NDJSON line per search/details/call — what the agent searched, selected, and called, its origin, and whether it was served from cache. |
+| `log_file` | One NDJSON audit line per event — `search`, `details`, `call`, `paginate`, `workflow`, `breaker`, `rate_limited`, `shadow` — to this path, or to `stderr` (the container path; the platform's log shipper forwards it). Every line carries `caller`; a call adds tool, upstream, origin, `is_error`, `cached`, `latency_ms`, `result_bytes`. Never the arguments. |
+| `rate_limits` | Token buckets on tool calls: `per_caller: {calls, per_s}` and `per_tool: {calls, per_s}` (per caller × tool). A refused call is a `RATE_LIMITED` isError result with a retry-after. Overlays add a per-tool cap across all callers (`rate_limit`). See [Rate limits](transports-and-auth.md#rate-limits). |
+| `secrets` | Stores behind `${…}` references. `${env:X}` and `${file:/path}` need nothing here; `${vault:path#field}` needs `secrets.vault` (address, mount, `auth`: token / approle / kubernetes) and honours `cache_ttl_s`. See [Secrets](transports-and-auth.md#secrets). |
 | `shadow` | **Off by default.** Score alternative retrieval configurations against real traffic without serving them; results land in `log_file` as `shadow` events. See [Shadow mode](#shadow-mode). |
 
 ## Upstreams
@@ -104,7 +108,8 @@ upstreams:
   - name: stripe
     spec: ./stripe.json          # path relative to the config file
     base_url: https://api.stripe.com
-    auth_env: STRIPE_TEST_KEY    # NAME of the env var holding the key
+    auth_env: STRIPE_TEST_KEY    # NAME of the env var holding the key, OR:
+    # api_key: "${vault:stripe/prod#key}"   # a ${env:…}/${file:…}/${vault:…} reference
     accept: application/json     # optional Accept header
     headers:                     # optional static request headers (${VAR} expands)
       Notion-Version: "2022-06-28"   # e.g. a mandatory runtime header a spec omits
@@ -141,6 +146,64 @@ tested combined ("isolation is not just compliance, it is relevance"). If you kn
 your agents never delete or never touch a subsystem, saying so in `filters:` makes
 every remaining search better.
 
+## Auth
+
+How callers are identified. Over stdio the caller is the process (`--jwt` /
+`MINMCP_JWT`, else `--scopes`); over HTTP, with any of this configured, each
+request is identified on its own. Semantics: [Transports → Caller identity](transports-and-auth.md#caller-identity).
+
+```yaml
+auth:
+  # a JWT verifier — precedence: jwks_url, then jwt_public_key(_file), then jwt_secret
+  jwks_url: https://idp.example.com/.well-known/jwks.json   # RS256 by `kid`; refreshed on rotation and every 10 min
+  jwt_public_key_file: ./idp.pem                           # RS256 PEM, relative to the config
+  jwt_public_key: "-----BEGIN PUBLIC KEY-----\n..."           # RS256 PEM, inline
+  jwt_secret: "${MINMCP_JWT_SECRET}"                       # HS256; a ${…} reference, or the
+                                                           # MINMCP_JWT_SECRET env var directly
+  audience: minmcp                 # if set, `aud` must contain this (default: unchecked)
+  issuer: https://idp.example.com  # if set, `iss` must equal this (default: unchecked)
+  scope_claim: scope               # claim holding the scopes (default "scope"; string or array)
+  subject_claim: sub               # claim naming the caller for audit (default "sub")
+  # OR, behind a gateway that already authenticated the caller (HTTP only):
+  trusted_headers:
+    scopes: X-Auth-Scopes          # space- or comma-separated scopes
+    subject: X-Auth-Subject        # optional; the audit label
+  allow_anonymous: false           # true: a request with no identity gets the process caller
+```
+
+## Rate limits
+
+Token buckets on tool calls, keyed by the caller's subject (`search_tools` and
+`get_tool_details` are free). `calls` is also the burst; the bucket refills at
+`calls / per_s` per second. A refused call is a `RATE_LIMITED` isError result
+with a retry-after. Per-tool caps across all callers live on the overlay
+(`rate_limit`).
+
+```yaml
+rate_limits:
+  per_caller: { calls: 600, per_s: 60 }   # a caller's total tool calls
+  per_tool:   { calls: 120, per_s: 60 }   # per (caller, tool); per_s defaults to 60
+```
+
+## Secrets
+
+Stores behind `${…}` references (see [Secret references](#secret-references)).
+`env` and `file` need nothing here; Vault does:
+
+```yaml
+secrets:
+  vault:
+    address: https://vault.example.com:8200   # default: $VAULT_ADDR
+    namespace: team-a                          # optional (Vault Enterprise)
+    mount: secret                              # KV v2 mount (default "secret")
+    ca_cert: /etc/ssl/private-ca.pem           # optional; default $VAULT_CACERT
+    auth:                                      # exactly one of the three
+      token_env: VAULT_TOKEN                   # a static token (the default source)
+      approle: { role_id: "${VAULT_ROLE_ID}", secret_id: "${VAULT_SECRET_ID}", mount: approle }
+      kubernetes: { role: minmcp, jwt_path: /var/run/secrets/kubernetes.io/serviceaccount/token, mount: kubernetes }
+  cache_ttl_s: 300                             # Vault reads cached this long (default 300)
+```
+
 ## Shadow mode
 
 `shadow: true` builds a handful of alternative search indexes (different
@@ -158,17 +221,26 @@ agent *did*, which is ideal for comparing rankers and catching regressions, but 
 consistently-wrong tool choice scores as a hit — absolute correctness still needs
 a labelled set.
 
-## Environment expansion
+## Secret references
 
-`${VAR}` is expanded from the environment (at connect time) in **`headers`** values
-and **`oauth.client_secret`**. An **unset** variable is a hard error — min-mcp
-fails loudly rather than sending an empty credential upstream.
+Every credential-shaped value — `headers` (upstream and overlay),
+`oauth.client_secret`, a spec upstream's `api_key`, `auth.jwt_secret`, a
+`user_supplied` field's source — is a **reference**, resolved at startup (or at
+call time for `user_supplied`):
 
-Subprocess `env:` values are **literal** (no `${VAR}` expansion); the child also
-inherits min-mcp's own environment, so pass a secret to a subprocess by exporting
-it before launching min-mcp, not by embedding it in the config. `spec:` upstream
-credentials use `auth_env:` (the env var's *name*), so they're never in the file
-either.
+| form | source |
+|---|---|
+| `${NAME}` / `${env:NAME}` | the process environment |
+| `${file:/run/secrets/x}` | a file (Kubernetes / Docker secret mounts); trailing newline trimmed |
+| `${vault:path/to/secret#field}` | HashiCorp Vault / OpenBao KV v2 — needs `secrets.vault` |
+
+An unresolvable reference is a hard error — min-mcp fails loudly rather than
+sending an empty credential upstream. Full store configuration and the
+`user_supplied` sources are in [Transports & auth → Secrets](transports-and-auth.md#secrets).
+
+Subprocess `env:` values are **literal** (no expansion); the child also inherits
+min-mcp's own environment, so pass a secret to a subprocess by exporting it
+before launching min-mcp, not by embedding it in the config.
 
 ## Examples
 
@@ -176,5 +248,7 @@ The [`examples/`](../examples/) directory has one config per shape — offline
 demos (`demo-overlays.yaml`, `demo-workflow.yaml`, `demo-scopes.yaml`) and
 real-API ones (`proxy-mcp-server.yaml`, `github-mcp-server.yaml`,
 `stripe-from-spec.yaml`, `github-from-spec.yaml`, `github-fixups.yaml`,
-`oauth-upstream.yaml`, `stripe-narrow-filter.yaml`, `stripe-composite.yaml`).
+`oauth-upstream.yaml`, `stripe-narrow-filter.yaml`, `stripe-composite.yaml`),
+and `enterprise.yaml` — gateway identity, per-caller scopes, rate limits, an
+audit stream, secrets, and an optional upstream, all in one annotated file.
 See [`examples/README.md`](../examples/README.md).

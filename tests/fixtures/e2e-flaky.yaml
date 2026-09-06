@@ -1,0 +1,8 @@
+# E2E fixture: an MCP subprocess that dies on its first tools/call and works
+# once respawned. Proves the self-healing stdio client: the failed call is an
+# UPSTREAM_ERROR result, the next call respawns the child and succeeds.
+mode: three_tool
+upstreams:
+  - name: flaky
+    command: sh
+    args: ["flaky-server.sh"]

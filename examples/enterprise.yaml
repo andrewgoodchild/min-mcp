@@ -1,0 +1,81 @@
+# Enterprise deployment shape: min-mcp behind a gateway that already
+# authenticates callers, with per-caller scopes, rate limits, an audit stream
+# for the SIEM, secrets from a store, and upstreams that may come and go.
+#
+# Offline-runnable as written (the bundled sample spec; the Vault block is
+# commented out so `inspect` needs no server):
+#   minmcp inspect --config examples/enterprise.yaml
+#   minmcp serve   --config examples/enterprise.yaml --http 0.0.0.0:8080
+# The non-loopback bind is accepted WITHOUT --allow-remote because every
+# request must carry identity (auth below, no allow_anonymous).
+
+mode: three_tool
+
+upstreams:
+  - name: acme
+    spec: specs/acme-store.json
+    base_url: http://localhost:8787
+    auth_env: ACME_API_KEY                 # or: api_key: "${vault:acme/prod#api_key}"
+                                           #     api_key: "${file:/run/secrets/acme-api-key}"
+  # An upstream that may be down when the proxy starts: skipped with a warning,
+  # its tools absent until restart, everything else serves. (Here the command
+  # does not exist, so `inspect` demonstrates the skip.)
+  - name: reports
+    command: /opt/mcp/reports-server
+    optional: true
+
+# --- Who is calling ------------------------------------------------------------
+auth:
+  # (a) Behind a gateway (Kong, Envoy, Apigee, APIM…) that has ALREADY validated
+  # the caller: trust the identity headers it sets. Only when the gateway is the
+  # sole route to this port and strips inbound copies of these headers.
+  trusted_headers:
+    scopes: X-Auth-Scopes                  # "store.read store.write" or comma-separated
+    subject: X-Auth-Subject                # who, for the audit line
+  # (b) Or validate bearer tokens here — pick one verifier:
+  # jwks_url: https://idp.example.com/.well-known/jwks.json
+  # jwt_public_key_file: ./idp.pem
+  # jwt_secret: "${vault:minmcp/prod#jwt_secret}"
+  # audience: minmcp                       # required `aud` when set
+  # issuer: https://idp.example.com        # required `iss` when set
+  # scope_claim: scope
+  # subject_claim: sub
+  # allow_anonymous: false                 # default: a request with no identity is 401
+
+# Per-caller visibility (default-deny once rules exist): a caller sees, searches,
+# and calls only what a scope they hold grants.
+scopes:
+  rules:
+    - scope: store.read
+      tools: ["acme.widgets/list", "acme.widgets/get"]
+    - scope: store.write
+      tools: ["acme.widgets/create", "acme.orders/create"]
+
+# --- Limits -----------------------------------------------------------------------
+rate_limits:
+  per_caller: { calls: 600, per_s: 60 }    # a caller's total tool calls
+  per_tool:   { calls: 120, per_s: 60 }    # per (caller, tool)
+
+overlays:
+  - tool: acme.orders/create
+    rate_limit: { calls: 30, per_s: 60 }   # this tool, across ALL callers (vendor quota)
+    breaker: { consecutive_failures: 5, cooldown_s: 60 }
+    timeout_s: 15
+
+# --- Audit ------------------------------------------------------------------------
+# One NDJSON line per search / details / call / rate_limited / breaker event:
+# caller, tool, origin, outcome, latency_ms, result_bytes — never the arguments.
+# `stderr` is the container path: the platform's log shipper forwards it.
+log_file: stderr
+
+# --- Secrets ------------------------------------------------------------------
+# `${env:NAME}` and `${file:/path}` work with no configuration. For Vault:
+# secrets:
+#   vault:
+#     address: https://vault.example.com:8200   # or $VAULT_ADDR
+#     mount: secret                              # KV v2 mount
+#     auth:
+#       kubernetes: { role: minmcp }             # pod service-account login
+#       # approle: { role_id: "${VAULT_ROLE_ID}", secret_id: "${VAULT_SECRET_ID}" }
+#       # token_env: VAULT_TOKEN
+#   cache_ttl_s: 300

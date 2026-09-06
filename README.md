@@ -8,14 +8,17 @@ can't edit them — so today you fork them, or paper over their flaws in every
 agent's prompt. min-mcp patches them *as they pass through*: a versioned,
 drift-checked **overlay** you can prove with `minmcp verify` in CI. On the way
 through it also minifies the surface, so a 17,000-operation API arrives as three
-searchable tools instead of a context bill.
+searchable tools instead of a context bill. And it runs where your agents run:
+behind the gateway you already have, with a caller identity per request, scopes
+and rate limits per caller, and an audit line per call.
 
 ```
-                    ┌─ overlay: patch schemas, rewrite errors, reshape responses
-                    │           (drift-checked, verified in CI)
-your agent ──► minmcp ──► GitHub's MCP server (85 tools)
-   sees            │────► Stripe's OpenAPI spec (589 operations)
-  3 tools          └────► Microsoft Graph's OpenAPI spec (17,531 operations)
+                          ┌─ overlay: patch schemas, rewrite errors, reshape responses
+                          │           (drift-checked, verified in CI)
+your gateway ──► minmcp ──► GitHub's MCP server (85 tools)
+ (bearer or        │    │────► Stripe's OpenAPI spec (589 operations)
+ identity headers) │    └────► Microsoft Graph's OpenAPI spec (17,531 operations)
+                   └─ per request: who → which tools → how many calls → audit line
 ```
 
 ## Why
@@ -89,7 +92,20 @@ and one interface. Search is BM25 over the [`bm25`](https://crates.io/crates/bm2
 crate behind a convention-aware tokenizer: `PostCheckoutSessions`, `read_file`, and
 `list-pull-requests` are all findable by their words.
 
-**3. Also.**
+**3. Run it behind your gateway.** One `minmcp serve --http` serves many callers.
+Each request is identified on its own — a bearer validated here (HS256 / RS256 /
+JWKS, with `aud` / `iss` checks), or identity headers from a gateway that already
+did the work — and sees only what its scopes grant: hidden tools are never listed,
+searched, or callable. Token-bucket **rate limits** per caller, per caller-and-tool,
+and per tool across callers refuse with a retry-after the agent can act on. Every
+search, lookup, and call writes an NDJSON **audit line** naming the caller, the
+tool, its origin, the outcome, latency, and size — to a file or to stderr for your
+log shipper. Credentials are **references** into the environment, mounted secret
+files, or HashiCorp Vault, never values in the config. A dead upstream is
+respawned, not fatal. → [Transports & auth](docs/transports-and-auth.md),
+[`examples/enterprise.yaml`](examples/enterprise.yaml)
+
+**4. Also.**
 - **Minify responses too.** Beyond the `fields` filter, overlays reshape any response
   server-side (strip secrets/PII/noise, rename, project) — over *any* API, even ones
   with no field-selection of their own.
@@ -102,9 +118,8 @@ crate behind a convention-aware tokenizer: `PostCheckoutSessions`, `read_file`, 
   subprocess, a remote MCP server over HTTP, or a spec — with per-upstream headers,
   outbound OAuth, and JWT-derived caller scopes. [Transports & auth](docs/transports-and-auth.md)
 - **Gate visibility.** Static `filters:` drop whole APIs or tool families for
-  everyone; per-caller `scopes:` hide what a JWT doesn't grant — hidden tools are
-  never listed, searched, or callable. A `passthrough` mode federates tools directly
-  when the surface is already small.
+  everyone; per-caller `scopes:` hide what a caller's identity doesn't grant. A
+  `passthrough` mode federates tools directly when the surface is already small.
 
 ## Quickstart
 
@@ -167,6 +182,18 @@ Then point it at your own upstreams — MCP servers you already run, or a spec:
 STRIPE_TEST_KEY=sk_test_... ./target/release/minmcp inspect --config examples/stripe-from-spec.yaml
 ```
 
+And the deployment shape — behind a gateway, many callers, one process. The
+bundled config trusts identity headers a gateway would set; a request without
+them is refused, and two callers with different scopes see two different surfaces:
+
+```sh
+./target/release/minmcp serve --http 0.0.0.0:8080 --config examples/enterprise.yaml
+# accepted without --allow-remote: every request must carry identity
+curl -s -o /dev/null -w '%{http_code}\n' -d '{...initialize...}' http://localhost:8080/   # 401
+curl -s -H 'X-Auth-Scopes: store.read' -H 'X-Auth-Subject: alice' ...                 # sees list/get
+# stderr: {"ts_ms":…,"event":"search","caller":"alice","query":"widget","k":10}
+```
+
 Full walkthrough → [Getting started](docs/getting-started.md).
 
 ## Proof it works
@@ -197,7 +224,7 @@ Full numbers, reproduction steps, and what is *not* measured →
 | [Configuration](docs/configuration.md) | every YAML key, with examples |
 | [Overlays](docs/overlays.md) | patch and reshape tools you don't own |
 | [Composites](docs/composites.md) | multi-step chains as one tool, and their safety |
-| [Transports & auth](docs/transports-and-auth.md) | stdio/HTTP, OAuth, JWT scopes |
+| [Transports, identity & ops](docs/transports-and-auth.md) | stdio/HTTP, per-request caller identity (JWT or gateway headers), rate limits, the audit stream, secrets (env/file/Vault), upstream health, what is deliberately not built |
 | [CLI reference](docs/cli.md) | every command and flag |
 | [About tool search](docs/about-tool-search.md) | **read this first** — what Claude and Codex do natively, Atlassian's peer proxy measured head-to-head, and when min-mcp fits alongside an agent with built-in catalog search |
 | [About TOON](docs/about-toon.md) | what it is, what we measured, why we don't emit it |
