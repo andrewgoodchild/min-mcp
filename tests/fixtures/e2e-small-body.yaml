@@ -1,0 +1,11 @@
+# A deliberately tiny body cap so the 413 path is testable without generating a
+# megabyte of JSON (see tests/tls_e2e.rs).
+mode: three_tool
+upstreams:
+  - name: fixture
+    spec: mini-openapi.json
+    base_url: https://example.invalid
+    auth_env: CI_FIXTURE_KEY
+http:
+  limits:
+    max_body_bytes: 512

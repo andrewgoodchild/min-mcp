@@ -1,0 +1,13 @@
+# Mutual TLS: a client certificate chaining to the test CA is required on every
+# connection (see tests/tls_e2e.rs).
+mode: three_tool
+upstreams:
+  - name: fixture
+    spec: mini-openapi.json
+    base_url: https://example.invalid
+    auth_env: CI_FIXTURE_KEY
+http:
+  tls:
+    cert_file: tls/server.crt
+    key_file: tls/server.key
+    client_ca_file: tls/ca.crt

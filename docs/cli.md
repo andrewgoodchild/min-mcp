@@ -59,6 +59,29 @@ grounded in published taxonomies. Reports per-rule aggregate stats plus a sample
 flagged tools. Findings are *drafted*, never applied — it's detection triage and a
 patch-drafter, not a breakage detector (that's `verify`).
 
+Three rules cover **tool poisoning** — text in a definition aimed at the model
+rather than at the reader:
+
+| rule | fires on |
+|---|---|
+| `hidden_text` | Zero-width characters, bidi overrides, or tag characters in a name or description — a human reviewer reads one thing, the model another |
+| `model_directed_instruction` | Phrases that instruct rather than describe: "ignore previous instructions", "do not tell the user", "before using this tool…" |
+| `secret_solicitation` | A local credential artifact a remote tool cannot need — `~/.ssh/id_rsa`, `.aws/credentials`, `.env file` |
+
+They are matched on the definition alone, so they catch a poisoned *description*
+— not a poisoned *response*, and not argument-level exfiltration. That boundary
+is deliberate: min-mcp is a proxy, not a guardrail product. The rules are tuned
+against real specs rather than intuition — on Stripe (589 ops) and GitHub (1,216
+ops) all three fire **zero** times. Matching credential *nouns* instead of
+artifacts flagged 18 GitHub tools, every one a false positive (its PAT-grant and
+Actions environment-variable endpoints), which is why the rule matches paths.
+
+That measurement is over OpenAPI specs, whose summaries never address a reader.
+Hand-written MCP servers do: "before using this tool, call `search` first" is
+ordinary sequencing advice there, and `model_directed_instruction` will flag it.
+Treat a hit on an MCP upstream as triage, not a verdict — which is what every
+rule here is.
+
 ```sh
 minmcp lint --config myconfig.yaml              # aggregate stats + flagged sample
 minmcp lint --config myconfig.yaml --sample 0   # aggregate only

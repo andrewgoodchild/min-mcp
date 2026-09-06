@@ -1,0 +1,12 @@
+# A cap ABOVE rmcp's own 4 MiB default, which is the regression this fixture
+# guards: left at the default, rmcp refuses at 4 MiB and the configured value
+# never takes effect (see tests/tls_e2e.rs).
+mode: three_tool
+upstreams:
+  - name: fixture
+    spec: mini-openapi.json
+    base_url: https://example.invalid
+    auth_env: CI_FIXTURE_KEY
+http:
+  limits:
+    max_body_bytes: 8388608

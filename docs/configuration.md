@@ -37,6 +37,7 @@ shadow: false             # score alternative retrievers on real traffic (see be
 | `filters` | Static allow/deny of tools, for everyone. See [Filters](#filters). |
 | `scopes` | Per-caller visibility, keyed off JWT scopes. See [Transports & auth](transports-and-auth.md). |
 | `auth` | How callers are identified: a JWT verifier (HS256 / RS256 / JWKS, with optional `audience` / `issuer` / `subject_claim`), or `trusted_headers` from a gateway; `allow_anonymous`. Over HTTP identity is per request. See [Transports & auth](transports-and-auth.md#caller-identity). |
+| `http` | The HTTP listener's own hardening: `tls` (`cert_file`, `key_file`, and `client_ca_file` for mutual TLS) and `limits` (`max_body_bytes`, `max_in_flight`). See [TLS](transports-and-auth.md#tls-on-the-listener). |
 | `overlays` | Per-tool fixes for a server you don't own: patch descriptions, the input schema (`fields`: required/example/enum/hide/`user_supplied`), errors (`error_hints` + `retryable` + structured `field`), responses, request `defaults`/`headers` (with `{{uuid}}`/`{{hash}}` generators), `aliases`, `paginate`, `verify` checks, and per-tool guards — `timeout_s` (call deadline) and `breaker` (circuit breaker on consecutive failures). See [Overlays](overlays.md). |
 | `workflows` | Composite tools. See [Composites](composites.md). |
 | `binding_policy` | Default reaction when an overlay no longer matches the live schema: `warn` (serve, skip broken parts) or `strict` (refuse to start). Overridable per overlay. |

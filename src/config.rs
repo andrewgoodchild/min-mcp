@@ -172,6 +172,14 @@ pub struct RateLimits {
     pub per_tool: Option<Limit>,
 }
 
+impl RateLimits {
+    /// Is any caller-keyed limit configured? (An overlay's `rate_limit` is keyed
+    /// by tool across all callers, so it is unaffected by the caller's subject.)
+    pub fn any(&self) -> bool {
+        self.per_caller.is_some() || self.per_tool.is_some()
+    }
+}
+
 /// Secret stores beyond the environment. `${file:…}` needs no configuration;
 /// `${vault:…}` needs `vault`.
 #[derive(Debug, Deserialize, Clone)]
@@ -756,6 +764,88 @@ pub struct Auth {
     pub allow_anonymous: bool,
 }
 
+/// Transport-level hardening for the HTTP listener: TLS, and caps bounding what
+/// one client can make the process allocate. Both are off/loose by default —
+/// `serve --http` on loopback for local development needs neither.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConfig {
+    /// Terminate TLS on the listener itself. Unset means plaintext, which is
+    /// only safe on loopback or behind a TLS-terminating gateway.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    /// See [`HttpLimits`].
+    #[serde(default)]
+    pub limits: HttpLimits,
+}
+
+/// Server certificate, key, and optionally the CA that client certificates must
+/// chain to. Paths rather than inline PEM: key material belongs in a mounted
+/// secret (Kubernetes, systemd credentials), never in the committed config.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM certificate chain — the server certificate first, then intermediates.
+    pub cert_file: String,
+    /// PEM private key (PKCS#8, PKCS#1, or SEC1).
+    pub key_file: String,
+    /// If set, MUTUAL TLS: a client must present a certificate chaining to this
+    /// CA bundle, or the connection is closed before any request is read.
+    ///
+    /// This authenticates the CHANNEL, not the caller — it is what makes
+    /// `auth.trusted_headers` safe to believe, by ensuring only the gateway can
+    /// open a connection at all. It never names the caller: identity still
+    /// comes from the bearer or the gateway's identity headers.
+    #[serde(default)]
+    pub client_ca_file: Option<String>,
+}
+
+/// Caps on what one client can make the process allocate. The defaults are far
+/// above what a legitimate MCP client sends, so they bite only on abuse.
+///
+/// `default` at the container level fills any missing field from the `Default`
+/// impl below, so each cap is stated exactly once.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields, default)]
+pub struct HttpLimits {
+    /// Largest accepted request body; a larger one is refused with 413 before
+    /// being buffered. 1 MiB by default — model-generated tool arguments are
+    /// bounded by the model's own context long before this.
+    pub max_body_bytes: usize,
+    /// Most requests rmcp is handling at once across every connection. Beyond
+    /// this a request waits rather than being refused.
+    ///
+    /// This bounds request HANDLING, not concurrent upstream calls: the permit
+    /// is released when the response future resolves, and an SSE reply resolves
+    /// before the tool runs. See the note in `rmcp_serve::serve_http`.
+    pub max_in_flight: usize,
+}
+
+// Not derived: a derived Default would give 0 for both, and 0 means "refuse
+// every request" / "never issue a permit" rather than "unset".
+impl Default for HttpLimits {
+    fn default() -> Self {
+        HttpLimits { max_body_bytes: 1024 * 1024, max_in_flight: 256 }
+    }
+}
+
+impl Auth {
+    /// Will an authenticated request carry a subject to key rate limits and
+    /// audit lines on? A bearer does (`subject_claim`, `sub` by default); a
+    /// gateway does only if it forwards an identity header as well as scopes.
+    pub fn names_the_caller(&self) -> bool {
+        match &self.trusted_headers {
+            // Trusted headers take effect only when no bearer is presented, so a
+            // gateway without a subject header is the gap even alongside a verifier.
+            Some(t) => t.subject.is_some(),
+            // `has_verifier` rather than an inline field check: the HS256 secret
+            // may arrive via MINMCP_JWT_SECRET with no config field set at all,
+            // and missing that spelling warns a deployment that is already fine.
+            None => self.has_verifier(),
+        }
+    }
+}
+
 /// Identity headers set by a trusted fronting gateway (see `Auth::trusted_headers`).
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -839,6 +929,9 @@ pub struct Config {
     pub filters: Filters,
     #[serde(default)]
     pub auth: Auth,
+    /// Transport hardening for `serve --http`. See [`HttpConfig`].
+    #[serde(default)]
+    pub http: HttpConfig,
     #[serde(default)]
     pub overlays: Vec<Overlay>,
     /// Composite tools (linear step workflows) exposed alongside upstream tools.
@@ -887,6 +980,15 @@ pub struct Config {
     overlay_index: HashMap<String, usize>,
 }
 
+/// Make one configured path relative to the config file's directory, in place.
+/// Absolute paths are left alone. Every path-valued config key goes through
+/// this, so the rule lives in one place rather than once per key.
+fn resolve_rel(base: &std::path::Path, p: &mut String) {
+    if !std::path::Path::new(p.as_str()).is_absolute() {
+        *p = base.join(p.as_str()).to_string_lossy().into_owned();
+    }
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -899,25 +1001,28 @@ impl Config {
             .filter(|p| !p.as_os_str().is_empty())
             .map(PathBuf::from);
         if let Some(base) = base {
+            // Every path in the config is relative to the config file, so the
+            // rule is stated once and applied at each site (see `resolve_rel`).
             for up in &mut cfg.upstreams {
                 up.cwd.get_or_insert_with(|| base.clone());
-                // spec paths are also relative to the config file
-                if let Some(spec) = &up.spec {
-                    if !PathBuf::from(spec).is_absolute() {
-                        up.spec = Some(base.join(spec).to_string_lossy().into_owned());
-                    }
+                if let Some(spec) = &mut up.spec {
+                    resolve_rel(&base, spec);
                 }
             }
-            // the RS256 public-key file is likewise relative to the config
-            if let Some(key) = &cfg.auth.jwt_public_key_file {
-                if !PathBuf::from(key).is_absolute() {
-                    cfg.auth.jwt_public_key_file =
-                        Some(base.join(key).to_string_lossy().into_owned());
+            if let Some(key) = &mut cfg.auth.jwt_public_key_file {
+                resolve_rel(&base, key);
+            }
+            if let Some(log) = &mut cfg.log_file {
+                // `stderr` is a sentinel, not a path.
+                if log != "stderr" {
+                    resolve_rel(&base, log);
                 }
             }
-            if let Some(log) = &cfg.log_file {
-                if log != "stderr" && !PathBuf::from(log).is_absolute() {
-                    cfg.log_file = Some(base.join(log).to_string_lossy().into_owned());
+            if let Some(tls) = &mut cfg.http.tls {
+                resolve_rel(&base, &mut tls.cert_file);
+                resolve_rel(&base, &mut tls.key_file);
+                if let Some(ca) = &mut tls.client_ca_file {
+                    resolve_rel(&base, ca);
                 }
             }
         }
@@ -983,6 +1088,29 @@ impl Config {
             if t.scopes.trim().is_empty() {
                 anyhow::bail!("auth.trusted_headers.scopes must name a header");
             }
+        }
+        // Both caps are hazards at 0 in DIFFERENT ways, and neither is loud:
+        // `max_body_bytes: 0` refuses every request that carries a body, and
+        // `max_in_flight: 0` is worse — the semaphore never issues a permit, so
+        // the listener binds, prints its banner, and then hangs every request
+        // forever with no error anywhere. An overlarge `max_in_flight` is a
+        // panic inside tokio's `Semaphore::new`, so it is caught here too.
+        if self.http.limits.max_body_bytes == 0 {
+            anyhow::bail!(
+                "http.limits.max_body_bytes must be at least 1: 0 refuses every request that \
+                 carries a body. Omit the field for the 1 MiB default."
+            );
+        }
+        match self.http.limits.max_in_flight {
+            0 => anyhow::bail!(
+                "http.limits.max_in_flight must be at least 1: with 0 permits every request \
+                 waits forever and the server answers nothing. Omit the field for the default (256)."
+            ),
+            n if n > tokio::sync::Semaphore::MAX_PERMITS => anyhow::bail!(
+                "http.limits.max_in_flight is {n}, above the maximum {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            ),
+            _ => {}
         }
         if self.auth.allow_anonymous && !self.auth.has_verifier() && self.auth.trusted_headers.is_none() {
             anyhow::bail!(
@@ -1351,6 +1479,14 @@ upstreams:
   - name: stripe
     command: uv
     args: ["run", "x"]
+http:
+  tls:
+    cert_file: /etc/minmcp/server.crt
+    key_file: /etc/minmcp/server.key
+    client_ca_file: /etc/minmcp/clients.crt
+  limits:
+    max_body_bytes: 2048
+    max_in_flight: 8
 overlays:
   - tool: stripe.PostCustomers
     description: "Create a customer."
@@ -1362,5 +1498,45 @@ overlays:
         );
         assert_eq!(c.mode, Mode::Passthrough);
         assert_eq!(c.overlay_for("stripe.PostCustomers").unwrap().fields.len(), 1);
+        let tls = c.http.tls.as_ref().expect("tls section");
+        assert_eq!(tls.cert_file, "/etc/minmcp/server.crt");
+        assert_eq!(tls.client_ca_file.as_deref(), Some("/etc/minmcp/clients.crt"));
+        assert_eq!(c.http.limits.max_body_bytes, 2048);
+        assert_eq!(c.http.limits.max_in_flight, 8);
+    }
+
+    #[test]
+    fn http_limits_default_when_the_section_is_absent() {
+        // A derived Default would give 0 here, which would refuse every request.
+        let c = cfg("upstreams: [{name: s, command: x}]\n");
+        assert_eq!(c.http.limits.max_body_bytes, 1024 * 1024);
+        assert_eq!(c.http.limits.max_in_flight, 256);
+        assert!(c.http.tls.is_none());
+    }
+
+    #[test]
+    fn a_zero_cap_is_rejected_rather_than_silently_serving_nothing() {
+        // `max_in_flight: 0` is the nastier of the two: the listener binds and
+        // prints its banner, then every request waits on a permit that is never
+        // issued — a server that answers nothing, with nothing in the log.
+        assert!(Config::from_yaml(
+            "upstreams: [{name: s, command: x}]\nhttp:\n  limits:\n    max_in_flight: 0\n"
+        )
+        .is_err());
+        assert!(Config::from_yaml(
+            "upstreams: [{name: s, command: x}]\nhttp:\n  limits:\n    max_body_bytes: 0\n"
+        )
+        .is_err());
+        // And the sane ones still load.
+        let c = cfg("upstreams: [{name: s, command: x}]\nhttp:\n  limits:\n    max_in_flight: 1\n");
+        assert_eq!(c.http.limits.max_in_flight, 1);
+    }
+
+    #[test]
+    fn a_misspelled_http_key_is_rejected() {
+        assert!(Config::from_yaml(
+            "upstreams: [{name: s, command: x}]\nhttp:\n  limits:\n    max_body: 10\n"
+        )
+        .is_err());
     }
 }

@@ -36,6 +36,8 @@ pub struct HttpServer {
     child: Child,
     /// The port the OS actually assigned.
     pub port: u16,
+    /// `http` or `https`, read from the banner — the TLS suite needs to know.
+    pub scheme: String,
 }
 
 impl HttpServer {
@@ -75,21 +77,28 @@ impl HttpServer {
                     panic!("no 'listening on' banner within the deadline");
                 }
             };
-            if let Some(rest) = line.split("listening on http://").nth(1) {
-                let port = rest
-                    .trim_end_matches('/')
-                    .trim()
-                    .rsplit(':')
-                    .next()
-                    .and_then(|p| p.parse::<u16>().ok())
-                    .expect("port in the banner");
-                return HttpServer { child, port };
+            // "listening on http://host:port/" or "https://…" once TLS is
+            // configured, so the scheme is parsed rather than assumed.
+            // Skipped rather than unwrapped at each step: any other stderr line
+            // that happens to contain "listening on " must not panic the suite,
+            // it must just not match.
+            let banner = line
+                .split("listening on ")
+                .nth(1)
+                .map(|rest| rest.trim().trim_end_matches('/'))
+                .and_then(|rest| rest.split_once("://"))
+                .and_then(|(scheme, hostport)| {
+                    let port = hostport.rsplit(':').next()?.parse::<u16>().ok()?;
+                    Some((scheme.to_string(), port))
+                });
+            if let Some((scheme, port)) = banner {
+                return HttpServer { child, port, scheme };
             }
         }
     }
 
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/", self.port)
+        format!("{}://127.0.0.1:{}/", self.scheme, self.port)
     }
 }
 

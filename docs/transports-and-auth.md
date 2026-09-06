@@ -163,6 +163,90 @@ Off by default: an unauthenticated path next to an authenticated one is how
 scoping gets bypassed, and it also disables the identity-based exemption from
 the loopback-only bind rule.
 
+## TLS on the listener
+
+`serve --http` speaks plaintext by default, which is right for loopback and for
+a sidecar whose gateway terminates TLS. To terminate it here instead:
+
+```yaml
+http:
+  tls:
+    cert_file: /etc/minmcp/server.crt   # PEM chain, server certificate first
+    key_file: /etc/minmcp/server.key    # PKCS#8, PKCS#1 or SEC1
+```
+
+Paths are relative to the config file, like `spec:` and `jwt_public_key_file`.
+The banner then reads `https://`. A certificate that cannot be read, parsed, or
+matched to its key is a **startup** error, not a per-connection one: a listener
+that accepts and then fails every handshake is worse than one that never binds.
+
+### Mutual TLS
+
+Add a CA and every connection must present a client certificate that chains to
+it, or it is closed before a single request is read:
+
+```yaml
+http:
+  tls:
+    cert_file: /etc/minmcp/server.crt
+    key_file: /etc/minmcp/server.key
+    client_ca_file: /etc/minmcp/gateway-ca.crt
+```
+
+This authenticates the **channel, not the caller**. It never names who is
+calling — identity still comes from the bearer or the gateway's headers. What it
+does is close the gap under [`trusted_headers`](#3b-behind-a-gateway-that-already-authenticated-the-caller):
+those headers are only as good as the guarantee that the gateway is the sole
+route to the port, and a client certificate is that guarantee, enforced here
+rather than assumed from network policy.
+
+Because it is a real authentication boundary, requiring client certificates also
+satisfies the non-loopback bind guard — the same way per-request identity does.
+Every certificate holder still shares the process's scopes, so it is a
+substitute for `--allow-remote`, never for `auth:`.
+
+## Request caps
+
+```yaml
+http:
+  limits:
+    max_body_bytes: 1048576   # default 1 MiB
+    max_in_flight: 256        # default
+```
+
+A body over `max_body_bytes` is refused with **413**, whether or not it declares
+its length: the cap is checked against the frames as they stream, so a chunked
+body gets the same answer as one with a content-length, and nothing past the cap
+is ever buffered.
+1 MiB is far above any model-generated tool call — the model's own context bounds
+those long before this does.
+
+`max_in_flight` bounds how many requests the MCP service is inside at once
+across every connection. Past the cap a request **waits** rather than failing.
+
+**It does not bound concurrent upstream calls.** The permit is released when the
+response future resolves, and a Streamable HTTP reply resolves as soon as the SSE
+stream is handed back — before the tool call runs. Measured: with
+`max_in_flight: 1`, three concurrent 4-second tool calls still finish in about
+four seconds, not twelve. Treat it as a bound on request *handling*; the controls
+that actually govern upstream work are [rate limits](#rate-limits), per-tool
+`timeout_s`, and `breaker`. Both caps apply to the HTTP transport only; stdio is
+one process and one caller.
+
+### Connection deadlines
+
+Not configurable, and not something a normal client meets: a TLS handshake must
+complete within **10s**, and a connection must produce a request head within
+**30s**. Together they bound the one thing `http.limits` cannot — a client that
+opens sockets and never sends a request, so no request exists to be counted.
+
+The 30s figure is also the idle keep-alive timeout, because hyper applies that
+deadline to every request head on a connection rather than only the first. It is
+deliberately longer than the handshake deadline: at 10s a connection would be
+dropped whenever an agent paused to think, charging a fresh TCP (and TLS)
+handshake to the next tool call. A long-lived SSE stream is unaffected — the
+deadline is on reading a request, not on writing a response.
+
 ## Rate limits
 
 Token buckets on tool calls (`search_tools` and `get_tool_details` are free),
@@ -180,8 +264,16 @@ overlays:
 ```
 
 `calls` is also the burst; the bucket refills at `calls / per_s` per second.
-Every anonymous caller shares one bucket — over HTTP without identity, that is
-the whole port.
+
+Buckets key on the caller's **subject**, and every caller without one shares a
+single `anonymous` bucket. Over HTTP without identity that is the whole port,
+which is expected. The case to watch is subtler: a gateway configured with
+`trusted_headers.scopes` but no `trusted_headers.subject` produces callers who
+are authenticated and hold distinct scopes yet still share one bucket, so one
+noisy tenant rate-limits every other. `serve --http` warns at startup when rate
+limits are configured and nothing supplies a subject. Set
+`auth.trusted_headers.subject`, or use bearer tokens, whose `auth.subject_claim`
+defaults to `sub`.
 
 ## Audit log
 
@@ -310,6 +402,12 @@ so you never mint one by hand. See
 - Secrets are only ever referenced (`${env:…}`, `${file:…}`, `${vault:…}`);
   nothing sensitive belongs in the committed config, and nothing resolved is
   ever logged.
-- Not built: TLS termination on the listener (put it on the gateway), per-tenant
-  isolation in one process (run one process per tenant behind the gateway), and
-  binding an HTTP session to the identity that opened it.
+- TLS, and optional mutual TLS, terminate on the listener when `http.tls` is
+  configured; without it the port is plaintext and belongs behind a gateway.
+  Request bodies and in-flight requests are capped (`http.limits`).
+- Not built: per-tenant isolation in one process (run one process per tenant
+  behind the gateway), binding an HTTP session to the identity that opened it
+  (scopes always come from the current request's token, never from session
+  state, so a session id carries no privilege), and revocation of an unexpired
+  token (JWKS rotation withdraws a *key*; short token lifetimes are the
+  mitigation for a stolen one).

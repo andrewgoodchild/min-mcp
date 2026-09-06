@@ -6,7 +6,75 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Added — transport hardening
+
+- **TLS on the listener.** `http.tls.cert_file` / `key_file` terminate TLS in
+  `serve --http` itself; the banner reads `https://`. A certificate that cannot
+  be read, parsed, or matched to its key fails at **startup**, not per
+  connection. Paths resolve relative to the config file, like `spec:`.
+- **Mutual TLS.** `http.tls.client_ca_file` requires every connection to present
+  a client certificate chaining to that CA, closed during the handshake if not.
+  This authenticates the *channel*, not the caller: it is what makes
+  `auth.trusted_headers` safe to believe, by enforcing that the gateway is the
+  only route to the port instead of assuming it from network policy. Being a
+  real authentication boundary, it also satisfies the non-loopback bind guard.
+- **Request caps.** `http.limits.max_body_bytes` (default 1 MiB) refuses an
+  oversize body with 413 whether or not it declares a length, buffering nothing
+  past the cap (the value is handed to rmcp, whose own 4 MiB default would
+  otherwise silently override any larger setting);
+  `http.limits.max_in_flight` (default 256) bounds requests
+  the MCP service is inside at once across all connections, queueing rather than
+  failing past it. It bounds request *handling*, not concurrent upstream calls:
+  the permit is released when the response future resolves, and an SSE reply
+  resolves before the tool runs (measured — with a cap of 1, three concurrent 4s
+  calls still finish in ~4s). Upstream concurrency is governed by rate limits,
+  `timeout_s` and `breaker`.
+  Both are validated at startup — 0 is rejected rather than accepted as "hang
+  every request forever".
+- **Connection deadlines**, so a client that opens sockets and sends nothing
+  cannot pin tasks and descriptors indefinitely — the one allocation
+  `http.limits` cannot bound, since no request exists to count. A TLS handshake
+  gets 10s; a request head gets 30s on either scheme. The two differ on purpose:
+  hyper applies the head deadline to *every* request on a connection, so it is
+  also the idle keep-alive timeout, and reusing the handshake's 10s there would
+  drop connections whenever an agent paused to think, charging a fresh TCP (and
+  TLS) handshake to the next tool call. A long-lived SSE stream is unaffected —
+  the deadline is on reading a request, not on writing a response.
+- **Three tool-poisoning lint rules** — `hidden_text` (zero-width characters,
+  bidi overrides, tag characters in a name or description),
+  `model_directed_instruction` ("ignore previous instructions", "do not tell the
+  user"), and `secret_solicitation` (a local credential artifact like
+  `~/.ssh/id_rsa` that a remote tool cannot need). Tuned against real specs: all
+  three fire zero times across Stripe (589 ops) and GitHub (1,216 ops). Matching
+  credential *nouns* instead of artifacts flagged 18 GitHub tools, every one a
+  false positive, which is why the rule matches paths.
+
+### Changed
+
+- `serve --http` warns at startup when rate limits are configured but nothing
+  supplies a caller subject. Buckets key on the subject, so a gateway sending
+  `trusted_headers.scopes` without `trusted_headers.subject` gave authenticated
+  callers with distinct scopes a single shared bucket — one noisy tenant
+  rate-limiting everyone. The behaviour is unchanged and documented; it is now
+  visible instead of silent.
+- `serve --http` warns when binding a non-loopback address in plaintext, where
+  bearer tokens and gateway identity headers cross the network in the clear.
+
+### Security
+
+- TLS and the request caps close two of the three gaps the security notes listed
+  as "not built". The remaining one — per-tenant isolation in a single process —
+  stays deliberate: run one process per tenant. Session-identity binding is also
+  still absent, but scopes always come from the current request's token, never
+  from session state, so a session id carries no privilege.
+
+#### Dependencies
+
+`rustls`, `tokio-rustls` and `tower` become direct dependencies. All three were
+already in the tree (reqwest and rmcp pull them), so no new third-party code is
+introduced. rustls is pinned to the **`ring`** provider with
+`default-features = false`: its default feature set selects `aws_lc_rs`, which
+needs a C toolchain the Windows release build does not have.
 
 ## [0.2.0] — 2026-09-06
 
