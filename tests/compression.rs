@@ -5,7 +5,8 @@
 
 use std::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_minmcp");
+mod common;
+use common::BIN;
 
 fn inspect(config: &str) -> serde_yaml::Value {
     let out = Command::new(BIN)

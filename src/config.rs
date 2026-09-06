@@ -92,6 +92,11 @@ pub struct UpstreamConfig {
     /// Name of the env var holding the API key (never the key itself).
     #[serde(default)]
     pub auth_env: Option<String>,
+    /// The API key as a secret reference — `${env:NAME}`, `${file:/run/secrets/x}`,
+    /// or `${vault:path#field}` — for stores other than the environment. One of
+    /// `auth_env` / `api_key`, not both.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Optional Accept header (e.g. application/vnd.github+json).
     #[serde(default)]
     pub accept: Option<String>,
@@ -140,25 +145,129 @@ impl UpstreamConfig {
     }
 }
 
-/// Expand `${VAR}` occurrences in `s` from the environment. An unset variable is
-/// an error (fail loud rather than send an empty credential upstream).
-pub fn expand_env(s: &str) -> Result<String> {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| anyhow::anyhow!("unterminated ${{...}} in {s:?}"))?;
-        let var = &after[..end];
-        let val = std::env::var(var)
-            .map_err(|_| anyhow::anyhow!("env var {var} referenced as ${{{var}}} in the config is not set"))?;
-        out.push_str(&val);
-        rest = &after[end + 1..];
+/// A token-bucket limit: `calls` per `per_s` seconds, with `calls` as the burst.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Limit {
+    pub calls: u32,
+    #[serde(default = "default_per_s")]
+    pub per_s: u64,
+}
+
+fn default_per_s() -> u64 {
+    60
+}
+
+/// Fleet-wide rate limits on tool calls (search/details are free). Keyed by
+/// the caller's subject; every anonymous caller shares one bucket. A refused
+/// call is a `RATE_LIMITED` isError result with a retry-after.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimits {
+    /// Calls per caller, across all tools.
+    #[serde(default)]
+    pub per_caller: Option<Limit>,
+    /// Calls per (caller, tool).
+    #[serde(default)]
+    pub per_tool: Option<Limit>,
+}
+
+/// Secret stores beyond the environment. `${file:…}` needs no configuration;
+/// `${vault:…}` needs `vault`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsConfig {
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
+    /// Seconds a Vault read is cached (default 300), so a `user_supplied` field
+    /// costs one round-trip per TTL rather than one per call. `env` and `file`
+    /// are never cached — re-reading a mounted file is how rotation lands.
+    #[serde(default = "default_secret_ttl")]
+    pub cache_ttl_s: u64,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        SecretsConfig { vault: None, cache_ttl_s: default_secret_ttl() }
     }
-    out.push_str(rest);
-    Ok(out)
+}
+
+fn default_secret_ttl() -> u64 {
+    300
+}
+
+/// HashiCorp Vault / OpenBao, KV v2. Address and token fall back to the
+/// standard `VAULT_ADDR` / `VAULT_TOKEN` environment variables.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct VaultConfig {
+    /// e.g. `https://vault.example.com:8200` (default: `$VAULT_ADDR`).
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Vault Enterprise namespace, if any.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// KV v2 mount that `${vault:path#field}` paths are under (default `secret`).
+    #[serde(default = "default_vault_mount")]
+    pub mount: String,
+    /// PEM bundle for a private CA (default: `$VAULT_CACERT`).
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+    #[serde(default)]
+    pub auth: VaultAuth,
+}
+
+fn default_vault_mount() -> String {
+    "secret".to_string()
+}
+
+/// How min-mcp authenticates to Vault. Default: a token from `$VAULT_TOKEN`.
+/// Exactly one of `approle` / `kubernetes` may be set; both re-login when Vault
+/// rejects the token (403), so a token TTL shorter than the process is fine.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct VaultAuth {
+    /// Env var holding a Vault token (default `VAULT_TOKEN`).
+    #[serde(default)]
+    pub token_env: Option<String>,
+    #[serde(default)]
+    pub approle: Option<VaultAppRole>,
+    #[serde(default)]
+    pub kubernetes: Option<VaultKubernetes>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct VaultAppRole {
+    /// May reference the environment: `${VAULT_ROLE_ID}`.
+    pub role_id: String,
+    /// Keep it out of the file: `${VAULT_SECRET_ID}`.
+    pub secret_id: String,
+    #[serde(default = "default_approle_mount")]
+    pub mount: String,
+}
+
+fn default_approle_mount() -> String {
+    "approle".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct VaultKubernetes {
+    pub role: String,
+    /// The pod's projected service-account token.
+    #[serde(default = "default_sa_jwt_path")]
+    pub jwt_path: String,
+    #[serde(default = "default_k8s_mount")]
+    pub mount: String,
+}
+
+fn default_sa_jwt_path() -> String {
+    "/var/run/secrets/kubernetes.io/serviceaccount/token".to_string()
+}
+
+fn default_k8s_mount() -> String {
+    "kubernetes".to_string()
 }
 
 /// A composite tool: a linear sequence of steps (the useful subset of Arazzo),
@@ -524,6 +633,10 @@ pub struct Overlay {
     /// already fetched are returned with a PAGINATION notice.
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// Per-tool rate limit across ALL callers (a vendor quota, a fragile
+    /// endpoint) — on top of the fleet-wide `rate_limits`.
+    #[serde(default)]
+    pub rate_limit: Option<Limit>,
     /// Circuit breaker: after `consecutive_failures` isError results this tool
     /// is paused for `cooldown_s` (then one probe call is let through). The
     /// structural fix for identical-retry loops — measured burning 15 turns in
@@ -624,6 +737,38 @@ pub struct Auth {
     /// If set, the token's `iss` claim must equal this value.
     #[serde(default)]
     pub issuer: Option<String>,
+    /// Claim naming the caller, for audit lines (default `sub`).
+    #[serde(default = "default_subject_claim")]
+    pub subject_claim: String,
+    /// HTTP only. Behind a gateway that has ALREADY authenticated the caller,
+    /// take identity from these request headers instead of a bearer. Trust
+    /// them only when the gateway is the sole route to this port and strips
+    /// inbound copies — a client that can reach the port directly can set any
+    /// header it likes.
+    #[serde(default)]
+    pub trusted_headers: Option<TrustedHeaders>,
+    /// HTTP only. When identity is configured (a verifier or trusted headers),
+    /// a request carrying none is refused with 401 — unless this is true, in
+    /// which case it gets the process identity (`--jwt` / `--scopes`). Off by
+    /// default: an unauthenticated path next to an authenticated one is how
+    /// scoping gets bypassed.
+    #[serde(default)]
+    pub allow_anonymous: bool,
+}
+
+/// Identity headers set by a trusted fronting gateway (see `Auth::trusted_headers`).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHeaders {
+    /// Header carrying the caller's scopes, space- or comma-separated.
+    pub scopes: String,
+    /// Header carrying the caller's identity, for audit lines.
+    #[serde(default)]
+    pub subject: Option<String>,
+}
+
+fn default_subject_claim() -> String {
+    "sub".to_string()
 }
 
 // Manual Default so an ABSENT `auth:` section still yields the "scope" claim
@@ -638,14 +783,26 @@ impl Default for Auth {
             scope_claim: default_scope_claim(),
             audience: None,
             issuer: None,
+            subject_claim: default_subject_claim(),
+            trusted_headers: None,
+            allow_anonymous: false,
         }
     }
 }
 
 impl Auth {
-    /// Effective HS256 secret: env var overrides the config field.
+    /// Effective HS256 secret: env var overrides the config field. The config
+    /// value may be a `${…}` reference; the caller resolves it.
     pub fn secret(&self) -> Option<String> {
         std::env::var("MINMCP_JWT_SECRET").ok().or_else(|| self.jwt_secret.clone())
+    }
+
+    /// Is a JWT verifier configured at all (any key source)?
+    pub fn has_verifier(&self) -> bool {
+        self.jwks_url.is_some()
+            || self.jwt_public_key.is_some()
+            || self.jwt_public_key_file.is_some()
+            || self.secret().is_some()
     }
 
     /// RS256 public-key PEM, from the inline field or the referenced file.
@@ -711,11 +868,19 @@ pub struct Config {
     /// Per-tool overlay hints are additive on top of these.
     #[serde(default)]
     pub error_hints: Vec<ErrorHint>,
-    /// If set, append one NDJSON line per search/details/call event to this file
-    /// (path relative to the config). Observability for what the agent actually
-    /// did — which tools it searched, selected, and called, and their origins.
+    /// If set, append one NDJSON audit line per search/details/call/… event to
+    /// this file (path relative to the config), or to `stderr` — the container
+    /// path, where the platform's log shipper forwards it to the SIEM. Every
+    /// line carries the caller, the tool, its origin, outcome, latency, and
+    /// result size; never the arguments.
     #[serde(default)]
     pub log_file: Option<String>,
+    /// Fleet-wide token-bucket limits on tool calls. See [`RateLimits`].
+    #[serde(default)]
+    pub rate_limits: RateLimits,
+    /// Secret stores for `${…}` references. See [`SecretsConfig`].
+    #[serde(default)]
+    pub secrets: SecretsConfig,
     /// tool_id -> index into `overlays`, so per-call lookup is O(1) instead of a
     /// linear scan. Built at load; not part of the config file.
     #[serde(skip)]
@@ -751,7 +916,7 @@ impl Config {
                 }
             }
             if let Some(log) = &cfg.log_file {
-                if !PathBuf::from(log).is_absolute() {
+                if log != "stderr" && !PathBuf::from(log).is_absolute() {
                     cfg.log_file = Some(base.join(log).to_string_lossy().into_owned());
                 }
             }
@@ -801,6 +966,29 @@ impl Config {
             if up.is_spec() && up.base_url.is_none() {
                 anyhow::bail!("spec upstream {:?} needs `base_url`", up.name);
             }
+            if up.auth_env.is_some() && up.api_key.is_some() {
+                anyhow::bail!(
+                    "upstream {:?} sets both `auth_env` and `api_key`; use one (api_key takes a \
+                     ${{…}} reference, auth_env names an env var)",
+                    up.name
+                );
+            }
+        }
+        if let Some(v) = &self.secrets.vault {
+            if v.auth.approle.is_some() && v.auth.kubernetes.is_some() {
+                anyhow::bail!("secrets.vault.auth: set either `approle` or `kubernetes`, not both");
+            }
+        }
+        if let Some(t) = &self.auth.trusted_headers {
+            if t.scopes.trim().is_empty() {
+                anyhow::bail!("auth.trusted_headers.scopes must name a header");
+            }
+        }
+        if self.auth.allow_anonymous && !self.auth.has_verifier() && self.auth.trusted_headers.is_none() {
+            anyhow::bail!(
+                "auth.allow_anonymous is set but no caller identity is configured (a JWT verifier \
+                 or trusted_headers) — without one every request is already the process identity"
+            );
         }
         let mut seen = HashSet::new();
         for o in &self.overlays {
@@ -1100,13 +1288,40 @@ overlays:
     }
 
     #[test]
-    fn expand_env_substitutes_and_errors_on_missing() {
-        std::env::set_var("MINMCP_TEST_TOKEN", "sekret");
-        assert_eq!(expand_env("Bearer ${MINMCP_TEST_TOKEN}").unwrap(), "Bearer sekret");
-        assert_eq!(expand_env("no vars here").unwrap(), "no vars here");
-        assert!(expand_env("${MINMCP_DEFINITELY_UNSET_VAR_XYZ}").is_err());
-        assert!(expand_env("${unterminated").is_err());
-        std::env::remove_var("MINMCP_TEST_TOKEN");
+    fn rate_limits_secrets_and_identity_keys_parse_and_validate() {
+        let c = cfg(
+            "upstreams: []\nrate_limits:\n  per_caller: {calls: 100}\n  per_tool: {calls: 5, per_s: 10}\n\
+             overlays:\n  - tool: a.b\n    rate_limit: {calls: 2, per_s: 1}\n\
+             secrets:\n  vault:\n    address: https://v.example:8200\n    auth: {approle: {role_id: r, secret_id: \"${X}\"}}\n\
+             auth:\n  jwt_secret: s\n  subject_claim: email\n  trusted_headers: {scopes: X-Scopes, subject: X-User}\n  allow_anonymous: true\n",
+        );
+        assert_eq!(c.rate_limits.per_caller.unwrap().per_s, 60, "per_s defaults to 60");
+        assert_eq!(c.rate_limits.per_tool.unwrap().calls, 5);
+        assert_eq!(c.overlay_for("a.b").unwrap().rate_limit.unwrap().calls, 2);
+        let v = c.secrets.vault.as_ref().unwrap();
+        assert_eq!(v.mount, "secret");
+        assert_eq!(v.auth.approle.as_ref().unwrap().mount, "approle");
+        assert_eq!(c.secrets.cache_ttl_s, 300);
+        assert_eq!(c.auth.subject_claim, "email");
+        assert!(c.auth.allow_anonymous && c.auth.has_verifier());
+        let anon = Config::from_yaml("upstreams: []\nauth:\n  allow_anonymous: true\n").unwrap_err();
+        assert!(format!("{anon:#}").contains("allow_anonymous"), "{anon:#}");
+        // both vault logins → rejected; both key sources on an upstream → rejected
+        let both = Config::from_yaml(
+            "upstreams: []\nsecrets:\n  vault:\n    auth:\n      approle: {role_id: r, secret_id: s}\n      kubernetes: {role: k}\n",
+        )
+        .unwrap_err();
+        assert!(format!("{both:#}").contains("not both"), "{both:#}");
+        let keys = Config::from_yaml(
+            "upstreams:\n  - name: a\n    spec: s.json\n    base_url: http://h\n    auth_env: K\n    api_key: \"${file:/x}\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{keys:#}").contains("auth_env"), "{keys:#}");
+        // absent sections keep their defaults
+        let d = cfg("upstreams: []\n");
+        assert!(d.rate_limits.per_caller.is_none() && d.secrets.vault.is_none());
+        assert_eq!(d.auth.subject_claim, "sub");
+        assert!(!d.auth.has_verifier());
     }
 
     #[test]

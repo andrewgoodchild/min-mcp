@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-const BIN: &str = env!("CARGO_BIN_EXE_minmcp");
+mod common;
+use common::BIN;
+
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Server {
@@ -27,8 +29,13 @@ struct Server {
 
 impl Server {
     fn spawn(config: &str) -> Self {
+        Self::spawn_with_env(config, &[])
+    }
+
+    fn spawn_with_env(config: &str, env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(BIN)
             .args(["serve", "--config", config])
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -250,6 +257,28 @@ fn per_tool_timeout_fires_and_repeated_timeouts_trip_the_breaker() {
     assert!(e3);
     assert!(t3.contains("BREAKER_OPEN"), "breaker must trip on repeated timeouts: {t3}");
     assert!(started.elapsed() < Duration::from_secs(1), "refusal is local, no upstream wait");
+}
+
+#[cfg(unix)] // the fixture upstream is a /bin/sh script
+#[test]
+fn a_dead_upstream_is_respawned_on_the_next_call() {
+    // Life 1 dies mid-call: the agent gets an UPSTREAM_ERROR result, not a
+    // protocol error. The next call respawns the child (re-initialized) and
+    // succeeds — no restart of min-mcp, no operator.
+    let mark = std::env::temp_dir().join(format!("minmcp_flaky_{}", std::process::id()));
+    let _ = std::fs::remove_file(&mark);
+    let mut s = Server::spawn_with_env(
+        "tests/fixtures/e2e-flaky.yaml",
+        &[("MINMCP_FLAKY_MARK", mark.to_str().unwrap())],
+    );
+    let (t1, e1) = s.call("call_tool", json!({"tool_id": "flaky.flip"}));
+    assert!(e1 && t1.contains("UPSTREAM_ERROR"), "the first life dies mid-call: {t1}");
+    // The crash-loop guard allows a respawn only once the previous start is
+    // at least a second old.
+    std::thread::sleep(Duration::from_millis(1200));
+    let (t2, e2) = s.call("call_tool", json!({"tool_id": "flaky.flip"}));
+    assert!(!e2 && t2.contains("\"life\":2"), "the next call must respawn and succeed: {t2}");
+    let _ = std::fs::remove_file(&mark);
 }
 
 #[test]

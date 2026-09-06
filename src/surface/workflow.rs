@@ -6,11 +6,16 @@ impl Surface {
     /// Run a composite: each step resolves its inputs from the workflow inputs +
     /// prior step outputs, calls its tool, and extracts named outputs. One
     /// upstream chain, one round-trip for the agent. A failed step aborts.
-    pub(super) async fn execute_workflow(&mut self, wf: &crate::config::Workflow, inputs: Value) -> Result<Value> {
+    pub(super) async fn execute_workflow(
+        &self,
+        caller: &Caller,
+        wf: &crate::config::Workflow,
+        inputs: Value,
+    ) -> Result<Value> {
         let mut outs: HashMap<String, Value> = HashMap::new();
         for step in &wf.steps {
             let args = resolve_input(&step.input, &inputs, &outs);
-            let result = self.dispatch(&step.tool, args, &[]).await?;
+            let result = self.dispatch(caller, &step.tool, args, &[]).await?;
             if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
                 let text = result_text(&result);
                 return Ok(text_result(
@@ -30,7 +35,7 @@ impl Surface {
             .iter()
             .map(|(name, expr)| (name.clone(), resolve_input(expr, &inputs, &outs)))
             .collect();
-        self.log_event("workflow", json!({"workflow": wf.id, "steps": wf.steps.len()}));
+        self.log_event(caller, "workflow", json!({"workflow": wf.id, "steps": wf.steps.len()}));
         Ok(text_result(serde_json::to_string(&Value::Object(final_out)).unwrap_or_default(), false))
     }
 }

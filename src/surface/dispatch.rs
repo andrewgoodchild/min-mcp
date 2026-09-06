@@ -1,45 +1,54 @@
-//! The call path: preflight, cache, headers, pagination, response shaping, error hints.
+//! The call path: visibility, rate limits, preflight, cache, headers, the
+//! upstream call, pagination, response shaping, error hints, audit.
+
+use std::time::Instant;
 
 use super::*;
 
 impl Surface {
-    pub(super) async fn dispatch(&mut self, tool_id: &str, arguments: Value, fields: &[String]) -> Result<Value> {
-        let Some(t) = self.visible_def(tool_id) else {
+    pub(super) async fn dispatch(&self, caller: &Caller, tool_id: &str, arguments: Value, fields: &[String]) -> Result<Value> {
+        let started = Instant::now();
+        let Some(t) = self.visible_def(caller, tool_id) else {
             return Ok(text_result(
                 format!(
                     "unknown tool_id {tool_id:?} —{} {}",
-                    self.suggest_near_misses(tool_id),
+                    self.suggest_near_misses(caller, tool_id),
                     self.recovery()
                 ),
                 true,
             ));
         };
         let (idx, original_name, read_only) = (t.upstream_idx, t.name.clone(), t.read_only);
-        // Everything overlay-derived, from ONE lookup (cloned/finished before
-        // the &mut upstreams call below): preflight override (global default is
-        // ON — a local structured error beats a raw upstream dump), per-tool
-        // timeout + breaker, request defaults, and pagination config.
+        // One overlay lookup for the whole call path: limits, the guards below,
+        // the response transform, and the cache all read from this.
+        let overlay = self.config.overlay_for(tool_id);
+        // Rate limits — after visibility (a limited caller learns nothing about
+        // hidden tools), before any work. A refusal is a continuation prompt.
+        if let Some((what, retry_in_s)) = self.rate_limited(caller, tool_id, overlay) {
+            self.log_event(caller, "rate_limited", json!({"tool_id": tool_id, "limit": what, "retry_in_s": retry_in_s}));
+            return Ok(text_result(
+                format!(
+                    "RATE_LIMITED: {what} — retry in ~{retry_in_s}s. Do not retry before then; \
+                     batch the work or use a different tool meanwhile."
+                ),
+                true,
+            ));
+        }
+        // Everything overlay-derived, from ONE lookup: preflight override (global
+        // default is ON — a local structured error beats a raw upstream dump),
+        // per-tool timeout + breaker, request defaults, and pagination config.
         let mut arguments = arguments;
-        let (preflight_on, timeout_s, breaker_cfg, paginate) = {
-            let ov = self.config.overlay_for(tool_id);
-            if let Some(o) = ov {
-                for (path, val) in &o.defaults {
-                    crate::project::set_default(&mut arguments, path, val.clone());
-                }
+        if let Some(o) = overlay {
+            for (path, val) in &o.defaults {
+                crate::project::set_default(&mut arguments, path, val.clone());
             }
-            (
-                ov.and_then(|o| o.preflight).unwrap_or(self.config.preflight),
-                ov.and_then(|o| o.timeout_s),
-                ov.and_then(|o| o.breaker.clone()),
-                ov.and_then(|o| o.paginate.clone()),
-            )
-        };
+        }
+        let preflight_on = overlay.and_then(|o| o.preflight).unwrap_or(self.config.preflight);
+        let timeout_s = overlay.and_then(|o| o.timeout_s);
+        let breaker_cfg = overlay.and_then(|o| o.breaker.as_ref());
+        let paginate = overlay.and_then(|o| o.paginate.as_ref());
         // Clamped to the transport ceiling: `timeout_s` TIGHTENS the 120s default,
-        // it never extends it. Unclamped, an HTTP/spec deadline replaced reqwest's
-        // client timeout (a timeout_s: 600 held the shared Surface mutex for ten
-        // minutes, freezing every session), while stdio's 120s per-line read made
-        // the same value unenforceable — the transports diverged and both
-        // contradicted the config doc.
+        // it never extends it.
         let deadline = timeout_s
             .map(|t| std::time::Duration::from_secs(t.min(crate::upstream::TRANSPORT_CEILING_S)));
         // Resolve the patched schema up front (owned) for pre-flight. Only when
@@ -68,13 +77,13 @@ impl Surface {
             None => Vec::new(),
         };
         // User-supplied fields: inject the authoritative value the agent can't see
-        // or fabricate (it was stripped from the schema; source is session/env).
+        // or fabricate (it was stripped from the schema; source is env/file/vault).
         // Runs before pre-flight so the injected value satisfies the schema; an
         // unresolvable source is a clear local error, never a fabricated success.
-        if let Some(us) = self.user_supplied.get(tool_id).cloned() {
+        if let Some(us) = self.user_supplied.get(tool_id) {
             for (path, source) in us {
-                match resolve_user_source(&source) {
-                    Some(v) => crate::project::set(&mut arguments, &path, Value::String(v)),
+                match self.secrets.resolve_source(source).await {
+                    Some(v) => crate::project::set(&mut arguments, path, Value::String(v)),
                     None => {
                         let e = json!({
                             "error": "missing_user_supplied_value", "field": path,
@@ -115,11 +124,10 @@ impl Surface {
         // A call is a "read" for coherence purposes if the upstream says so or
         // an overlay opted it into the cache; anything else is assumed to write.
         let is_read = read_only == Some(true) || cacheable;
-        let cached: Option<Value> = cache_key
-            .as_ref()
-            .and_then(|k| self.read_cache.get(k))
-            .filter(|(at, _)| at.elapsed() < ttl)
-            .map(|(_, v)| v.clone());
+        let cached: Option<Value> = cache_key.as_ref().and_then(|k| {
+            let cache = lock(&self.read_cache);
+            cache.get(k).filter(|(at, _)| at.elapsed() < ttl).map(|(_, v)| v.clone())
+        });
         let from_cache = cached.is_some();
         let mut was_probe = false;
         let mut result = match cached {
@@ -128,11 +136,14 @@ impl Surface {
                 // Circuit breaker: refuse locally while open — an agent must not
                 // burn turns re-calling a tool that fails identically (law 6,
                 // made structural). A cache hit above never reaches this gate.
-                if let Some(b) = &breaker_cfg {
-                    let now = std::time::Instant::now();
-                    match self.breakers.entry(tool_id.to_string()).or_default().check(b, now) {
+                if let Some(b) = breaker_cfg {
+                    let decision = lock(&self.breakers)
+                        .entry(tool_id.to_string())
+                        .or_default()
+                        .check(b, Instant::now());
+                    match decision {
                         breaker::Decision::Block { failures, retry_in_s } => {
-                            self.log_event("breaker", json!({"tool_id": tool_id, "state": "open"}));
+                            self.log_event(caller, "breaker", json!({"tool_id": tool_id, "state": "open"}));
                             return Ok(text_result(
                                 format!(
                                     "BREAKER_OPEN: {tool_id} has failed {failures} time(s) in a row and is paused for ~{retry_in_s}s. \
@@ -145,10 +156,9 @@ impl Surface {
                     }
                 }
                 // The deadline is applied INSIDE each backend so a stdio write
-                // is never cancelled mid-frame (a dropped half-written line
-                // would merge with the next request into one corrupt frame).
-                // Clone the arguments only when pagination will reuse them.
-                let call_args = match &paginate {
+                // is never cancelled mid-frame. Clone the arguments only when
+                // pagination will reuse them.
+                let call_args = match paginate {
                     Some(_) => arguments.clone(),
                     None => std::mem::take(&mut arguments),
                 };
@@ -175,14 +185,14 @@ impl Surface {
                         // died, the remote returned a non-2xx, the JSON-RPC layer
                         // errored). Rendered as an isError result the agent can
                         // act on — the same shape a spec upstream's transport
-                        // failure already took — instead of a JSON-RPC protocol
+                        // failure already takes — instead of a JSON-RPC protocol
                         // error, which many clients surface as a hard failure the
                         // model never gets to reason about. Falling through the
-                        // normal path below keeps the breaker, cache-bust, hints,
-                        // and logging identical to any other failed call.
+                        // normal path keeps breaker, cache-bust, hints, and audit
+                        // identical to any other failed call.
                         text_result(
                             format!(
-                                "UPSTREAM_ERROR: {tool_id} failed before returning a result: {e:#}. {} \
+                                "UPSTREAM_ERROR: {tool_id} — the upstream did not return a tool result: {e:#}. {} \
                                  If this repeats, the upstream may be down — use a different tool or report it.",
                                 crate::upstream::TIMEOUT_GUIDANCE
                             ),
@@ -193,33 +203,27 @@ impl Surface {
             }
         };
         let mut is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
-        // The usage prior counts SUCCESSES, not attempts. It used to fire on every
-        // path — preflight rejections that never left the proxy, timeouts, upstream
-        // isError — which promoted tools in search ranking *by failing*: the exact
-        // opposite of the breaker's philosophy, and a feedback loop for confusable
-        // tools (the agent keeps picking the wrong sibling, the wrong sibling keeps
-        // rising). Found when the recall eval's own failing calls warmed the prior
-        // and flipped a correct top-1 (PostPrices behind PostProducts at 2 failed
-        // "uses" — the 1.16x boost outweighed a close lexical margin).
+        // The usage prior counts SUCCESSES, not attempts: a tool must never rise
+        // in search ranking by failing.
         if !is_error {
             self.index.record_use(tool_id);
         }
         if !from_cache {
             // Feed the breaker the PRIMARY call's outcome (cache hits never count).
-            if let Some(b) = &breaker_cfg {
-                self.breakers
+            if let Some(b) = breaker_cfg {
+                lock(&self.breakers)
                     .entry(tool_id.to_string())
                     .or_default()
-                    .on_result(b, is_error, was_probe, std::time::Instant::now());
+                    .on_result(b, is_error, was_probe, Instant::now());
             }
             // Follow pagination and concatenate before any response shaping, so the
             // agent gets one complete list instead of hand-rolling a cursor loop.
             // (A cache hit already stored the merged list.)
             let mut partial_pages = false;
-            if let Some(p) = &paginate {
+            if let Some(p) = paginate {
                 if !is_error {
                     let (merged, partial) = self
-                        .paginate(idx, &original_name, arguments, &extra_headers, result, p, deadline)
+                        .paginate(caller, idx, &original_name, arguments, &extra_headers, result, p, deadline)
                         .await?;
                     result = merged;
                     partial_pages = partial;
@@ -228,23 +232,21 @@ impl Surface {
             }
             // Cache only clean successes (an error result must never be
             // replayed) — and a pagination run that stopped early is NOT clean:
-            // its merged list is known-incomplete, and serving it for the full
-            // TTL would replay the gap long after the upstream recovered.
-            // Only reasonably-sized ones — 512 entries of
-            // multi-MB pre-truncation payloads would be a memory foot-gun.
-            // (The size probe runs only when this call is actually cacheable.)
+            // its merged list is known-incomplete. Only reasonably-sized ones —
+            // 512 entries of multi-MB payloads would be a memory foot-gun.
             if !is_error && !partial_pages {
                 if let Some(k) = cache_key {
                     const CACHE_ENTRY_MAX_BYTES: usize = 262_144;
                     if json_len(&result) <= CACHE_ENTRY_MAX_BYTES {
-                        if self.read_cache.len() >= READ_CACHE_MAX_ENTRIES {
+                        let mut cache = lock(&self.read_cache);
+                        if cache.len() >= READ_CACHE_MAX_ENTRIES {
                             // bounded: drop expired first; if still full, start fresh
-                            self.read_cache.retain(|_, (at, _)| at.elapsed() < ttl);
-                            if self.read_cache.len() >= READ_CACHE_MAX_ENTRIES {
-                                self.read_cache.clear();
+                            cache.retain(|_, (at, _)| at.elapsed() < ttl);
+                            if cache.len() >= READ_CACHE_MAX_ENTRIES {
+                                cache.clear();
                             }
                         }
-                        self.read_cache.insert(k, (std::time::Instant::now(), result.clone()));
+                        cache.insert(k, (Instant::now(), result.clone()));
                     }
                 }
             }
@@ -260,14 +262,7 @@ impl Surface {
         // transform (remove/rename/set, then a jq escape hatch) runs ALWAYS —
         // even on errors, to strip secrets — and the caller's `fields` projection
         // narrows further, on success only (never hide an error payload).
-        // Borrow the overlay's transform (no per-call clone); the immutable
-        // config borrow ends before the &mut self logging below.
-        // Gate the transform on `when` (success/error/always).
-        let rt = self
-            .config
-            .overlay_for(tool_id)
-            .map(|o| &o.response)
-            .filter(|r| r.applies(is_error));
+        let rt = overlay.map(|o| &o.response).filter(|r| r.applies(is_error));
         let has_transform = rt.map(|r| !r.is_noop()).unwrap_or(false);
         let keep: &[String] = if is_error { &[] } else { fields };
         if has_transform || !keep.is_empty() {
@@ -284,27 +279,86 @@ impl Surface {
         }
         // NOTE: no truncation here. dispatch() serves two audiences — the agent
         // (via Surface::call / cli_call) and internal machinery (workflow step
-        // outputs, verify assertions) that must read the FULL result: truncating
-        // here cut >8KB step results mid-JSON, every output path resolved to
-        // None, and the next step received the literal '$steps.…' placeholder.
-        // The agent-facing budget is applied at the boundary in Surface::call.
-        self.apply_error_hints(tool_id, &mut result);
+        // outputs, verify assertions) that must read the FULL result. The
+        // agent-facing budget is applied at the boundary in Surface::call.
+        self.apply_error_hints(caller, tool_id, &mut result);
         // Nudge (law 6): a large result the caller didn't project is the teachable
         // moment to point at `fields`. Only in three_tool, where call_tool exists.
         if self.config.mode == Mode::ThreeTool && fields.is_empty() && !is_error {
             nudge_projection(&mut result);
         }
-        // observability: which tool was called, where it routed, and whether it
-        // errored (owned strings first so the upstream borrow ends before &mut).
-        let (upstream, origin) = {
+        // Audit: who called what, where it routed, how it went, how long it took,
+        // how much came back. Arguments are deliberately NOT logged — they carry
+        // customer data and injected secrets. Guarded, because measuring the
+        // result and resolving the origin are real work on a large payload and
+        // there is nowhere to write them when no audit sink is configured.
+        if self.log.is_some() {
             let b = &self.upstreams[idx];
-            (b.name().to_string(), b.origin(&original_name))
-        };
-        self.log_event(
-            "call",
-            json!({"tool_id": tool_id, "upstream": upstream, "origin": origin, "is_error": is_error, "cached": from_cache}),
-        );
+            self.log_event(
+                caller,
+                "call",
+                json!({
+                    "tool_id": tool_id, "upstream": b.name(), "origin": b.origin(&original_name),
+                    "is_error": is_error, "cached": from_cache,
+                    "latency_ms": started.elapsed().as_millis() as u64,
+                    "result_bytes": json_len(&result),
+                }),
+            );
+        }
         Ok(result)
+    }
+
+    /// The first exhausted limit for this call, as (what, retry_in_s): the
+    /// caller's overall budget, the caller's budget on this tool, then the
+    /// tool's budget across all callers (overlay `rate_limit`). Every anonymous
+    /// caller shares one bucket — over HTTP without identity that is the whole
+    /// port.
+    ///
+    /// A refused call costs nothing: tiers an earlier pass already charged are
+    /// refunded, or a per-tool refusal would quietly drain the caller's whole
+    /// budget and lock them out of every other tool.
+    fn rate_limited(
+        &self,
+        caller: &Caller,
+        tool_id: &str,
+        overlay: Option<&crate::config::Overlay>,
+    ) -> Option<(String, u64)> {
+        let now = Instant::now();
+        let who = caller.label();
+        let rl = &self.config.rate_limits;
+        // (bucket, limit, what to tell the agent) — one list, so adding a tier
+        // is one entry rather than another copy of the take/refund dance.
+        let tiers = [
+            rl.per_caller.map(|l| {
+                (format!("caller:{who}"), l, format!("caller {who} exceeded {} calls per {}s", l.calls, l.per_s))
+            }),
+            rl.per_tool.map(|l| {
+                (
+                    format!("tool:{who}:{tool_id}"),
+                    l,
+                    format!("caller {who} exceeded {} calls per {}s on {tool_id}", l.calls, l.per_s),
+                )
+            }),
+            overlay.and_then(|o| o.rate_limit).map(|l| {
+                (
+                    format!("overlay:{tool_id}"),
+                    l,
+                    format!("{tool_id} is limited to {} calls per {}s across all callers", l.calls, l.per_s),
+                )
+            }),
+        ];
+        let mut charged: Vec<(&String, crate::config::Limit)> = Vec::new();
+        for (key, limit, message) in tiers.iter().flatten() {
+            let Err(retry_in_s) = self.limits.take(key, *limit, now) else {
+                charged.push((key, *limit));
+                continue;
+            };
+            for (k, l) in charged {
+                self.limits.refund(k, l, now);
+            }
+            return Some((message.clone(), retry_in_s));
+        }
+        None
     }
 
     /// Follow a paginated list: from `first`, read the next cursor, re-call with it
@@ -313,7 +367,8 @@ impl Surface {
     /// gate set false), so downstream shaping sees one complete result.
     #[allow(clippy::too_many_arguments)] // internal call-path plumbing, one caller
     async fn paginate(
-        &mut self,
+        &self,
+        caller: &Caller,
         idx: usize,
         name: &str,
         mut args: Value,
@@ -351,9 +406,7 @@ impl Surface {
             prev_cursor = Some(cursor.clone());
             crate::project::set(&mut args, &p.into, cursor);
             // A follow-up failure — isError, timeout, or transport — must NOT
-            // discard the pages already fetched. `?` here used to let a follow-up
-            // TimeoutElapsed escape as a protocol error, throwing away pages 1..k
-            // and skipping the PAGINATION notice; now every failure shape stops
+            // discard the pages already fetched: every failure shape stops
             // pagination and surfaces on the merged (partial) result instead.
             let next = match self.upstreams[idx].call_tool(name, args.clone(), headers, deadline).await {
                 Ok(n) => n,
@@ -395,13 +448,13 @@ impl Surface {
                 )}));
             }
         }
-        self.log_event("paginate", json!({"tool": name, "pages": pages, "items": count, "partial": partial_error}));
+        self.log_event(caller, "paginate", json!({"tool": name, "pages": pages, "items": count, "partial": partial_error}));
         Ok((merged, partial_error))
     }
 
     /// Errors are continuation prompts (law 6): append recovery instructions
     /// when a global or per-tool hint matches the result text.
-    fn apply_error_hints(&self, tool_id: &str, result: &mut Value) {
+    fn apply_error_hints(&self, caller: &Caller, tool_id: &str, result: &mut Value) {
         let text: String = result
             .get("content")
             .and_then(Value::as_array)
@@ -426,7 +479,7 @@ impl Surface {
         let schema = matched
             .iter()
             .any(|h| h.field.is_some())
-            .then(|| self.visible_def(tool_id).map(|t| self.resolved_schema(t)))
+            .then(|| self.visible_def(caller, tool_id).map(|t| self.resolved_schema(t)))
             .flatten();
         if let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) {
             for h in matched {

@@ -19,8 +19,11 @@
 //!    `update`→`updat`, which would never match the affinity table's literals.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 
 use bm25::{Language, SearchEngine, SearchEngineBuilder, Tokenizer};
+
+use crate::sync::{read, write};
 
 /// BM25 parameters. These are the `bm25` crate's defaults, deliberately: the
 /// previous implementation used k1=1.5/b=0.4, and which pair is better on tool
@@ -273,7 +276,10 @@ pub struct IndexedTool {
 pub struct Index {
     engine: SearchEngine<String, u32, ToolTokenizer>,
     meta: HashMap<String, Meta>,
-    usage: HashMap<String, u64>,
+    /// The usage prior — the one piece of the index that changes after build.
+    /// An `RwLock`, so concurrent searches read it in parallel; only recording
+    /// a successful call takes the write side, and briefly.
+    usage: RwLock<HashMap<String, u64>>,
     opts: IndexOptions,
 }
 
@@ -322,11 +328,11 @@ impl Index {
             .build()
         };
 
-        Index { engine, meta, usage: HashMap::new(), opts }
+        Index { engine, meta, usage: RwLock::new(HashMap::new()), opts }
     }
 
-    pub fn record_use(&mut self, tool_id: &str) {
-        *self.usage.entry(tool_id.to_string()).or_default() += 1;
+    pub fn record_use(&self, tool_id: &str) {
+        *write(&self.usage).entry(tool_id.to_string()).or_default() += 1;
     }
 
     /// Id tokens implied by the query's verb words (e.g. "update" -> {update,
@@ -357,6 +363,7 @@ impl Index {
         // would make those promotions unreachable. `matches` already restricts to
         // documents sharing a query token, so this is not a full scan.
         let mut scored: Vec<(String, f64)> = Vec::new();
+        let usage = read(&self.usage);
         for hit in self.engine.search(query, None) {
             let score = hit.score as f64;
             // The crate's IDF is the Robertson form, (N - df + 0.5)/(df + 0.5),
@@ -389,7 +396,7 @@ impl Index {
                 // near-ties break toward shorter ids (canonical operations)
                 score *= 1.0 / (1.0 + 0.04 * m.id_token_count);
             }
-            let uses = *self.usage.get(&tool_id).unwrap_or(&0) as f64;
+            let uses = *usage.get(&tool_id).unwrap_or(&0) as f64;
             score *= 1.0 + USAGE_DAMP * (1.0 + uses).ln();
             scored.push((tool_id, score));
         }
@@ -585,7 +592,7 @@ mod tests {
 
     #[test]
     fn usage_prior_boosts_but_is_damped() {
-        let mut idx = fixture();
+        let idx = fixture();
         for _ in 0..50 {
             idx.record_use("stripe.GetCustomers");
         }

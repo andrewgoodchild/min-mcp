@@ -6,24 +6,8 @@
 //!
 //! `cfg(unix)` where a fixture needs `/bin/sh`; the rest is portable.
 
-use std::process::Command;
-
-const BIN: &str = env!("CARGO_BIN_EXE_minmcp");
-
-/// HS256 tokens signed with the fixture secret `test-secret`, `exp` in 2100.
-/// Hardcoded rather than minted at runtime because `jsonwebtoken` is a
-/// dependency of the binary, not of this test.
-const TOKEN_WRITE: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzY29wZSI6InN0b3JlLndyaXRlIiwiZXhwIjo0MTAyNDQ0ODAwfQ.y7gSKROF0_0tej7CTwv2pwqds5YKn6UqPqUojnZqXow";
-const TOKEN_READ: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzY29wZSI6InN0b3JlLnJlYWQiLCJleHAiOjQxMDI0NDQ4MDB9.EuAvpxVlc9I6NeYBSpMJEH7ThR4guKjGNx-2KyX7wjg";
-
-fn run(args: &[&str]) -> (String, String, bool) {
-    let out = Command::new(BIN).args(args).output().expect("run minmcp");
-    (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-        out.status.success(),
-    )
-}
+mod common;
+use common::{run, TOKEN_READ, TOKEN_WRITE};
 
 #[cfg(unix)]
 #[test]

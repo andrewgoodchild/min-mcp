@@ -38,8 +38,10 @@
 //!   ($refs unresolved), so body-parameter vocabulary is only partly present.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 use crate::index::{Index, IndexOptions, IndexedTool};
+use crate::sync::lock;
 
 /// Cap on remembered ranked ids per challenger. Beyond this a "miss" is reported,
 /// which is the honest answer — nothing reads past a window this deep anyway.
@@ -69,7 +71,9 @@ struct Turn {
 
 pub(super) struct Shadow {
     challengers: Vec<Challenger>,
-    turn: Option<Turn>,
+    /// The last search's rankings, awaiting the call that labels them. One per
+    /// process (see KNOWN LIMITS above); behind a lock so the surface is `&self`.
+    turn: Mutex<Option<Turn>>,
 }
 
 /// One row to log when a call reveals what the agent wanted.
@@ -85,7 +89,7 @@ impl Shadow {
     /// every method below becomes a no-op.
     pub(super) fn new(corpus: &[IndexedTool], enabled: bool) -> Self {
         if !enabled {
-            return Shadow { challengers: Vec::new(), turn: None };
+            return Shadow { challengers: Vec::new(), turn: Mutex::new(None) };
         }
         let variants: &[(&'static str, IndexOptions)] = &[
             // The shipped configuration, measured through the *challenger* path
@@ -113,7 +117,7 @@ impl Shadow {
             .iter()
             .map(|(method, opts)| Challenger { method, index: Index::build_with(corpus, *opts) })
             .collect();
-        Shadow { challengers, turn: None }
+        Shadow { challengers, turn: Mutex::new(None) }
     }
 
     pub(super) fn enabled(&self) -> bool {
@@ -123,9 +127,9 @@ impl Shadow {
     /// Run every challenger over a query the incumbent just answered, and remember
     /// the rankings. `served` is the incumbent's own result, kept so one log row can
     /// compare like with like.
-    pub(super) fn observe_search(&mut self, query: &str, served: &[String]) {
+    pub(super) fn observe_search(&self, query: &str, served: &[String]) {
         if !self.enabled() || query.chars().count() > MAX_QUERY_CHARS {
-            self.turn = None;
+            *lock(&self.turn) = None;
             return;
         }
         let ranked = self
@@ -141,7 +145,7 @@ impl Shadow {
                 (c.method, ids)
             })
             .collect();
-        self.turn = Some(Turn {
+        *lock(&self.turn) = Some(Turn {
             ranked,
             served: served.iter().take(MAX_REMEMBERED).cloned().collect(),
             scored: HashSet::new(),
@@ -155,11 +159,12 @@ impl Shadow {
     /// `eligible` gates out ids that aren't in the searchable surface at all
     /// (composites invoked directly, a hand-typed id): no retriever should be
     /// blamed for failing to rank something that was never a candidate.
-    pub(super) fn observe_call(&mut self, tool_id: &str, eligible: bool) -> Vec<Observation> {
+    pub(super) fn observe_call(&self, tool_id: &str, eligible: bool) -> Vec<Observation> {
         if !eligible {
             return Vec::new();
         }
-        let Some(turn) = self.turn.as_mut() else { return Vec::new() };
+        let mut guard = lock(&self.turn);
+        let Some(turn) = guard.as_mut() else { return Vec::new() };
         if !turn.scored.insert(tool_id.to_string()) {
             return Vec::new();
         }
@@ -209,7 +214,7 @@ mod tests {
 
     #[test]
     fn disabled_builds_nothing_and_reports_nothing() {
-        let mut s = Shadow::new(&corpus(), false);
+        let s = Shadow::new(&corpus(), false);
         assert!(!s.enabled());
         s.observe_search("create a customer", &["stripe.PostCustomers".to_string()]);
         assert!(s.observe_call("stripe.PostCustomers", true).is_empty());
@@ -217,7 +222,7 @@ mod tests {
 
     #[test]
     fn scores_every_challenger_and_the_served_result() {
-        let mut s = Shadow::new(&corpus(), true);
+        let s = Shadow::new(&corpus(), true);
         s.observe_search("create a customer", &["stripe.PostCustomers".to_string()]);
         let obs = s.observe_call("stripe.PostCustomers", true);
         // one row for the incumbent plus one per challenger — asserted against the
@@ -234,7 +239,7 @@ mod tests {
     /// otherwise a retry loop silently inflates whichever retriever ranked it.
     #[test]
     fn one_credit_per_tool_per_search() {
-        let mut s = Shadow::new(&corpus(), true);
+        let s = Shadow::new(&corpus(), true);
         s.observe_search("create a customer", &["stripe.PostCustomers".to_string()]);
         assert!(!s.observe_call("stripe.PostCustomers", true).is_empty());
         assert!(s.observe_call("stripe.PostCustomers", true).is_empty(), "second call must not re-credit");
@@ -242,11 +247,11 @@ mod tests {
 
     #[test]
     fn ineligible_and_searchless_calls_are_ignored() {
-        let mut s = Shadow::new(&corpus(), true);
+        let s = Shadow::new(&corpus(), true);
         s.observe_search("create a customer", &["stripe.PostCustomers".to_string()]);
         assert!(s.observe_call("stripe.PostCustomers", false).is_empty(), "ineligible id");
 
-        let mut s2 = Shadow::new(&corpus(), true);
+        let s2 = Shadow::new(&corpus(), true);
         assert!(s2.observe_call("stripe.PostCustomers", true).is_empty(), "no preceding search");
     }
 
@@ -254,7 +259,7 @@ mod tests {
     /// looks perfect and the telemetry is useless.
     #[test]
     fn a_miss_is_reported_as_a_miss() {
-        let mut s = Shadow::new(&corpus(), true);
+        let s = Shadow::new(&corpus(), true);
         s.observe_search("something entirely unrelated to payments", &[]);
         let obs = s.observe_call("stripe.PostPayouts", true);
         assert!(!obs.is_empty());
@@ -264,7 +269,7 @@ mod tests {
 
     #[test]
     fn an_absurd_query_is_skipped_rather_than_truncated() {
-        let mut s = Shadow::new(&corpus(), true);
+        let s = Shadow::new(&corpus(), true);
         s.observe_search(&"x".repeat(MAX_QUERY_CHARS + 1), &["stripe.PostCustomers".to_string()]);
         assert!(s.observe_call("stripe.PostCustomers", true).is_empty());
     }

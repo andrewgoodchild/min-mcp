@@ -10,11 +10,12 @@ impl Surface {
     /// collisions the sanitizer renamed, and diff `schema_sha` across spec
     /// versions to catch drift. Scope-independent (shows the full pre-scope
     /// surface); a debugging/audit artifact, not something the agent sees.
-    /// `visible_only` scope-filters rows AND derived counts for the current
-    /// caller (the protocol path); `false` is the full pre-scope audit view
+    /// `Some(caller)` scope-filters rows AND derived counts for that caller
+    /// (the protocol path); `None` is the full pre-scope audit view
     /// (`minmcp map`). One builder, so a scoped view can never leak a hidden
     /// tool through a side field.
-    pub fn source_map(&self, visible_only: bool) -> Value {
+    pub fn source_map(&self, caller: Option<&Caller>) -> Value {
+        let visible_only = caller.is_some();
         // Invert exposed (name -> id) so each tool can show the MCP name it is
         // declared under in the current mode (null in three_tool: reached via
         // call_tool by id, not declared by name).
@@ -26,7 +27,7 @@ impl Surface {
         let tools: Vec<Value> = self
             .tools
             .iter()
-            .filter(|t| !visible_only || self.allowed(t.id()))
+            .filter(|t| caller.is_none_or(|c| self.allowed(c, t.id())))
             .map(|t| {
                 let (upstream, kind, origin) = match self.upstreams.get(t.upstream_idx) {
                     Some(b) => (b.name().to_string(), b.kind(), b.origin(&t.name)),
@@ -178,7 +179,7 @@ impl Surface {
     /// through the full dispatch path (so overlay headers/defaults/field-patches/
     /// response-transform all apply — it verifies the *fixed* tool the agent sees)
     /// and evaluates deterministic assertions. Makes real network calls.
-    pub async fn verify(&mut self) -> Value {
+    pub async fn verify(&self, caller: &Caller) -> Value {
         // Collect first (owned) so the &config borrow ends before &mut dispatch.
         let checks: Vec<(String, crate::config::VerifyCheck)> = self
             .config
@@ -189,7 +190,7 @@ impl Surface {
         let (mut passed, mut failed) = (0usize, 0usize);
         let mut results = Vec::new();
         for (tool, check) in checks {
-            let outcome = match self.route_call(&tool, check.arguments.clone(), &[]).await {
+            let outcome = match self.route_call(caller, &tool, check.arguments.clone(), &[]).await {
                 Ok(r) => eval_expect(&r, self.tool_from_spec(&tool), &check.expect),
                 Err(e) => (false, vec![format!("call errored: {e}")]),
             };
@@ -208,8 +209,8 @@ impl Surface {
         json!({"passed": passed, "failed": failed, "checks": results})
     }
 
-    /// Stats for `minmcp inspect`.
-    pub fn stats(&self) -> Value {
+    /// Stats for `minmcp inspect`, scoped to `caller` where visibility matters.
+    pub fn stats(&self, caller: &Caller) -> Value {
         let upstream_defs: usize = self.tools.len();
         // Spec upstreams store cheap UNRESOLVED $ref stubs at load, which badly
         // understate the raw baseline. Small surfaces resolve exactly (that's
@@ -230,9 +231,12 @@ impl Surface {
                 t.description.len() + schema_len + t.name.len()
             })
             .sum();
-        let minified = self.list_tools();
+        let minified = self.list_tools(caller);
         let minified_count = minified["tools"].as_array().map(Vec::len).unwrap_or(0);
         let min_chars = json_len(&minified);
+        // Upstreams that announced tools/list_changed since startup: their
+        // catalog here is a stale snapshot until the proxy restarts.
+        let stale: Vec<&str> = self.upstreams.iter().filter(|b| b.stale()).map(Backend::name).collect();
         json!({
             // serialized like the config key (`three_tool`), not the Rust
             // variant name, so inspect output and config speak one vocabulary
@@ -240,8 +244,9 @@ impl Surface {
             "upstreams_configured": self.config.upstreams.len(),
             // active = configured minus any fully filtered-out upstreams
             "upstreams_active": self.upstreams.len(),
+            "upstreams_stale": stale,
             "upstream_tools": upstream_defs,
-            "visible_after_scopes": self.tools.iter().filter(|t| self.allowed(t.id())).count(),
+            "visible_after_scopes": self.tools.iter().filter(|t| self.allowed(caller, t.id())).count(),
             "surface_tools": minified_count,
             "est_tokens_raw": raw_chars / 4,
             "est_tokens_minified": min_chars / 4,

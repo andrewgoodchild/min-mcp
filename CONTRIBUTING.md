@@ -39,14 +39,14 @@ keys beside it. Suites:
 | suite | what it covers |
 |---|---|
 | `cargo test --bin minmcp` | unit tests, including the surface internals |
-| `tests/stdio_e2e.rs` | the real binary over stdio: search → details → call, resources, breaker, timeout |
-| `tests/http_e2e.rs` | Streamable HTTP: handshake, session, Origin refusal |
+| `tests/stdio_e2e.rs` | the real binary over stdio: search → details → call, resources, breaker, timeout, respawn of a dead upstream |
+| `tests/http_e2e.rs` | Streamable HTTP: handshake, session, Origin refusal, per-request bearer identity (401 without, two scopes from one process) |
 | `tests/features_e2e.rs` | composites, `verify`, pagination, JWT scopes, preflight opt-out, a dying upstream, `optional` upstreams, strict config |
 | `tests/cli_contract.rs` | flags, exit codes, the startup banner |
 | `tests/compression.rs` | the compression claim — this one is a published number, keep it honest |
 
-Tests needing `/bin/sh` or `curl` are `cfg(unix)`-gated, so Windows runs 20 of
-the 28 end-to-end tests — `http_e2e.rs` skips entirely. All three platforms are
+Tests needing `/bin/sh` or `curl` are `cfg(unix)`-gated, so Windows runs 23 of
+the 33 end-to-end tests — `http_e2e.rs` skips entirely. All three platforms are
 **blocking** in CI regardless, because `release.yml` publishes a binary for each
 one and none should ship from a tree nothing checked. If you port a fixture to
 Windows, drop its gate.
@@ -72,6 +72,23 @@ So:
 - **Docs live next to the change.** Every overlay key has a `### key — what it
   does` section in [docs/overlays.md](docs/overlays.md); config keys are in
   [docs/configuration.md](docs/configuration.md).
+- **The surface is shared, not locked.** `Surface` methods take `&self`; the
+  catalog, index, schemas, and backends are immutable after build, and per-call
+  state (usage prior, read cache, breakers, rate buckets, audit sink) sits behind
+  small `std::sync::Mutex`es. Never hold one across an `.await`. Anything that
+  decides what a caller may see takes a `&Caller` — there is no identity on the
+  surface itself, because over HTTP identity is per request.
+- **One lock idiom.** Poison-tolerant locking lives in `src/sync.rs` (`lock`,
+  `read`, `write`); use it rather than spelling
+  `.unwrap_or_else(PoisonError::into_inner)` again.
+- **Shared test fixtures** (the binary path, the HS256 fixture tokens, the
+  initialize body, the `serve --http` harness) live in `tests/common/mod.rs`.
+  Servers there bind port 0 and learn the port from the banner — never a
+  hardcoded port, which races other suites.
+- **Credentials are references.** A new config value that holds a secret goes
+  through `Secrets::expand` (`${env|file|vault:…}`) and is stored as a
+  `SecretString`; it is never logged, and the audit stream never carries call
+  arguments.
 
 ## Commits and PRs
 

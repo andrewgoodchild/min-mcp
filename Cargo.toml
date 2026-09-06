@@ -54,12 +54,25 @@ serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision
 # aliased to `serde_yaml` so call sites are unchanged. On the hot path — it
 # parses the config and every YAML OpenAPI spec (e.g. the 42 MB MS Graph doc).
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
-tokio = { version = "1", features = ["macros", "rt", "io-util", "io-std", "process", "time", "sync", "net"] }
+# rt-multi-thread: the surface is shared (Arc), not locked, so concurrent
+# callers run on separate workers and one slow upstream call blocks only its own.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "io-util", "io-std", "process", "time", "sync", "net"] }
 # Logging over the ecosystem-standard `tracing`; one subscriber also captures
 # rmcp's own spans. Trimmed features (no ansi colours — output goes to stderr).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
 bm25 = "2.3.2"
+# `http::request::Parts` is what rmcp injects into each HTTP request's context;
+# the per-request caller is attached to it. Same crate version hyper/rmcp use.
+http = "1"
+# Secret providers. vaultrs is the de facto Rust client for HashiCorp Vault
+# (and OpenBao): KV v2 reads plus token/AppRole/Kubernetes login. `rustls-no-provider`
+# so it shares the `ring` crypto provider reqwest already brings instead of adding
+# aws-lc (a cmake C build on every platform). `${file:…}`/`${env:…}` need no crate.
+vaultrs = { version = "0.8", default-features = false, features = ["rustls-no-provider"] }
+# Resolved secrets are held as `SecretString`: no Debug/Display leak, zeroed on
+# drop, and every use site says `expose_secret()` out loud.
+secrecy = "0.10"
 
 [dev-dependencies]
 # Parse `minmcp inspect` JSON output and validate doc/example YAML in the

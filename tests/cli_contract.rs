@@ -5,16 +5,8 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
-const BIN: &str = env!("CARGO_BIN_EXE_minmcp");
-
-fn run(args: &[&str]) -> (String, String, bool) {
-    let out = Command::new(BIN).args(args).output().expect("run minmcp");
-    (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-        out.status.success(),
-    )
-}
+mod common;
+use common::{run, HttpServer, BIN, INIT, TOKEN_READ};
 
 #[test]
 fn version_flag_prints_version() {
@@ -87,6 +79,76 @@ fn serve_http_refuses_a_non_loopback_bind_without_allow_remote() {
     let (_, stderr, ok) = run(&["serve", "--allow-remote", "--config", "tests/fixtures/ci-server.yaml"]);
     assert!(!ok);
     assert!(stderr.contains("--http"), "--allow-remote without --http is a usage error: {stderr}");
+}
+
+/// One raw HTTP/1.1 POST of the initialize request with the given extra
+/// headers, returning the status line. Raw sockets, so the test needs no HTTP
+/// crate and controls the `Host` header exactly.
+trait PostStatus {
+    fn post_status(&self, headers: &[(&str, &str)]) -> String;
+}
+
+impl PostStatus for HttpServer {
+    fn post_status(&self, headers: &[(&str, &str)]) -> String {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        let mut req = String::from("POST / HTTP/1.1\r\n");
+        let mut has_host = false;
+        for (k, v) in headers {
+            has_host |= k.eq_ignore_ascii_case("host");
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        if !has_host {
+            req.push_str(&format!("Host: 127.0.0.1:{}\r\n", self.port));
+        }
+        req.push_str("Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n");
+        req.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n{INIT}", INIT.len()));
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf = [0u8; 512];
+        let n = s.read(&mut buf).unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string()
+    }
+}
+
+#[test]
+fn identity_enforced_remote_bind_serves_clients_by_any_host_name() {
+    // With `auth:` configured (a verifier, no allow_anonymous) every request is
+    // authenticated, so the non-loopback bind is accepted without --allow-remote
+    // — and it must actually SERVE: clients reach a remote server under whatever
+    // Host they use, so rmcp's loopback-only Host allow-list is off, and a
+    // rebinding page can't present a bearer, so the Origin check is off too.
+    let s = HttpServer::start("0.0.0.0", &["--config", "tests/fixtures/e2e-scopes.yaml"]);
+    let bearer = format!("Bearer {TOKEN_READ}");
+    let ok = s.post_status(&[("Host", "10.1.2.3:8080"), ("Authorization", &bearer)]);
+    assert!(ok.contains(" 200 "), "a remote client with a valid bearer must be served, got: {ok}");
+    let ok = s.post_status(&[("Host", "mcp.corp.example"), ("Origin", "https://console.corp.example"), ("Authorization", &bearer)]);
+    assert!(ok.contains(" 200 "), "a browser-based client with a bearer must be served, got: {ok}");
+    let no = s.post_status(&[("Host", "10.1.2.3:8080")]);
+    assert!(no.contains(" 401 "), "identity is still enforced, got: {no}");
+}
+
+#[test]
+fn allow_remote_serves_any_host_but_still_refuses_foreign_origins() {
+    // --allow-remote with no auth: Host validation must be off (or nothing
+    // remote could ever connect), but the Origin check stays — it is the only
+    // thing standing between a DNS-rebinding page and an unauthenticated port.
+    let s = HttpServer::start("0.0.0.0", &["--allow-remote", "--config", "tests/fixtures/ci-server.yaml"]);
+    let ok = s.post_status(&[("Host", "10.1.2.3:8080")]);
+    assert!(ok.contains(" 200 "), "a remote client must be served under --allow-remote, got: {ok}");
+    let no = s.post_status(&[("Host", "10.1.2.3:8080"), ("Origin", "https://evil.example")]);
+    assert!(no.contains(" 403 "), "a foreign Origin must still be refused, got: {no}");
+}
+
+#[test]
+fn loopback_bind_keeps_both_dns_rebinding_defences() {
+    let s = HttpServer::start("127.0.0.1", &["--config", "tests/fixtures/ci-server.yaml"]);
+    let ok = s.post_status(&[]);
+    assert!(ok.contains(" 200 "), "{ok}");
+    let host = s.post_status(&[("Host", "evil.example")]);
+    assert!(host.contains(" 403 "), "a foreign Host on a loopback server is a rebinding attempt, got: {host}");
+    let origin = s.post_status(&[("Origin", "https://evil.example")]);
+    assert!(origin.contains(" 403 "), "a foreign Origin on a loopback server is a rebinding attempt, got: {origin}");
 }
 
 #[test]

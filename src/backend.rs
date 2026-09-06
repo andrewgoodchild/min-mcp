@@ -1,25 +1,27 @@
-//! A Surface upstream is either a spawned MCP server (`Mcp`) or an OpenAPI spec
-//! mounted directly (`Spec`) — the same tool surface either way. This is what
-//! lets min-mcp minify a raw API spec, not just proxy existing MCP servers.
+//! A Surface upstream is either a spawned MCP server (`Mcp`), a remote MCP
+//! server (`Http`), or an OpenAPI spec mounted directly (`Spec`) — the same
+//! tool surface either way. Every method takes `&self`: each transport is
+//! internally synchronized, so the surface can serve many callers against one
+//! backend without a lock around it.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use secrecy::SecretString;
 use serde_json::{json, Value};
 
 use crate::config::UpstreamConfig;
 use crate::exec::Executor;
 use crate::http_upstream::HttpUpstream;
+use crate::secrets::Secrets;
 use crate::spec::Spec;
 use crate::upstream::{McpRpc, ToolDef, Upstream};
 
-// `Mcp` is about twice the size of the next variant *on Windows only*, where the
-// process handles inside `Upstream` (`Child`, `ChildStdin`, the buffered stdout
-// reader) are wider than their Unix fd equivalents — so this lint fires there and
-// nowhere else. Boxing would trade a startup-time byte count for an indirection on
-// every upstream call, and the lint's actual concern doesn't apply: these live in
-// `Surface.upstreams: Vec<Backend>`, one per configured upstream, moved exactly
-// once at build time and only borrowed afterwards.
+// `Mcp` is the largest variant (a child handle, the connection slot, the
+// respawn bookkeeping). Boxing it would trade a startup-time byte count for an
+// indirection on every upstream call, and the lint's concern doesn't apply:
+// these live in `Surface.upstreams: Vec<Backend>`, one per configured
+// upstream, moved exactly once at build time and only borrowed afterwards.
 #[allow(clippy::large_enum_variant)]
 pub enum Backend {
     Mcp(Upstream),
@@ -30,7 +32,7 @@ pub enum Backend {
 impl Backend {
     /// `idx` is this backend's position in the Surface's backend list, stamped
     /// onto each ToolDef so dispatch can route back here.
-    pub async fn list_tools(&mut self, idx: usize) -> Result<Vec<ToolDef>> {
+    pub async fn list_tools(&self, idx: usize) -> Result<Vec<ToolDef>> {
         match self {
             Backend::Mcp(u) => u.list_tools(idx).await,
             Backend::Http(h) => h.list_tools(idx).await,
@@ -43,7 +45,7 @@ impl Backend {
     /// apply to spec (HTTP) upstreams only — MCP subprocess/HTTP upstreams ignore
     /// them (their transport isn't a per-call REST request).
     pub async fn call_tool(
-        &mut self,
+        &self,
         name: &str,
         args: Value,
         extra_headers: &[(String, String)],
@@ -77,6 +79,16 @@ impl Backend {
         }
     }
 
+    /// Has the upstream announced that its tool catalog changed since this
+    /// proxy snapshotted it at startup? Surfaced by `inspect`.
+    pub fn stale(&self) -> bool {
+        match self {
+            Backend::Mcp(u) => u.stale(),
+            Backend::Http(h) => h.stale(),
+            Backend::Spec(_) => false,
+        }
+    }
+
     /// Fully-resolved input schema for one tool, computed ON DEMAND. Spec upstreams
     /// list tools with a cheap unresolved schema (so a 10k-op spec loads instantly);
     /// this expands the `$ref`s for just the tool the caller inspects. Non-spec
@@ -99,7 +111,7 @@ impl Backend {
     /// Merged passthrough listing of one MCP collection (`resources/list` →
     /// `resources`, `prompts/list` → `prompts`). Spec upstreams have none; an
     /// upstream without the capability contributes nothing.
-    pub async fn list_passthrough(&mut self, method: &str, key: &str) -> Vec<Value> {
+    pub async fn list_passthrough(&self, method: &str, key: &str) -> Vec<Value> {
         match self {
             Backend::Mcp(u) => u.list_passthrough(method, key).await,
             Backend::Http(h) => h.list_passthrough(method, key).await,
@@ -107,7 +119,7 @@ impl Backend {
         }
     }
 
-    pub async fn read_resource(&mut self, uri: &str) -> Result<Value> {
+    pub async fn read_resource(&self, uri: &str) -> Result<Value> {
         match self {
             Backend::Mcp(u) => u.read_resource(uri).await,
             Backend::Http(h) => h.read_resource(uri).await,
@@ -115,7 +127,7 @@ impl Backend {
         }
     }
 
-    pub async fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value> {
         match self {
             Backend::Mcp(u) => u.get_prompt(name, arguments).await,
             Backend::Http(h) => h.get_prompt(name, arguments).await,
@@ -145,26 +157,30 @@ pub struct SpecBackend {
 }
 
 impl SpecBackend {
-    pub fn new(cfg: &UpstreamConfig) -> Result<Self> {
+    pub async fn new(cfg: &UpstreamConfig, secrets: &Secrets) -> Result<Self> {
         let spec_path = cfg.spec.as_ref().ok_or_else(|| anyhow!("spec upstream needs `spec`"))?;
         let base_url = cfg.base_url.as_ref().ok_or_else(|| anyhow!("spec upstream needs `base_url`"))?;
-        // The key is read from the named env var — never stored in config.
-        // Missing is non-fatal (inspect needs no key; serve surfaces 401s as
-        // tool errors), matching how MCP-server upstreams start without creds.
-        let api_key = cfg
-            .auth_env
-            .as_ref()
-            .and_then(|var| std::env::var(var).ok())
-            .unwrap_or_default();
+        // The key comes from `api_key` (a `${…}` reference into any secret
+        // store) or `auth_env` (the name of an env var). Missing is non-fatal
+        // (inspect needs no key; serve surfaces 401s as tool errors), matching
+        // how MCP-server upstreams start without creds.
+        let api_key = match (&cfg.api_key, &cfg.auth_env) {
+            (Some(template), _) => secrets
+                .expand(template)
+                .await
+                .with_context(|| format!("resolving api_key for upstream {}", cfg.name))?,
+            (None, Some(var)) => std::env::var(var).unwrap_or_default(),
+            (None, None) => String::new(),
+        };
         let spec = Spec::load(spec_path).with_context(|| format!("loading spec {spec_path}"))?;
         Ok(SpecBackend {
             name: cfg.name.clone(),
             spec: Arc::new(spec),
             executor: Executor::new(
                 base_url,
-                &api_key,
+                SecretString::from(api_key),
                 cfg.accept.clone(),
-                crate::exec::resolve_headers(&cfg.headers)?,
+                crate::exec::resolve_headers(&cfg.headers, secrets).await?,
                 cfg.result_format(),
             )?,
         })
@@ -189,7 +205,7 @@ impl SpecBackend {
     }
 
     async fn call_tool(
-        &mut self,
+        &self,
         op_id: &str,
         args: Value,
         extra_headers: &[(String, String)],

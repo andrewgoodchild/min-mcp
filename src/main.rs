@@ -5,6 +5,7 @@
 
 mod auth;
 mod backend;
+mod caller;
 mod config;
 mod exec;
 mod http_upstream;
@@ -16,19 +17,25 @@ mod logging;
 mod oauth;
 mod project;
 mod rmcp_serve;
+mod secrets;
 mod spec;
+mod sync;
 // note: `jsonrpc` stays — the upstream MCP clients (upstream.rs / http_upstream.rs)
 // still frame JSON-RPC by hand; only the *server* side moved to rmcp.
 mod surface;
 mod upstream;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 
+use auth::{ClaimChecks, JwtVerifier};
+use caller::Caller;
 use config::Config;
+use secrets::Secrets;
 use surface::Surface;
 
 #[derive(Parser)]
@@ -57,10 +64,12 @@ struct Common {
     /// --allow-remote is given; validates Origin.
     #[arg(long)]
     http: Option<String>,
-    /// serve --http only: allow binding a non-loopback address. The HTTP
-    /// transport has NO inbound authentication — every client that can reach
-    /// the port gets this process's scopes and upstream credentials — so only
-    /// do this behind an authenticating reverse proxy or on a private network.
+    /// serve --http only: allow binding a non-loopback address WITHOUT caller
+    /// identity. Every client that can reach the port then gets this process's
+    /// scopes and upstream credentials, so only do this behind an
+    /// authenticating reverse proxy or on a private network. Not needed when
+    /// `auth:` makes every request authenticate (a verifier or trusted_headers,
+    /// without allow_anonymous).
     #[arg(long, requires = "http")]
     allow_remote: bool,
 }
@@ -127,73 +136,88 @@ enum Cmd {
 }
 
 /// Build the JWT verifier from config, in precedence order: a JWKS endpoint
-/// (fetched once here), an RS256 public key, or an HS256 shared secret.
-async fn build_verifier(cfg: &Config) -> Result<Option<auth::JwtVerifier>> {
+/// (fetched here, refreshed later by the verifier), an RS256 public key, or an
+/// HS256 shared secret (which may itself be a `${…}` secret reference).
+///
+/// Only when a token will actually be validated — `--jwt`, or `serve --http`.
+/// Building it reaches the network (JWKS), and an audit command like `map` or
+/// `lint` must not need the identity provider to be up.
+async fn build_verifier(cfg: &Config, secrets: &Secrets, needed: bool) -> Result<Option<JwtVerifier>> {
+    if !needed {
+        return Ok(None);
+    }
     let a = &cfg.auth;
     if let Some(url) = &a.jwks_url {
-        // Bounded like the OAuth token fetch: a hung JWKS endpoint must fail
-        // startup with a clear error, not stall it forever.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("building HTTP client for the JWKS fetch")?;
-        let json = client
-            .get(url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .with_context(|| format!("fetching JWKS from {url}"))?
-            .text()
-            .await
-            .with_context(|| format!("reading JWKS from {url}"))?;
-        return Ok(Some(auth::jwks_from_json(&json)?));
+        // Fetched now (bounded — a hung endpoint fails startup with a clear
+        // error), and refreshed by the verifier itself on rotation and age.
+        return Ok(Some(auth::jwks_from_url(url).await?));
     }
     if let Some(pem) = a.public_key_pem()? {
         return Ok(Some(auth::rs256_from_pem(&pem)?));
     }
     if let Some(secret) = a.secret() {
-        return Ok(Some(auth::JwtVerifier::Hs256(secret.into_bytes())));
+        let secret = secrets.expand(&secret).await.context("resolving auth.jwt_secret")?;
+        return Ok(Some(JwtVerifier::Hs256(secret.into_bytes())));
     }
     Ok(None)
 }
 
-/// Resolve the caller's granted scopes: a validated JWT wins; otherwise the
-/// --scopes flag (local-dev identity).
-async fn resolve_scopes(cfg: &Config, common: &Common) -> Result<Vec<String>> {
+fn claim_checks(cfg: &Config) -> ClaimChecks {
+    ClaimChecks { audience: cfg.auth.audience.clone(), issuer: cfg.auth.issuer.clone() }
+}
+
+/// The PROCESS identity: a validated `--jwt` wins; otherwise the `--scopes`
+/// flag (local-dev identity). Over stdio this is the caller; over HTTP it is
+/// only the fallback for requests that carry no identity of their own.
+async fn resolve_caller(cfg: &Config, common: &Common, verifier: Option<&JwtVerifier>) -> Result<Caller> {
     if let Some(token) = &common.jwt {
-        let verifier = build_verifier(cfg).await?.ok_or_else(|| {
+        let verifier = verifier.ok_or_else(|| {
             anyhow::anyhow!(
                 "--jwt given but no verifier configured (auth.jwt_secret / jwt_public_key / jwks_url)"
             )
         })?;
-        let checks = auth::ClaimChecks {
-            audience: cfg.auth.audience.clone(),
-            issuer: cfg.auth.issuer.clone(),
-        };
-        return verifier.scopes(token, &cfg.auth.scope_claim, &checks);
+        return verifier.caller(token, &cfg.auth.scope_claim, &cfg.auth.subject_claim, &claim_checks(cfg)).await;
     }
-    Ok(clean(common.scopes.clone()))
+    Ok(Caller::with_scopes(clean(common.scopes.clone())))
 }
 
-async fn build(common: &Common) -> Result<Surface> {
+/// Everything a command needs: the shared surface, the process identity, and
+/// (for `serve --http`) how each request is authenticated.
+struct Built {
+    surface: Arc<Surface>,
+    caller: Caller,
+    identity: rmcp_serve::HttpIdentity,
+}
+
+async fn build(common: &Common) -> Result<Built> {
     let cfg = Config::load(&common.config)?;
-    let granted = resolve_scopes(&cfg, common).await?;
-    Surface::build(cfg, granted).await
+    let secrets = Secrets::from_config(&cfg.secrets);
+    // A verifier is only consulted for a `--jwt` process token or a per-request
+    // bearer over HTTP; every other command works without the IdP.
+    let needs_verifier = common.jwt.is_some() || common.http.is_some();
+    let verifier = build_verifier(&cfg, &secrets, needs_verifier).await?.map(Arc::new);
+    let caller = resolve_caller(&cfg, common, verifier.as_deref()).await?;
+    let identity = rmcp_serve::HttpIdentity::from_auth(&cfg.auth, verifier);
+    let surface = Arc::new(Surface::build(cfg, secrets).await?);
+    Ok(Built { surface, caller, identity })
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Multi-threaded runtime: the surface is shared, not locked, so concurrent
+// callers run on separate workers and one slow upstream call blocks only
+// its own caller.
+#[tokio::main]
 async fn main() -> Result<()> {
     logging::init(); // stderr tracing subscriber, filtered by MINMCP_LOG
     let cli = Cli::parse();
     match cli.command {
         Cmd::Inspect(common) => {
-            let surface = build(&common).await?;
-            println!("{}", serde_json::to_string_pretty(&surface.stats())?);
+            let b = build(&common).await?;
+            println!("{}", serde_json::to_string_pretty(&b.surface.stats(&b.caller))?);
             Ok(())
         }
         Cmd::Map { common, diff } => {
-            let surface = build(&common).await?;
-            let current = surface.source_map(false);
+            let b = build(&common).await?;
+            let current = b.surface.source_map(None);
             match diff {
                 None => {
                     println!("{}", serde_json::to_string_pretty(&current)?);
@@ -214,8 +238,8 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Verify(common) => {
-            let mut surface = build(&common).await?;
-            let report = surface.verify().await;
+            let b = build(&common).await?;
+            let report = b.surface.verify(&b.caller).await;
             println!("{}", serde_json::to_string_pretty(&report)?);
             if report["failed"].as_u64().unwrap_or(0) > 0 {
                 std::process::exit(1); // CI signal: a fix/binding no longer holds
@@ -223,36 +247,38 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Lint { common, sample } => {
-            let surface = build(&common).await?;
-            println!("{}", serde_json::to_string_pretty(&surface.lint_report(sample))?);
+            let b = build(&common).await?;
+            println!("{}", serde_json::to_string_pretty(&b.surface.lint_report(sample))?);
             Ok(())
         }
         Cmd::Search { common, query, k } => {
-            let surface = build(&common).await?;
-            println!("{}", surface.cli_search(&query, k));
+            let b = build(&common).await?;
+            println!("{}", b.surface.cli_search(&b.caller, &query, k));
             Ok(())
         }
         Cmd::Help { common, tool_id } => {
-            let surface = build(&common).await?;
-            println!("{}", surface.cli_details(&tool_id));
+            let b = build(&common).await?;
+            println!("{}", b.surface.cli_details(&b.caller, &tool_id));
             Ok(())
         }
         Cmd::Call { common, tool_id, args, fields } => {
-            let mut surface = build(&common).await?;
+            let b = build(&common).await?;
             let arguments: Value =
                 serde_json::from_str(&args).context("--args must be a JSON object")?;
-            let result = surface.cli_call(&tool_id, arguments, &fields).await?;
+            let result = b.surface.cli_call(&b.caller, &tool_id, arguments, &fields).await?;
             print_tool_result(&result);
             Ok(())
         }
         Cmd::Serve(common) => {
-            let surface = build(&common).await?;
-            print_serve_banner(&surface);
+            let b = build(&common).await?;
+            print_serve_banner(&b.surface, &b.caller);
             // Both transports are served by the official MCP SDK (rmcp),
             // wrapping our Surface behind its ServerHandler.
             match &common.http {
-                Some(addr) => rmcp_serve::serve_http(surface, addr, common.allow_remote).await,
-                None => rmcp_serve::serve_stdio(surface).await,
+                Some(addr) => {
+                    rmcp_serve::serve_http(b.surface, b.caller, b.identity, addr, common.allow_remote).await
+                }
+                None => rmcp_serve::serve_stdio(b.surface, b.caller).await,
             }
         }
     }
@@ -267,8 +293,8 @@ fn clean(scopes: Vec<String>) -> Vec<String> {
 /// print: when the minified surface is BIGGER than declaring everything
 /// (small N), say so and recommend `mode: passthrough` — a minifier that
 /// can't tell you when not to minify is marketing, not measurement.
-fn print_serve_banner(surface: &crate::surface::Surface) {
-    let s = surface.stats();
+fn print_serve_banner(surface: &Surface, caller: &Caller) {
+    let s = surface.stats(caller);
     let (raw, min) = (
         s["est_tokens_raw"].as_u64().unwrap_or(0),
         s["est_tokens_minified"].as_u64().unwrap_or(0),

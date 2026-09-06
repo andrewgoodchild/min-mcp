@@ -6,6 +6,81 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Added — the control layer for running behind a gateway
+
+- **Per-request caller identity over HTTP.** With `auth:` configured, each
+  request is authenticated on its own — `Authorization: Bearer` validated by the
+  configured verifier, or identity headers from a trusted gateway
+  (`auth.trusted_headers`) — and sees only what its scopes grant. One `serve
+  --http` now serves many callers with different surfaces. A request with no
+  identity is 401 with a `WWW-Authenticate` challenge unless
+  `auth.allow_anonymous`. `auth.subject_claim` (default `sub`) names the caller.
+- **Rate limits.** `rate_limits.per_caller` / `per_tool` (token buckets keyed by
+  the caller) and overlay `rate_limit` (one tool across all callers). A refused
+  call is a `RATE_LIMITED` isError result with a retry-after.
+- **Audit stream.** Every NDJSON line carries `caller`; a `call` adds
+  `latency_ms` and `result_bytes`; `rate_limited` events are logged. `log_file:
+  stderr` sends the stream to stderr for container log shippers.
+- **Secret references.** `${env:X}`, `${file:/run/secrets/x}`, and
+  `${vault:path#field}` (HashiCorp Vault / OpenBao KV v2 via `vaultrs`; token,
+  AppRole, or Kubernetes login with re-login on 403; cached `secrets.cache_ttl_s`)
+  everywhere a credential appears, including `user_supplied` sources and a spec
+  upstream's new `api_key`. Resolved secrets are `SecretString`s.
+- **Upstream health.** A stdio upstream that exits is respawned on the next call
+  (crash-loop guard: one start per second); an expired remote MCP session (404)
+  is re-initialized and the request retried; `tools/list_changed` flags the
+  upstream in `inspect` as `upstreams_stale`.
+- `examples/enterprise.yaml`, an annotated deployment config.
+
+### Changed
+
+- **The surface is shared, not locked.** The catalog, index, schemas, and
+  backends are read concurrently; per-call state sits behind small locks never
+  held across an upstream call; the stdio client multiplexes requests by id; the
+  runtime is multi-threaded. A slow upstream call now blocks only its own
+  caller, instead of every session.
+- `--allow-remote` is no longer needed for a non-loopback bind when `auth:`
+  makes every request authenticate. A non-loopback bind now actually serves
+  remote clients: rmcp's loopback-only `Host` allow-list (which 403'd every
+  non-loopback `Host`) is disabled for such binds, and the `Origin` check is
+  kept under `--allow-remote` but dropped when identity is enforced.
+- A JWKS set refreshes itself on an unknown `kid` and every ten minutes
+  (single-flight, at most once a minute), so an IdP key rotation no longer
+  means 401s until restart, and a withdrawn key stops being trusted.
+- `inspect` reports `upstreams_stale`.
+
+### Fixed — from a review of the control layer
+
+- **Audit commands no longer need the identity provider or Vault.** `build()`
+  fetched JWKS and logged in to Vault for *every* subcommand, so a config with
+  `auth.jwks_url` or `secrets.vault` made `inspect` / `map` / `lint` / `search`
+  (and stdio `serve`, which never validates a token unless `--jwt` is given)
+  fail wherever those services were unreachable. The verifier is now built only
+  when a token will actually be validated, and Vault connects on the first
+  `${vault:…}` reference that is really reached.
+- **A refused call no longer spends the caller's wider budget.** The per-caller
+  bucket was charged before the per-tool and overlay buckets were consulted, so
+  hammering one rate-limited tool locked the caller out of every other tool.
+  Tiers already charged are refunded when a later one refuses.
+- **A scoped-out passthrough tool no longer leaks its id.** Calling a hidden
+  tool by its exposed name resolved the name first and answered `unknown
+  tool_id "up.GetX" — did you mean …`, handing the caller the canonical id and
+  its neighbours; it is now shaped exactly like a tool that does not exist.
+- **A request that carries no caller identity is refused** when identity is
+  enforced, instead of falling back to the process identity (which may hold
+  broader scopes than any real caller).
+- **A dying stdio upstream fails its in-flight call immediately.** A request
+  that registered between the reader draining its waiters and the child's pipe
+  closing waited out the full deadline for a reply that could never arrive.
+- **Concurrent recovery is single-flight.** Two callers hitting an expired
+  remote MCP session each re-initialized, and one cleared the other's fresh
+  session id; the same for OAuth token refresh. A healthy call now takes no
+  lock a recovery could be holding, and a respawn no longer blocks callers from
+  reading the live connection.
+- SSE replies match their request id by the same tolerant rule the stdio client
+  uses, so a server echoing `"7"` for `7` is matched rather than falling
+  through to the first result-bearing frame.
+
 ### Security
 
 - **HTTP serving is loopback-only.** `serve --http` refuses a non-loopback
@@ -53,6 +128,13 @@ All notable changes to min-mcp. Format loosely follows
   instead of the Rust variant name `"ThreeTool"`.
 - `MINMCP_LOG=trace` is accepted.
 - jq programs are compiled once per process instead of on every call.
+- Searches no longer serialize on the usage prior, the audit line's size
+  measurement is skipped when no sink is configured, and a per-request params
+  clone on the HTTP upstream's hot path is gone.
+- One poison-tolerant lock helper (`crate::sync`) replaces three copies and
+  ~15 inline spellings; `tests/common` replaces per-suite copies of the fixture
+  tokens and spawn helpers, and the HTTP suite's hardcoded ports (a real
+  cross-test race) are now OS-assigned.
 - `rust-version = "1.91"` declares the MSRV; release binaries are stripped and
   built with `codegen-units = 1`.
 

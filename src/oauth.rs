@@ -3,24 +3,34 @@
 //! before expiry — so an OAuth-protected remote MCP server can be proxied with
 //! just a client_id/secret in config, no hand-minted tokens.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 
-use crate::config::{expand_env, OAuthConfig};
+use crate::config::OAuthConfig;
+use crate::secrets::Secrets;
+use crate::sync::lock;
 
 pub struct OAuthClient {
     client: reqwest::Client,
     token_url: String,
     client_id: String,
-    client_secret: String, // env-expanded
+    /// `${…}`-resolved; a secret, so never in Debug output.
+    client_secret: SecretString,
     scope: Option<String>,
-    cached: Option<(String, Instant)>,
+    /// The current token and when it stops being usable. A std lock: reads are
+    /// the common case and must not queue behind an in-flight fetch.
+    cached: Mutex<Option<(SecretString, Instant)>>,
+    /// Held only while fetching, so concurrent callers share one round-trip to
+    /// the token endpoint instead of each minting their own.
+    fetching: tokio::sync::Mutex<()>,
 }
 
 impl OAuthClient {
-    pub fn new(cfg: &OAuthConfig) -> Result<Self> {
+    pub async fn new(cfg: &OAuthConfig, secrets: &Secrets) -> Result<Self> {
         // Bound the token fetch: bearer() is awaited before every HTTP-upstream
         // request, so a hung token endpoint would stall min-mcp indefinitely
         // (reqwest has no default timeout). Token endpoints respond fast.
@@ -32,23 +42,34 @@ impl OAuthClient {
             client,
             token_url: cfg.token_url.clone(),
             client_id: cfg.client_id.clone(),
-            client_secret: expand_env(&cfg.client_secret)?,
+            client_secret: SecretString::from(secrets.expand(&cfg.client_secret).await?),
             scope: cfg.scope.clone(),
-            cached: None,
+            cached: Mutex::new(None),
+            fetching: tokio::sync::Mutex::new(()),
         })
     }
 
+    /// The cached token, if it is still good.
+    fn current(&self) -> Option<String> {
+        let cached = lock(&self.cached);
+        let (token, expiry) = cached.as_ref()?;
+        (Instant::now() < *expiry).then(|| token.expose_secret().to_string())
+    }
+
     /// A valid bearer token — cached until shortly before expiry, then refetched.
-    pub async fn bearer(&mut self) -> Result<String> {
-        if let Some((token, expiry)) = &self.cached {
-            if Instant::now() < *expiry {
-                return Ok(token.clone());
-            }
+    /// Returned exposed: it goes straight into an Authorization header.
+    pub async fn bearer(&self) -> Result<String> {
+        if let Some(t) = self.current() {
+            return Ok(t);
+        }
+        let _flight = self.fetching.lock().await;
+        if let Some(t) = self.current() {
+            return Ok(t); // another caller refreshed while we waited
         }
         let mut form = vec![
             ("grant_type", "client_credentials"),
             ("client_id", self.client_id.as_str()),
-            ("client_secret", self.client_secret.as_str()),
+            ("client_secret", self.client_secret.expose_secret()),
         ];
         if let Some(scope) = &self.scope {
             form.push(("scope", scope.as_str()));
@@ -67,7 +88,7 @@ impl OAuthClient {
         let (token, ttl) = parse_token_response(&body)?;
         // refresh a minute early to avoid using a token that expires mid-flight
         let lifetime = Duration::from_secs(ttl.saturating_sub(60).max(1));
-        self.cached = Some((token.clone(), Instant::now() + lifetime));
+        *lock(&self.cached) = Some((SecretString::from(token.clone()), Instant::now() + lifetime));
         Ok(token)
     }
 }

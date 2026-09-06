@@ -25,10 +25,10 @@ runner that could execute Intel macOS builds, so shipping that binary would mean
 publishing one nothing had ever run. Intel Mac users build from source with the
 command above; it is a supported configuration, just not a prebuilt one.
 
-The test coverage behind the platforms is also not equal: 8 of the 28 end-to-end
+The test coverage behind the platforms is also not equal: 10 of the 33 end-to-end
 tests use a POSIX shell script or `curl` as their fixture, so they are
 `cfg(unix)`-gated and skip on Windows — including the whole Streamable HTTP
-suite. The Windows binary compiles, lints clean, and passes the other 20, but its
+suite. The Windows binary compiles, lints clean, and passes the other 23, but its
 HTTP transport has no end-to-end coverage on that platform. If you run min-mcp
 over HTTP on Windows, you are the first — please file what you find.
 
@@ -172,9 +172,12 @@ so the nested-body calls that break a generated client work here.
 ./target/release/minmcp serve --http 127.0.0.1:8080 --config myconfig.yaml
 ```
 
-The HTTP transport has no inbound authentication and one scope set per process,
-so a non-loopback bind is refused unless you pass `--allow-remote` — do that only
-behind an authenticating proxy.
+With `auth:` configured, every HTTP request is identified on its own (a bearer
+validated here, or headers from your gateway) and sees only what its scopes
+grant — one process, many callers. Without it, every request is the process
+identity, so a non-loopback bind is refused unless you pass `--allow-remote`.
+See [`examples/enterprise.yaml`](../examples/enterprise.yaml) for the shape
+behind a gateway.
 
 See [Transports & auth](transports-and-auth.md) for remote upstreams, outbound
 OAuth, and JWT-derived caller scopes.
@@ -196,6 +199,51 @@ the bundled 4-operation spec:
 
 Read [`examples/demo-overlays.yaml`](../examples/demo-overlays.yaml) — it is
 annotated line by line — then [Overlays](overlays.md).
+
+## 7. Run it behind a gateway
+
+One process, many callers. [`examples/enterprise.yaml`](../examples/enterprise.yaml)
+is the deployment shape: identity from headers a gateway sets after it has
+authenticated the caller, per-caller scopes, rate limits, an audit stream to
+stderr, secret references, and an upstream that may be down. It runs offline:
+
+```sh
+./target/release/minmcp serve --http 127.0.0.1:8080 --config examples/enterprise.yaml
+```
+
+```
+WARN optional upstream "reports" unavailable and skipped: spawning upstream reports: … No such file or directory
+min-mcp: 4 upstream tool(s) across 1 upstream(s) → 3 surface tool(s); ~424 tokens vs 497 raw (1.2×)
+min-mcp: Streamable HTTP (rmcp) listening on http://127.0.0.1:8080/
+```
+
+A request with no identity is refused with a challenge:
+
+```sh
+curl -s -D - -o /dev/null -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"demo","version":"0"}}}' \
+  http://127.0.0.1:8080/
+# HTTP/1.1 401 Unauthorized
+# www-authenticate: Bearer
+```
+
+Add the headers the gateway would set and the same request opens a session;
+`search_tools` then returns only what that caller's scopes grant — alice with
+`store.read` sees `widgets/get` and `widgets/list`, bob with `store.write` sees
+`widgets/create` and `orders/create` — and stderr carries one audit line per
+event:
+
+```sh
+  -H 'X-Auth-Scopes: store.read' -H 'X-Auth-Subject: alice'
+# {"ts_ms":1788655073641,"event":"search","caller":"alice","query":"widget","k":10}
+```
+
+Swap `trusted_headers` for a JWT verifier (`jwks_url`, `jwt_public_key_file`,
+`jwt_secret`) when agents call min-mcp directly with bearer tokens. The
+non-loopback bind in the example is accepted without `--allow-remote` precisely
+because every request must authenticate. Details, including what is deliberately
+not built, in [Transports, identity & ops](transports-and-auth.md).
 
 ## Next
 

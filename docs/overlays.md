@@ -35,6 +35,7 @@ overlays:
     # cacheable: true                   # opt this tool's results into the read cache
     # timeout_s: 10                     # per-tool call deadline (transport default: 120s)
     # breaker: { consecutive_failures: 5, cooldown_s: 60 }   # trip after N straight errors
+    # rate_limit: { calls: 30, per_s: 60 }                   # this tool across ALL callers
 ```
 
 Every field is optional; use only what you need.
@@ -84,9 +85,11 @@ agent-facing schema** (so the agent can neither set nor *invent* it) and
 ```yaml
 fields:
   body.account_id: { user_supplied: "env:ACCOUNT_ID" }   # the agent never sees this field
+  # also: "file:/run/secrets/account-id" or "vault:acme/prod#account_id"
 ```
 
-The value comes from the environment/session, so fabrication is impossible *by
+The value comes from the environment, a mounted secret file, or Vault (see
+[Secrets](transports-and-auth.md#secrets)), so fabrication is impossible *by
 construction* — the model can't guess a field it can't see, and any value it
 tries to pass is overwritten. If the source can't be resolved at call time the
 call fails with a clear `missing_user_supplied_value` error, never a fabricated
@@ -176,6 +179,12 @@ Details worth knowing:
 - Both are **opt-in per tool**. There is no global default: a breaker on a tool
   that legitimately errors often (a `search` that returns 404 for "not found")
   would do harm, so you name the tools you want guarded.
+
+**`rate_limit`** caps one tool across *all* callers — a vendor quota, a fragile
+endpoint — on top of the fleet-wide per-caller limits in
+[`rate_limits`](transports-and-auth.md#rate-limits). A refused call is a
+`RATE_LIMITED` isError result with a retry-after, and never reaches the
+upstream, the breaker, or the usage prior.
 
 ### `verify` — dynamic checks that prove the fix works
 The third leg of the loop — **detect (lint) → fix (overlay) → verify**. Each check

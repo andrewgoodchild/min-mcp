@@ -1,17 +1,28 @@
-//! The minified surface: what the agent sees, in one of three modes, after
+//! The minified surface: what the agent sees, in one of the modes, after
 //! scope filtering and overlay application. Design laws apply here:
 //! details stay a separate call (law 4/5), errors carry recovery hints
 //! (law 6), usage priors are damped (law 6 of the index).
+//!
+//! Shared, not locked: the catalog, index, schemas, and backends are built
+//! once and read by every caller concurrently. The few things that change per
+//! call — usage prior, read cache, breakers, rate-limit buckets, the audit
+//! sink — sit behind their own small locks, never held across an await. So a
+//! slow upstream call blocks only its own caller, and the identity that
+//! filters the surface is a per-request `Caller`, not a field on the surface.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::backend::{Backend, SpecBackend};
+use crate::caller::Caller;
 use crate::config::{Config, Mode};
 use crate::http_upstream::HttpUpstream;
 use crate::index::Index;
+use crate::secrets::Secrets;
+use crate::sync::{lock, read, write};
 use crate::upstream::{ToolDef, Upstream};
 
 const MAX_DETAIL_CHARS: usize = 20_000;
@@ -27,6 +38,7 @@ mod ids;
 mod minify;
 mod patch;
 mod preflight;
+mod ratelimit;
 mod resources;
 mod results;
 mod shadow;
@@ -39,24 +51,34 @@ use generators::{fnv1a, resolve_generators, tool_fingerprint};
 use ids::sanitize_name;
 use minify::{budget_truncate, minify_schema, minify_schema_hard, prune_below_depth, truncate_in_place};
 use patch::{apply_field_patches, binding_status};
-use preflight::{preflight_error, resolve_user_source, structured_field_error_at};
+use preflight::{preflight_error, structured_field_error_at};
 use results::{apply_response_transform, bad_arg, eval_expect, get_path, json_len, nudge_projection, result_payload, result_text, text_result, transform_result, truncate_result_text, AGENT_RESULT_BUDGET};
+
+/// Where audit events (NDJSON, one per line) go.
+pub(crate) enum AuditSink {
+    File(Mutex<std::fs::File>),
+    /// `log_file: stderr` — for containers, where the platform's log shipper
+    /// (Fluent Bit, the Datadog agent, …) forwards stderr to the SIEM. stdout
+    /// is never an option: on stdio it IS the MCP protocol.
+    Stderr,
+}
 
 pub struct Surface {
     config: Config,
-    granted: Vec<String>,
+    secrets: Secrets,
     upstreams: Vec<Backend>,
     tools: Vec<ToolDef>,
     /// tool_id -> index into `tools` (single source of truth for existence)
     by_id: HashMap<String, usize>,
-    /// exposed MCP tool name -> tool_id (promoted/passthrough tools).
-    /// BTreeMap so list order is deterministic without a per-call sort.
+    /// exposed MCP tool name -> tool_id (passthrough mode), over EVERY tool;
+    /// `list_tools` filters it per caller. BTreeMap so list order is
+    /// deterministic without a per-call sort.
     exposed: BTreeMap<String, String>,
     index: Index,
     /// workflow id -> index into `config.workflows` (composite tools).
     workflow_by_id: HashMap<String, usize>,
-    /// Append-only NDJSON event log (search/details/call), if configured.
-    log: Option<std::fs::File>,
+    /// Append-only NDJSON audit events (search/details/call/…), if configured.
+    log: Option<AuditSink>,
     /// tool_id -> fingerprint of the RAW upstream tool (description + input
     /// schema), captured BEFORE overlay patching. `authored_sha` pins this, so a
     /// rug-pull that changes only the top-level description is caught as drift —
@@ -66,36 +88,37 @@ pub struct Surface {
     /// applied. Only tools that carry a schema-changing overlay are here (so a
     /// huge un-overlaid spec still resolves lazily); `resolved_schema` prefers it.
     patched_schemas: HashMap<String, Value>,
-    /// tool_id -> per-operation request headers (overlay `headers:`), with `${ENV}`
-    /// already expanded but per-request generators (`{{uuid}}`, `{{now}}`) still as
+    /// tool_id -> per-operation request headers (overlay `headers:`), with `${…}`
+    /// already resolved but per-request generators (`{{uuid}}`, `{{now}}`) still as
     /// tokens — resolved fresh on every call in `dispatch`.
     tool_headers: HashMap<String, Vec<(String, String)>>,
     /// tool_id -> [(field_path, source)] for `user_supplied` fields: stripped from
-    /// the agent schema and injected from `source` (`env:VAR`) at call time.
+    /// the agent schema and injected from `source` (`env:VAR`, `file:…`, `vault:…`)
+    /// at call time.
     user_supplied: HashMap<String, Vec<(String, String)>>,
     /// (tool_id, canonical args JSON) -> (inserted-at, raw pre-shaping result),
     /// for read-only tools when `read_cache_ttl_s` > 0. Response shaping and
     /// projection re-run per call on a clone, so a cache hit honors THIS call's
     /// `fields`. Bounded by `READ_CACHE_MAX_ENTRIES`.
-    read_cache: HashMap<(String, String), (std::time::Instant, Value)>,
-    /// resource URI -> owning upstream index, learned from the last
-    /// `resources/list` merge (refreshed on a read miss).
-    resource_origin: HashMap<String, usize>,
+    read_cache: Mutex<HashMap<(String, String), (std::time::Instant, Value)>>,
+    /// resource URI -> owning upstream index, learned from `resources/list`
+    /// merges (refreshed on a read miss).
+    resource_origin: Mutex<HashMap<String, usize>>,
     /// tool_id -> circuit-breaker state, for tools whose overlay sets `breaker:`.
-    breakers: HashMap<String, breaker::BreakerState>,
+    breakers: Mutex<HashMap<String, breaker::BreakerState>>,
+    /// Token buckets for `rate_limits` and overlay `rate_limit`.
+    limits: ratelimit::Buckets,
     /// Alternative retrievers scored against real traffic, serving nothing. Empty
     /// (and free) unless `shadow: true`. See `surface/shadow.rs`.
     shadow: shadow::Shadow,
     /// tool_id -> lazily resolved schema (immutable after load). Default-on
     /// preflight resolves on every call; without this a spec tool would re-expand
-    /// its `$ref`s each time. RefCell: fills under `&self` (Surface sits behind
-    /// the transport's Mutex, so borrows never overlap).
-    resolved_cache: std::cell::RefCell<HashMap<String, Value>>,
+    /// its `$ref`s each time.
+    resolved_cache: RwLock<HashMap<String, Value>>,
 }
 
-
 impl Surface {
-    pub async fn build(config: Config, granted: Vec<String>) -> Result<Self> {
+    pub async fn build(config: Config, secrets: Secrets) -> Result<Self> {
         let mut upstreams = Vec::new();
         let mut tools: Vec<ToolDef> = Vec::new();
         let mut by_id = HashMap::new();
@@ -114,10 +137,10 @@ impl Surface {
             // dispatch routes back to the right backend.
             let backend_idx = upstreams.len();
             let connected: Result<(Backend, Vec<ToolDef>)> = async {
-                let mut up = if ucfg.is_spec() {
-                    Backend::Spec(SpecBackend::new(ucfg)?)
+                let up = if ucfg.is_spec() {
+                    Backend::Spec(SpecBackend::new(ucfg, &secrets).await?)
                 } else if ucfg.is_http() {
-                    Backend::Http(HttpUpstream::connect(ucfg).await?)
+                    Backend::Http(HttpUpstream::connect(ucfg, &secrets).await?)
                 } else {
                     Backend::Mcp(Upstream::spawn(ucfg).await?)
                 };
@@ -177,14 +200,13 @@ impl Surface {
                             user_supplied.insert(t.id().to_string(), us);
                         }
                     }
-                    // Per-tool headers: expand ${ENV} now (fail loud, keeps secrets
+                    // Per-tool headers: resolve `${…}` now (fail loud, keeps secrets
                     // out of config); leave {{...}} generators for per-call resolution.
                     if !o.headers.is_empty() {
-                        let hs = o
-                            .headers
-                            .iter()
-                            .map(|(k, v)| Ok((k.clone(), crate::config::expand_env(v)?)))
-                            .collect::<Result<Vec<_>>>()?;
+                        let mut hs = Vec::with_capacity(o.headers.len());
+                        for (k, v) in &o.headers {
+                            hs.push((k.clone(), secrets.expand(v).await?));
+                        }
                         tool_headers.insert(t.id().to_string(), hs);
                     }
                 }
@@ -227,20 +249,21 @@ impl Surface {
         let workflow_by_id: HashMap<String, usize> =
             config.workflows.iter().enumerate().map(|(i, w)| (w.id.clone(), i)).collect();
 
-        let log = match &config.log_file {
-            Some(path) => Some(
+        let log = match config.log_file.as_deref() {
+            None => None,
+            Some("stderr") => Some(AuditSink::Stderr),
+            Some(path) => Some(AuditSink::File(Mutex::new(
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(path)
                     .with_context(|| format!("opening log_file {path}"))?,
-            ),
-            None => None,
+            ))),
         };
         let mut surface = Surface {
             shadow,
             config,
-            granted,
+            secrets,
             upstreams,
             tools,
             by_id,
@@ -252,10 +275,11 @@ impl Surface {
             patched_schemas: patched,
             tool_headers,
             user_supplied,
-            read_cache: HashMap::new(),
-            resource_origin: HashMap::new(),
-            breakers: HashMap::new(),
-            resolved_cache: std::cell::RefCell::new(HashMap::new()),
+            read_cache: Mutex::new(HashMap::new()),
+            resource_origin: Mutex::new(HashMap::new()),
+            breakers: Mutex::new(HashMap::new()),
+            limits: ratelimit::Buckets::default(),
+            resolved_cache: RwLock::new(HashMap::new()),
         };
         surface.build_exposed();
         // Binding registry: check overlays against the live upstream schema. A
@@ -277,37 +301,37 @@ impl Surface {
         Ok(surface)
     }
 
-    /// Append one NDJSON observability event (best-effort; logging never fails a
-    /// request). `event` is the kind (search/details/call); `fields` are merged in.
-    fn log_event(&mut self, event: &str, fields: Value) {
-        let Some(file) = self.log.as_mut() else { return };
-        let mut line = json!({"ts_ms": generators::epoch_millis(), "event": event});
+    /// Append one NDJSON audit event (best-effort; logging never fails a
+    /// request). Every line carries who acted (`caller`: the subject, or
+    /// `anonymous`), the event kind, and the event's own fields.
+    fn log_event(&self, caller: &Caller, event: &str, fields: Value) {
+        let Some(sink) = &self.log else { return };
+        let mut line = json!({"ts_ms": generators::epoch_millis(), "event": event, "caller": caller.label()});
         if let (Some(obj), Some(extra)) = (line.as_object_mut(), fields.as_object()) {
             for (k, v) in extra {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        use std::io::Write;
-        let _ = writeln!(file, "{line}");
+        match sink {
+            AuditSink::File(f) => {
+                use std::io::Write;
+                let mut f = lock(f);
+                let _ = writeln!(f, "{line}");
+            }
+            AuditSink::Stderr => eprintln!("{line}"),
+        }
     }
 
-    fn allowed(&self, tool_id: &str) -> bool {
-        self.config.allowed(tool_id, &self.granted)
+    fn allowed(&self, caller: &Caller, tool_id: &str) -> bool {
+        self.config.allowed(tool_id, &caller.scopes)
     }
 
-    fn visible_ids(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .map(|t| t.id().to_string())
-            .filter(|id| self.allowed(id))
-            .collect()
-    }
-
+    /// Passthrough mode declares EVERY tool by (sanitized) name; visibility is
+    /// applied per caller at list/call time. Three-tool mode declares none —
+    /// the agent reaches them via the meta-tools.
     fn build_exposed(&mut self) {
         let ids: Vec<String> = match self.config.mode {
-            // passthrough declares every visible tool by name; three_tool
-            // declares none (the agent reaches them via the meta-tools).
-            Mode::Passthrough => self.visible_ids(),
+            Mode::Passthrough => self.tools.iter().map(|t| t.id().to_string()).collect(),
             Mode::ThreeTool => vec![],
         };
         for id in ids {
@@ -379,14 +403,17 @@ impl Surface {
         self.by_id.get(tool_id).map(|&i| &self.tools[i])
     }
 
-    /// The tool def, only if the current caller is allowed to see it.
-    fn visible_def(&self, tool_id: &str) -> Option<&ToolDef> {
-        self.def_for(tool_id).filter(|_| self.allowed(tool_id))
+    /// The tool def, only if `caller` is allowed to see it.
+    fn visible_def(&self, caller: &Caller, tool_id: &str) -> Option<&ToolDef> {
+        self.def_for(tool_id).filter(|_| self.allowed(caller, tool_id))
     }
 
-    /// The full input schema to surface for a tool — resolved on demand for spec
-    /// upstreams (which store a cheap unresolved schema at load so huge specs load
-    /// instantly), else the schema already stored on the ToolDef.
+    /// The composite's index, only if `caller` is allowed to see it — the
+    /// workflow twin of [`Surface::visible_def`].
+    fn visible_workflow(&self, caller: &Caller, id: &str) -> Option<&usize> {
+        self.workflow_by_id.get(id).filter(|_| self.allowed(caller, id))
+    }
+
     /// Provenance for envelope unwrapping: does this tool's result come from a
     /// spec backend (whose executor wraps responses in `{status, body, …}`)?
     /// MCP/HTTP upstream results are never envelopes, whatever their shape.
@@ -397,18 +424,19 @@ impl Surface {
             .is_some_and(|u| matches!(self.upstreams.get(u), Some(Backend::Spec(_))))
     }
 
+    /// The full input schema to surface for a tool — an overlaid tool's patched
+    /// schema wins (resolved + patched at load); otherwise resolve lazily, once,
+    /// and memoize (schemas are immutable after load; default-on preflight hits
+    /// this per call).
     fn resolved_schema(&self, t: &ToolDef) -> Value {
-        // An overlaid tool's patched schema wins (it was resolved + patched at
-        // load); otherwise resolve lazily, once, and memoize (schemas are
-        // immutable after load; default-on preflight hits this per call).
         if let Some(p) = self.patched_schemas.get(t.id()) {
             return p.clone();
         }
-        if let Some(c) = self.resolved_cache.borrow().get(t.id()) {
+        if let Some(c) = read(&self.resolved_cache).get(t.id()) {
             return c.clone();
         }
         let v = self.raw_resolved(t);
-        self.resolved_cache.borrow_mut().insert(t.id().to_string(), v.clone());
+        write(&self.resolved_cache).insert(t.id().to_string(), v.clone());
         v
     }
 
@@ -422,11 +450,11 @@ impl Surface {
             .unwrap_or_else(|| t.input_schema.clone())
     }
 
-    /// The tools/list result the agent sees.
-    pub fn list_tools(&self) -> Value {
+    /// The tools/list result `caller` sees.
+    pub fn list_tools(&self, caller: &Caller) -> Value {
         let mut defs: Vec<Value> = Vec::new();
         for (name, id) in &self.exposed {
-            if let Some(t) = self.def_for(id) {
+            if let Some(t) = self.visible_def(caller, id) {
                 let mut desc = t.description.clone();
                 truncate_in_place(&mut desc, 1_000);
                 defs.push(json!({
@@ -455,18 +483,18 @@ impl Surface {
     // `call` gates on, so `minmcp search/help/call` work even in passthrough).
 
     /// Search tools by task description (CLI `minmcp search`).
-    pub fn cli_search(&self, query: &str, k: usize) -> String {
-        self.search_text(query, k).0
+    pub fn cli_search(&self, caller: &Caller, query: &str, k: usize) -> String {
+        self.search_text(caller, query, k).0
     }
 
     /// Full schema for one tool (CLI `minmcp help`).
-    pub fn cli_details(&self, tool_id: &str) -> String {
-        self.details_text(tool_id)
+    pub fn cli_details(&self, caller: &Caller, tool_id: &str) -> String {
+        self.details_text(caller, tool_id)
     }
 
     /// Invoke a tool or composite by id with optional projection (`minmcp call`).
-    pub async fn cli_call(&mut self, tool_id: &str, arguments: Value, fields: &[String]) -> Result<Value> {
-        let mut r = self.route_call(tool_id, arguments, fields).await?;
+    pub async fn cli_call(&self, caller: &Caller, tool_id: &str, arguments: Value, fields: &[String]) -> Result<Value> {
+        let mut r = self.route_call(caller, tool_id, arguments, fields).await?;
         truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
         Ok(r)
     }
@@ -474,7 +502,7 @@ impl Surface {
     /// Client-side errors (bad args, unknown tool) are returned as isError
     /// tool results with a `bad_arg` marker — NOT as Err, so the transport
     /// loop never mislabels them "the upstream may be down".
-    pub async fn call(&mut self, name: &str, args: Value) -> Result<Value> {
+    pub async fn call(&self, caller: &Caller, name: &str, args: Value) -> Result<Value> {
         let has_meta = self.config.mode != Mode::Passthrough;
         match name {
             "search_tools" if has_meta => {
@@ -486,13 +514,10 @@ impl Surface {
                     .and_then(Value::as_u64)
                     .and_then(|k| usize::try_from(k).ok())
                     .unwrap_or(DEFAULT_SEARCH_K);
-                let (text, served) = self.search_text(query, k);
-                self.log_event("search", json!({"query": query, "k": k}));
+                let (text, served) = self.search_text(caller, query, k);
+                self.log_event(caller, "search", json!({"query": query, "k": k}));
                 if self.shadow.enabled() {
-                    // Cloned because observe_search needs &mut self while `query`
-                    // still borrows `args`.
-                    let q = query.to_string();
-                    self.shadow.observe_search(&q, &served);
+                    self.shadow.observe_search(query, &served);
                 }
                 Ok(text_result(text, false))
             }
@@ -500,8 +525,8 @@ impl Surface {
                 let Some(id) = args.get("tool_id").and_then(Value::as_str) else {
                     return Ok(bad_arg("get_tool_details requires a 'tool_id' string"));
                 };
-                let text = self.details_text(id);
-                self.log_event("details", json!({"tool_id": id}));
+                let text = self.details_text(caller, id);
+                self.log_event(caller, "details", json!({"tool_id": id}));
                 Ok(text_result(text, false))
             }
             "call_tool" if has_meta => {
@@ -514,9 +539,9 @@ impl Surface {
                     // called directly, or a typo, must not count against a retriever
                     // that was never given the chance to rank it.
                     let eligible = self.by_id.contains_key(&id) || self.workflow_by_id.contains_key(&id);
-                    let obs = self.shadow.observe_call(&id, eligible);
-                    for o in obs {
+                    for o in self.shadow.observe_call(&id, eligible) {
                         self.log_event(
+                            caller,
                             "shadow",
                             json!({"tool_id": id, "method": o.method, "hit": o.hit, "rank": o.rank}),
                         );
@@ -542,20 +567,31 @@ impl Surface {
                 // Agent boundary: bound the result AFTER overlays/projection ran
                 // on the full body (workflow steps and verify call route_call/
                 // dispatch directly and read untruncated results).
-                let mut r = self.route_call(&id, inner, &fields).await?;
+                let mut r = self.route_call(caller, &id, inner, &fields).await?;
                 truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
                 Ok(r)
             }
             _ => {
-                // promoted / passthrough tool name (no meta wrapper -> no projection)
-                let Some(id) = self.exposed.get(name).cloned() else {
-                    let hint = ids::did_you_mean(name, self.exposed.keys().map(String::as_str));
+                // Passthrough tool name (no meta wrapper -> no projection).
+                // Visibility is applied HERE, before the name is resolved:
+                // handing a scoped-out name to dispatch would answer with
+                // `unknown tool_id "up.GetX" — did you mean …`, giving a caller
+                // the canonical id and its neighbours for tools tools/list
+                // deliberately withholds. A hidden tool must be shaped exactly
+                // like one that does not exist.
+                let Some(id) = self.exposed.get(name).filter(|id| self.allowed(caller, id)).cloned() else {
+                    let visible_names = self
+                        .exposed
+                        .iter()
+                        .filter(|(_, id)| self.allowed(caller, id))
+                        .map(|(n, _)| n.as_str());
+                    let hint = ids::did_you_mean(name, visible_names);
                     return Ok(text_result(
                         format!("unknown tool {name:?} —{hint} {}", self.recovery()),
                         true,
                     ));
                 };
-                let mut r = self.dispatch(&id, args, &[]).await?;
+                let mut r = self.dispatch(caller, &id, args, &[]).await?;
                 truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
                 Ok(r)
             }
@@ -564,7 +600,7 @@ impl Surface {
 
     /// Returns the agent-facing text and the ids it served, in rank order. The ids
     /// are what shadow mode compares its challengers against.
-    fn search_text(&self, query: &str, k: usize) -> (String, Vec<String>) {
+    fn search_text(&self, caller: &Caller, query: &str, k: usize) -> (String, Vec<String>) {
         // k=0 used to yield "no matches", which reads as a search failure; treat
         // it as "the default", like an omitted k.
         let k = if k == 0 { DEFAULT_SEARCH_K } else { k };
@@ -574,7 +610,7 @@ impl Surface {
         let mut lines: Vec<String> = Vec::new();
         let mut served: Vec<String> = Vec::new();
         for (id, _) in hits {
-            if !self.allowed(&id) {
+            if !self.allowed(caller, &id) {
                 continue; // invisible, not forbidden
             }
             // upstream tool or composite workflow (both indexed)
@@ -597,10 +633,10 @@ impl Surface {
         (lines.join("\n"), served)
     }
 
-    fn details_text(&self, tool_id: &str) -> String {
+    fn details_text(&self, caller: &Caller, tool_id: &str) -> String {
         // composite workflow: describe its declared inputs. Scope-gated like a
         // tool (search already hides it; details and call must agree).
-        if let Some(&i) = self.visible_workflow(tool_id) {
+        if let Some(&i) = self.visible_workflow(caller, tool_id) {
             let wf = &self.config.workflows[i];
             let schema = if wf.inputs.is_null() { json!({"type": "object"}) } else { wf.inputs.clone() };
             return serde_json::to_string_pretty(&json!({
@@ -611,10 +647,10 @@ impl Surface {
             }))
             .unwrap_or_default();
         }
-        let Some(t) = self.visible_def(tool_id) else {
+        let Some(t) = self.visible_def(caller, tool_id) else {
             return format!(
                 "unknown tool_id {tool_id:?} —{} {}",
-                self.suggest_near_misses(tool_id),
+                self.suggest_near_misses(caller, tool_id),
                 self.recovery()
             );
         };
@@ -679,34 +715,27 @@ impl Surface {
     }
 
     /// ` did you mean "x" or "y"?` for a mistyped id, from the closest known
-    /// tool/workflow ids (we hold the whole catalog — a dot-for-underscore slip
-    /// should never dead-end). Empty string when nothing is plausibly close.
-    fn suggest_near_misses(&self, wrong: &str) -> String {
+    /// tool/workflow ids the caller may see (we hold the whole catalog — a
+    /// dot-for-underscore slip should never dead-end). Empty string when nothing
+    /// is plausibly close.
+    fn suggest_near_misses(&self, caller: &Caller, wrong: &str) -> String {
         let candidates = self
             .by_id
             .keys()
             .chain(self.workflow_by_id.keys())
-            .filter(|id| self.allowed(id))
+            .filter(|id| self.allowed(caller, id))
             .map(String::as_str);
         ids::did_you_mean(wrong, candidates)
     }
 
-
-    /// The composite's index, only if the current caller is allowed to see it —
-    /// the workflow twin of [`Surface::visible_def`].
-    fn visible_workflow(&self, id: &str) -> Option<&usize> {
-        self.workflow_by_id.get(id).filter(|_| self.allowed(id))
-    }
-
     /// Route a call to a composite workflow if the id names one, else a tool.
-    async fn route_call(&mut self, id: &str, args: Value, fields: &[String]) -> Result<Value> {
-        if let Some(&i) = self.visible_workflow(id) {
-            let wf = self.config.workflows[i].clone(); // small; frees the borrow for &mut dispatch
-            return self.execute_workflow(&wf, args).await;
+    async fn route_call(&self, caller: &Caller, id: &str, args: Value, fields: &[String]) -> Result<Value> {
+        if let Some(&i) = self.visible_workflow(caller, id) {
+            let wf = &self.config.workflows[i];
+            return self.execute_workflow(caller, wf, args).await;
         }
-        self.dispatch(id, args, fields).await
+        self.dispatch(caller, id, args, fields).await
     }
-
 
     /// One-line description of any callable id — upstream tool or workflow.
     fn describe(&self, id: &str) -> Option<String> {
@@ -715,8 +744,4 @@ impl Surface {
         }
         self.workflow_by_id.get(id).map(|&i| self.config.workflows[i].description.clone())
     }
-
-
 }
-
-

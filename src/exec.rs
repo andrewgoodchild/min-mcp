@@ -5,9 +5,11 @@
 //! executor (ported from a Python prototype).
 
 use anyhow::{Context, Result};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
 use crate::config::ResultFormat;
+use crate::secrets::Secrets;
 use crate::spec::{Operation, QueryStyle, Spec};
 
 // A high safety net only — NOT the agent-facing budget. The budget truncation
@@ -137,7 +139,8 @@ fn scalar_str(v: &Value) -> Option<String> {
 pub struct Executor {
     client: reqwest::Client,
     base_url: String,
-    api_key: String,
+    /// The bearer, if any — a secret, so never in Debug output.
+    api_key: SecretString,
     /// Sent as the Accept header (GitHub wants application/vnd.github+json).
     accept: Option<String>,
     /// Extra static request headers (already ${VAR}-resolved). Covers mandatory
@@ -149,25 +152,29 @@ pub struct Executor {
     result_format: ResultFormat,
 }
 
-/// Resolve a spec upstream's static header map: expand `${VAR}` from the
-/// environment so a required runtime header can be set without hardcoding a
-/// secret. An unset variable is a hard error (fail loud). Reserved headers
-/// (Authorization, Accept, User-Agent) are set elsewhere and skipped here.
-pub fn resolve_headers(
+/// Resolve a spec upstream's static header map: expand `${…}` references (env,
+/// file, vault) so a required runtime header can be set without hardcoding a
+/// secret. An unresolvable reference is a hard error (fail loud). Reserved
+/// headers (Authorization, Accept, User-Agent) are set elsewhere and skipped.
+pub async fn resolve_headers(
     headers: &std::collections::HashMap<String, String>,
+    secrets: &Secrets,
 ) -> Result<Vec<(String, String)>> {
     const RESERVED: [&str; 3] = ["authorization", "accept", "user-agent"];
-    headers
-        .iter()
-        .filter(|(k, _)| !RESERVED.contains(&k.to_lowercase().as_str()))
-        .map(|(k, v)| Ok((k.clone(), crate::config::expand_env(v)?)))
-        .collect()
+    let mut out = Vec::with_capacity(headers.len());
+    for (k, v) in headers {
+        if RESERVED.contains(&k.to_lowercase().as_str()) {
+            continue;
+        }
+        out.push((k.clone(), secrets.expand(v).await?));
+    }
+    Ok(out)
 }
 
 impl Executor {
     pub fn new(
         base_url: &str,
-        api_key: &str,
+        api_key: SecretString,
         accept: Option<String>,
         headers: Vec<(String, String)>,
         result_format: ResultFormat,
@@ -184,7 +191,7 @@ impl Executor {
         Ok(Executor {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
+            api_key,
             accept,
             headers,
             result_format,
@@ -234,8 +241,8 @@ impl Executor {
         // Only send Authorization when we actually have a key — a no-auth public API
         // (auth_env unset/empty) must not receive an empty `Bearer `, which many
         // servers reject with a 4xx/5xx.
-        if !self.api_key.is_empty() {
-            merged.push(("authorization".into(), format!("Bearer {}", self.api_key)));
+        if !self.api_key.expose_secret().is_empty() {
+            merged.push(("authorization".into(), format!("Bearer {}", self.api_key.expose_secret())));
         }
         if let Some(accept) = &self.accept {
             merged.push(("accept".into(), accept.clone()));
@@ -309,15 +316,16 @@ mod tests {
         out
     }
 
-    #[test]
-    fn resolve_headers_expands_env_and_skips_reserved() {
+    #[tokio::test]
+    async fn resolve_headers_expands_env_and_skips_reserved() {
         use std::collections::HashMap;
+        let secrets = Secrets::env_only();
         std::env::set_var("MINMCP_TEST_HDR", "2022-06-28");
         let mut h = HashMap::new();
         h.insert("Notion-Version".to_string(), "${MINMCP_TEST_HDR}".to_string());
         h.insert("X-Static".to_string(), "literal".to_string());
         h.insert("Authorization".to_string(), "Bearer nope".to_string()); // reserved -> dropped
-        let mut got = resolve_headers(&h).unwrap();
+        let mut got = resolve_headers(&h, &secrets).await.unwrap();
         got.sort();
         assert_eq!(got, vec![
             ("Notion-Version".to_string(), "2022-06-28".to_string()),
@@ -326,7 +334,7 @@ mod tests {
         // an unset var is a hard error (no empty header sent)
         let mut bad = HashMap::new();
         bad.insert("X".to_string(), "${MINMCP_DEFINITELY_UNSET_XYZ}".to_string());
-        assert!(resolve_headers(&bad).is_err());
+        assert!(resolve_headers(&bad, &secrets).await.is_err());
     }
 
     #[test]
