@@ -17,6 +17,8 @@ use common::{HttpServer, INIT};
 const CA: &str = "tests/fixtures/tls/ca.crt";
 const CLIENT_CRT: &str = "tests/fixtures/tls/client.crt";
 const CLIENT_KEY: &str = "tests/fixtures/tls/client.key";
+const CLIENT2_CRT: &str = "tests/fixtures/tls/client2.crt";
+const CLIENT2_KEY: &str = "tests/fixtures/tls/client2.key";
 const CONTENT_TYPE: &str = "Content-Type: application/json";
 const ACCEPT: &str = "Accept: application/json, text/event-stream";
 
@@ -146,4 +148,56 @@ fn a_body_within_the_cap_still_works() {
     let (body, code) = init_post(&s.url(), &[]);
     assert_eq!(code, 0);
     assert!(body.contains("protocolVersion"), "a small body must not be capped: {body}");
+}
+
+/// One `tools/call`, as a client identified only by its certificate.
+///
+/// Each curl is its own connection, so the MCP session has to be opened first:
+/// `initialize`, keep the `Mcp-Session-Id` it returns, then call with it.
+fn call_as(url: &str, cert: &str, key: &str) -> String {
+    let tls = ["--cacert", CA, "--cert", cert, "--key", key];
+
+    // initialize, capturing response headers for the session id.
+    let mut args: Vec<&str> = tls.to_vec();
+    args.extend(["-s", "-D", "-", "-o", "/dev/null", "-X", "POST", url, "-H", CONTENT_TYPE, "-H", ACCEPT, "-d", INIT]);
+    let (headers, exit) = curl(&args);
+    assert_eq!(exit, 0, "initialize should complete: {headers}");
+    let session = headers
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("mcp-session-id").then(|| v.trim().to_string())
+        })
+        .unwrap_or_else(|| panic!("no session id in: {headers}"));
+    let session_header = format!("MCP-Session-Id: {session}");
+
+    let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fixture_GetPing","arguments":{}}}"#;
+    let (out, exit) = post(url, body, &tls, &["-H", &session_header]);
+    assert_eq!(exit, 0, "the call should complete: {out}");
+    out
+}
+
+#[test]
+fn rate_limit_buckets_are_keyed_per_client_certificate() {
+    // No `auth:` here, so no request names a subject. Before `Caller::rate_key`
+    // every such caller was charged to one `anonymous` bucket, and one client
+    // could exhaust every other client's budget. The limit is 1 call per 300s.
+    let s = HttpServer::start("127.0.0.1", &["--config", "tests/fixtures/e2e-mtls-ratelimit.yaml"]);
+
+    // Client 1 spends its single call. The upstream is unreachable by design,
+    // so this comes back an error — but a charged one.
+    let first = call_as(&s.url(), CLIENT_CRT, CLIENT_KEY);
+    assert!(!first.contains("RATE_LIMITED"), "the first call must not be limited: {first}");
+
+    // Client 1 again: now over its own limit.
+    let second = call_as(&s.url(), CLIENT_CRT, CLIENT_KEY);
+    assert!(second.contains("RATE_LIMITED"), "the second call must be limited: {second}");
+
+    // A DIFFERENT certificate: its own bucket, so it is not limited by what
+    // client 1 spent. This is the assertion the whole change exists for.
+    let other = call_as(&s.url(), CLIENT2_CRT, CLIENT2_KEY);
+    assert!(
+        !other.contains("RATE_LIMITED"),
+        "a different client certificate must have its own bucket, got: {other}"
+    );
 }

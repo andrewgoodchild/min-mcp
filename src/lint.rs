@@ -115,18 +115,16 @@ fn is_hidden(c: char) -> bool {
 const REQUIRED_MAX: usize = 8;
 const DEEP_MAX: usize = 6;
 
-/// Lint one tool from its (name, description, resolved input schema). `mutating`
-/// says whether the tool has a side effect (a write/delete), used by the schema-
-/// safety rule; it's determined reliably from the HTTP method for spec tools (see
-/// [`is_mutating`]). Returns the ids of the rules that fired.
+/// The tool-poisoning rules, decidable from a tool's name and description
+/// alone.
 ///
-/// The cross-tool `confusable_descriptions` rule can't be decided from one tool,
-/// so it is injected by the caller ([`Surface::lint_report`]) after a whole-surface
-/// pass; see [`confusable_key`].
-pub fn lint(name: &str, description: &str, schema: &Value, mutating: bool) -> Vec<&'static str> {
+/// Split out from [`lint`] because it needs no schema: `lint` resolves each
+/// tool's schema first, which is O(tools) and why `minmcp lint` is opt-in,
+/// while these three run at **startup** under `poisoning_policy` where that
+/// cost would be unacceptable. One rule set, two callers — a tool the linter
+/// flags and a tool the server refuses can never disagree.
+pub fn poisoning(name: &str, description: &str) -> Vec<&'static str> {
     let mut fired = Vec::new();
-
-    // --- poisoning rules ---
     // The name is checked too: it reaches the model on every turn, and a
     // zero-width character there is the cheapest way to shadow a real tool.
     if description.chars().any(is_hidden) || name.chars().any(is_hidden) {
@@ -141,6 +139,21 @@ pub fn lint(name: &str, description: &str, schema: &Value, mutating: bool) -> Ve
     if SECRET_ARTIFACTS.iter().any(|p| lowered.contains(p)) {
         fired.push("secret_solicitation");
     }
+    fired
+}
+
+/// Lint one tool from its (name, description, resolved input schema). `mutating`
+/// says whether the tool has a side effect (a write/delete), used by the schema-
+/// safety rule; it's determined reliably from the HTTP method for spec tools (see
+/// [`is_mutating`]). Returns the ids of the rules that fired.
+///
+/// The cross-tool `confusable_descriptions` rule can't be decided from one tool,
+/// so it is injected by the caller ([`Surface::lint_report`]) after a whole-surface
+/// pass; see [`confusable_key`].
+pub fn lint(name: &str, description: &str, schema: &Value, mutating: bool) -> Vec<&'static str> {
+    let mut fired = Vec::new();
+
+    fired.extend(poisoning(name, description));
 
     // --- description rules ---
     if description.trim().is_empty() {

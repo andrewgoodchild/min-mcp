@@ -533,7 +533,7 @@ pub async fn serve_http(
         // A transient accept failure (EMFILE, a reset mid-handshake) must not
         // take the whole server down; log it and keep accepting, with a short
         // pause so a persistent condition can't spin the loop.
-        let (tcp, _peer) = match listener.accept().await {
+        let (tcp, peer) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 crate::log_warn!("accepting connection failed: {e}; continuing");
@@ -548,6 +548,12 @@ pub async fn serve_http(
         let identity = identity.clone();
         let process_caller = process_caller.clone();
         let tls = tls.clone();
+        // What the CONNECTION knows about its client, for rate-limit bucketing
+        // when the request names no subject. Filled in below once the transport
+        // is up — before a single request can be served on it — so the guard can
+        // read it without the guard having to be built per handshake outcome.
+        let origin: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+        let conn_origin = origin.clone();
         // Gate on Origin and identity before the request reaches the MCP
         // service, then hand it off with the caller attached. One task per
         // connection; a slow request never blocks the accept loop.
@@ -555,6 +561,7 @@ pub async fn serve_http(
             let inner = inner.clone();
             let identity = identity.clone();
             let process_caller = process_caller.clone();
+            let origin = origin.clone();
             async move {
                 // Borrowed, and only owned on the refusal path; the flag is
                 // tested first so an identity-enforced remote bind (where the
@@ -573,6 +580,13 @@ pub async fn serve_http(
                         crate::log_info!("refused an HTTP request: {}", r.reason);
                         return Ok(plain_response(hyper::StatusCode::UNAUTHORIZED, Some(r.challenge), &r.reason));
                     }
+                };
+                // Never overrides a subject the request supplied; `rate_key`
+                // prefers the subject and falls back to this.
+                let caller = if caller.subject.is_none() {
+                    Arc::new((*caller).clone().with_origin(origin.get().cloned()))
+                } else {
+                    caller
                 };
                 req.extensions_mut().insert(caller);
                 // The body cap is rmcp's, from `with_max_request_body_bytes`
@@ -603,10 +617,17 @@ pub async fn serve_http(
             };
             match tls {
                 None => {
+                    let _ = conn_origin.set(format!("peer:{}", peer.ip()));
                     let _ = conn().serve_connection(TokioIo::new(tcp), guarded).await;
                 }
                 Some(tls) => match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, tls.accept(tcp)).await {
                     Ok(Ok(stream)) => {
+                        // A client certificate identifies its holder far better
+                        // than an address does — several tenants can share an
+                        // egress IP, but not a certificate.
+                        let who = client_fingerprint(stream.get_ref().1)
+                            .unwrap_or_else(|| format!("peer:{}", peer.ip()));
+                        let _ = conn_origin.set(who);
                         let _ = conn().serve_connection(TokioIo::new(stream), guarded).await;
                     }
                     // Includes a client that presented no certificate, or one
@@ -617,6 +638,17 @@ pub async fn serve_http(
             }
         });
     }
+}
+
+/// A stable per-client key from the leaf client certificate: `cert:<sha256 hex,
+/// truncated>`. Used to bucket rate limits under mutual TLS, never for identity
+/// or scopes — it names a key holder, not a person, and it is not put in audit
+/// lines. Truncated because this keys a HashMap, not a security decision.
+fn client_fingerprint(conn: &rustls::ServerConnection) -> Option<String> {
+    let leaf = conn.peer_certificates()?.first()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, leaf.as_ref());
+    let hex: String = digest.as_ref().iter().take(16).map(|b| format!("{b:02x}")).collect();
+    Some(format!("cert:{hex}"))
 }
 
 /// A plain-text response in the same body shape rmcp's service returns.

@@ -110,6 +110,22 @@ impl Surface {
         out
     }
 
+    /// Tools whose name or description trips a tool-poisoning rule, each with
+    /// the rules it fired. Drives startup enforcement (`poisoning_policy`).
+    ///
+    /// Unlike [`Self::lint_report`] this resolves no schemas — the poisoning
+    /// rules read the name and description only — so it is cheap enough to run
+    /// on every start, including for a 1,200-tool spec.
+    pub fn poisoned_tools(&self) -> Vec<(String, Vec<&'static str>)> {
+        self.tools
+            .iter()
+            .filter_map(|t| {
+                let fired = crate::lint::poisoning(&t.name, &t.description);
+                (!fired.is_empty()).then(|| (t.id().to_string(), fired))
+            })
+            .collect()
+    }
+
     /// Static quality-lint over every registered tool. Resolves each tool's
     /// schema first (that's what the agent actually sees via get_tool_details),
     /// runs the best-practice rule set, and returns per-rule aggregate stats plus

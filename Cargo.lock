@@ -1111,6 +1111,7 @@ dependencies = [
  "jaq-std",
  "jsonwebtoken",
  "reqwest 0.12.28",
+ "ring",
  "rmcp",
  "rustls",
  "secrecy",

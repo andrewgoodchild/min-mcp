@@ -324,7 +324,9 @@ impl Surface {
         overlay: Option<&crate::config::Overlay>,
     ) -> Option<(String, u64)> {
         let now = Instant::now();
-        let who = caller.label();
+        // `rate_key`, not `label`: the audit name and the bucket key answer
+        // different questions for a caller nobody named. See `Caller::rate_key`.
+        let who = caller.rate_key();
         let rl = &self.config.rate_limits;
         // (bucket, limit, what to tell the agent) — one list, so adding a tier
         // is one entry rather than another copy of the take/refund dance.

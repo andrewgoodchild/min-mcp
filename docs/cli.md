@@ -68,6 +68,13 @@ rather than at the reader:
 | `model_directed_instruction` | Phrases that instruct rather than describe: "ignore previous instructions", "do not tell the user", "before using this tool…" |
 | `secret_solicitation` | A local credential artifact a remote tool cannot need — `~/.ssh/id_rsa`, `.aws/credentials`, `.env file` |
 
+These same three rules run at **startup** under
+[`poisoning_policy`](configuration.md), which is what the server does about them
+— `warn` (default) names each flagged tool and serves it anyway, `strict`
+refuses to start, `off` skips the check. The startup check resolves no schemas
+(the rules read only the name and description), so unlike `minmcp lint` it is
+cheap enough to run on every start.
+
 They are matched on the definition alone, so they catch a poisoned *description*
 — not a poisoned *response*, and not argument-level exfiltration. That boundary
 is deliberate: min-mcp is a proxy, not a guardrail product. The rules are tuned

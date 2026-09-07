@@ -446,6 +446,29 @@ pub enum BindingPolicy {
     Strict,
 }
 
+/// What to do when a tool's own name or description trips a tool-poisoning rule
+/// (see `crate::lint::poisoning`) — text aimed at the model rather than at a
+/// reader, or engineered to be invisible to one.
+///
+/// The linter only ever *reports*; this is what the SERVER does about it, so a
+/// poisoned tool is not merely detectable but refusable. `warn` by default: the
+/// rules measure zero false positives across Stripe (589 ops) and GitHub
+/// (1,216), but refusing to start is a big hammer to hand someone by default,
+/// and a hand-written MCP upstream is a likelier source of a false positive than
+/// the OpenAPI specs the rules were tuned on.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PoisoningPolicy {
+    /// Do not check at all.
+    Off,
+    /// Log a warning naming each flagged tool, and serve it anyway. Default.
+    #[default]
+    Warn,
+    /// Refuse to start. For CI, and for a fleet where an upstream you do not
+    /// own could change its descriptions under you.
+    Strict,
+}
+
 /// Per-overlay binding strength. The consequence of breakage differs by overlay
 /// — a PII-strip that silently stops applying is a data leak (fail hard), a
 /// description patch that stops applying is cosmetic (fail soft) — so strength
@@ -940,6 +963,10 @@ pub struct Config {
     /// How to treat bindings that are broken against the live upstream schema.
     #[serde(default)]
     pub binding_policy: BindingPolicy,
+    /// What to do about a tool whose name or description trips a tool-poisoning
+    /// rule. See [`PoisoningPolicy`].
+    #[serde(default)]
+    pub poisoning_policy: PoisoningPolicy,
     /// Validate each call against its (patched) input schema BEFORE the upstream
     /// call: a missing required field or an out-of-enum value returns a
     /// structured error locally (no round-trip, no opaque upstream 400). ON by
@@ -1503,6 +1530,21 @@ overlays:
         assert_eq!(tls.client_ca_file.as_deref(), Some("/etc/minmcp/clients.crt"));
         assert_eq!(c.http.limits.max_body_bytes, 2048);
         assert_eq!(c.http.limits.max_in_flight, 8);
+    }
+
+    #[test]
+    fn poisoning_policy_parses_and_defaults_to_warn() {
+        let c = cfg("upstreams: [{name: s, command: x}]\n");
+        assert_eq!(c.poisoning_policy, PoisoningPolicy::Warn, "default must not refuse to start");
+        for (text, want) in [
+            ("poisoning_policy: strict\n", PoisoningPolicy::Strict),
+            ("poisoning_policy: off\n", PoisoningPolicy::Off),
+            ("poisoning_policy: warn\n", PoisoningPolicy::Warn),
+        ] {
+            let c = cfg(&format!("upstreams: [{{name: s, command: x}}]\n{text}"));
+            assert_eq!(c.poisoning_policy, want, "for {text}");
+        }
+        assert!(Config::from_yaml("upstreams: [{name: s, command: x}]\npoisoning_policy: loose\n").is_err());
     }
 
     #[test]

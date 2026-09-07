@@ -1,0 +1,7 @@
+# The poisoned spec with the check disabled entirely.
+mode: three_tool
+poisoning_policy: off
+upstreams:
+  - name: bad
+    spec: poisoned-openapi.json
+    base_url: https://example.invalid

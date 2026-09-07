@@ -117,6 +117,11 @@ pub struct Surface {
     resolved_cache: RwLock<HashMap<String, Value>>,
 }
 
+/// What to do about a tool that trips a poisoning rule. Kept out of the
+/// `bail!` so the prose can be read and edited as prose.
+const POISONING_HINT: &str = "Inspect them with `minmcp lint`, then either exclude them (`filters`), \
+replace the description with an overlay, or set `poisoning_policy: warn` if they are false positives.";
+
 impl Surface {
     pub async fn build(config: Config, secrets: Secrets) -> Result<Self> {
         let mut upstreams = Vec::new();
@@ -297,6 +302,32 @@ impl Surface {
         }
         if !strong.is_empty() {
             anyhow::bail!("{} strong overlay binding(s) broken (fail-closed):\n{}", strong.len(), fmt(&strong));
+        }
+        // Tool poisoning: a description written to steer the MODEL rather than
+        // inform a reader. The linter reports these; this is where the server
+        // decides whether to serve them. Cheap enough to run every start —
+        // the rules read name and description, and resolve no schemas.
+        use crate::config::PoisoningPolicy;
+        if surface.config.poisoning_policy != PoisoningPolicy::Off {
+            let poisoned = surface.poisoned_tools();
+            if !poisoned.is_empty() {
+                let detail = poisoned
+                    .iter()
+                    .map(|(t, rules)| format!("  {t}: {}", rules.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                match surface.config.poisoning_policy {
+                    PoisoningPolicy::Strict => anyhow::bail!(
+                        "{} tool(s) tripped a tool-poisoning rule (poisoning_policy: strict):\n{detail}\n{POISONING_HINT}",
+                        poisoned.len()
+                    ),
+                    // `off` is filtered out above; `warn` is the default.
+                    _ => crate::log_warn!(
+                        "{} tool(s) tripped a tool-poisoning rule and are being served anyway (poisoning_policy: warn):\n{detail}",
+                        poisoned.len()
+                    ),
+                }
+            }
         }
         Ok(surface)
     }
