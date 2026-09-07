@@ -6,6 +6,10 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] — 2026-09-08
+
 ### Added — caller identity and poisoning enforcement
 
 - **Rate-limit buckets key on `Caller::rate_key()`, not the audit label.** The
@@ -75,7 +79,7 @@ All notable changes to min-mcp. Format loosely follows
   credential *nouns* instead of artifacts flagged 18 GitHub tools, every one a
   false positive, which is why the rule matches paths.
 
-### Changed
+### Changed — hardening
 
 - `serve --http` warns at startup when rate limits are configured but nothing
   supplies a caller subject. Buckets key on the subject, so a gateway sending
@@ -86,7 +90,7 @@ All notable changes to min-mcp. Format loosely follows
 - `serve --http` warns when binding a non-loopback address in plaintext, where
   bearer tokens and gateway identity headers cross the network in the clear.
 
-### Security
+### Security — hardening
 
 - TLS and the request caps close two of the three gaps the security notes listed
   as "not built". The remaining one — per-tenant isolation in a single process —
@@ -101,8 +105,6 @@ already in the tree (reqwest and rmcp pull them), so no new third-party code is
 introduced. rustls is pinned to the **`ring`** provider with
 `default-features = false`: its default feature set selects `aws_lc_rs`, which
 needs a C toolchain the Windows release build does not have.
-
-## [0.2.0] — 2026-09-06
 
 ### Added — the control layer for running behind a gateway
 
