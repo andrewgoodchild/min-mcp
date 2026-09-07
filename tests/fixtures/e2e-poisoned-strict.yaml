@@ -1,0 +1,7 @@
+# The same spec under `poisoning_policy: strict`: refuse to start.
+mode: three_tool
+poisoning_policy: strict
+upstreams:
+  - name: bad
+    spec: poisoned-openapi.json
+    base_url: https://example.invalid

@@ -1,0 +1,7 @@
+# A spec with deliberately poisoned tool descriptions. Default policy (`warn`):
+# the tools are flagged on stderr and served anyway (see tests/poisoning_e2e.rs).
+mode: three_tool
+upstreams:
+  - name: bad
+    spec: poisoned-openapi.json
+    base_url: https://example.invalid

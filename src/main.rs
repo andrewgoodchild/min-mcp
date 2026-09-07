@@ -203,14 +203,17 @@ async fn build(common: &Common) -> Result<Built> {
     let caller = resolve_caller(&cfg, common, verifier.as_deref()).await?;
     let identity = rmcp_serve::HttpIdentity::from_auth(&cfg.auth, verifier);
     let http = cfg.http.clone();
-    // Rate limits key on the caller's subject, so a deployment that configures
-    // limits but supplies no subject silently gets ONE bucket for everyone.
-    // That is documented, but it is a genuine surprise when the callers *are*
-    // authenticated — a gateway forwarding scopes without an identity header.
+    // Rate limits key on the caller's subject, falling back to what the
+    // connection knows (`Caller::rate_key`). That fallback separates direct
+    // clients and certificate holders, but NOT callers behind a shared gateway:
+    // they arrive on one peer address, so without an identity header they still
+    // share a bucket — and unlike the anonymous case, those callers *are*
+    // authenticated and hold distinct scopes, which is what makes it surprising.
     if common.http.is_some() && cfg.rate_limits.any() && !cfg.auth.names_the_caller() {
         crate::log_warn!(
-            "rate limits are configured but nothing supplies a caller subject, so every caller \
-             shares one bucket: set `auth.trusted_headers.subject`, or use bearer tokens (whose \
+            "rate limits are configured but nothing names the caller, so buckets fall back to the \
+             connection (client certificate, else peer address); callers sharing one gateway will \
+             share a bucket. Set `auth.trusted_headers.subject`, or use bearer tokens (whose \
              `auth.subject_claim` defaults to `sub`)"
         );
     }

@@ -6,6 +6,32 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Added — caller identity and poisoning enforcement
+
+- **Rate-limit buckets key on `Caller::rate_key()`, not the audit label.** The
+  two answer different questions for a caller nobody named: `anonymous` is the
+  right word for an audit line and the wrong key for a bucket, where it charged
+  every unnamed caller to one budget. The key is now the subject, else what the
+  connection knows (the client certificate's fingerprint under mutual TLS, else
+  the peer address), else `anonymous`. The fallback is a bucket key only — it
+  never reaches an audit line and never grants a scope, because it names a
+  socket rather than a person.
+
+  This is an improvement, not a cure, and it changes how limits are spent:
+  callers that previously shared one `anonymous` bucket now get one each, so
+  aggregate throughput can rise where a deployment was relying on that shared
+  bucket as a global cap. It still does not separate callers behind one gateway
+  — they share a peer address — so the startup warning stays, now describing the
+  fallback rather than claiming a single shared bucket.
+- **`poisoning_policy`** decides what the SERVER does about a tool whose name or
+  description trips a tool-poisoning rule, which until now was only ever
+  *reported* by `minmcp lint`: `warn` (default) names each flagged tool and
+  serves it, `strict` refuses to start, `off` skips the check. The rules are
+  factored out of `lint()` so they resolve no schemas — `minmcp lint` is opt-in
+  precisely because resolving every schema is O(tools), and the startup check
+  reads names and descriptions only. One rule set, two callers, so a tool the
+  linter flags and a tool the server refuses can never disagree.
+
 ### Added — transport hardening
 
 - **TLS on the listener.** `http.tls.cert_file` / `key_file` terminate TLS in

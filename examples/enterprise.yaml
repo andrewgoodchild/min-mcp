@@ -73,7 +73,16 @@ http:
                                            # request handling, NOT concurrent
                                            # upstream calls — see the docs.
 
+# A tool whose description is written to steer the MODEL rather than inform a
+# reader is refused rather than merely reported. `warn` (the default) names it
+# and serves it; `strict` refuses to start, which is the right setting when the
+# upstreams are not yours and their descriptions can change under you.
+poisoning_policy: strict
+
 # --- Limits -----------------------------------------------------------------------
+# Buckets key on the caller's subject (set by `trusted_headers.subject` above),
+# falling back to the client certificate or peer address. Callers behind ONE
+# gateway share a peer address, which is why the subject header matters here.
 rate_limits:
   per_caller: { calls: 600, per_s: 60 }    # a caller's total tool calls
   per_tool:   { calls: 120, per_s: 60 }    # per (caller, tool)

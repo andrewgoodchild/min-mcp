@@ -1,0 +1,17 @@
+# Mutual TLS with a deliberately tiny per-caller limit, so the rate-limit BUCKET
+# KEY is observable from the wire: two client certificates must not share a
+# budget (see tests/tls_e2e.rs). No `auth:`, so no request names a subject —
+# which is exactly the case `Caller::rate_key` had to fix.
+mode: passthrough
+poisoning_policy: off
+upstreams:
+  - name: fixture
+    spec: mini-openapi.json
+    base_url: https://example.invalid
+rate_limits:
+  per_caller: { calls: 1, per_s: 300 }
+http:
+  tls:
+    cert_file: tls/server.crt
+    key_file: tls/server.key
+    client_ca_file: tls/ca.crt

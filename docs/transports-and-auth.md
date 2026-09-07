@@ -265,15 +265,26 @@ overlays:
 
 `calls` is also the burst; the bucket refills at `calls / per_s` per second.
 
-Buckets key on the caller's **subject**, and every caller without one shares a
-single `anonymous` bucket. Over HTTP without identity that is the whole port,
-which is expected. The case to watch is subtler: a gateway configured with
-`trusted_headers.scopes` but no `trusted_headers.subject` produces callers who
-are authenticated and hold distinct scopes yet still share one bucket, so one
-noisy tenant rate-limits every other. `serve --http` warns at startup when rate
-limits are configured and nothing supplies a subject. Set
-`auth.trusted_headers.subject`, or use bearer tokens, whose `auth.subject_claim`
-defaults to `sub`.
+Buckets key on the most specific thing actually known about the caller:
+
+1. the **subject**, when the request names one — a bearer's `sub` (or
+   `auth.subject_claim`), or the gateway's `trusted_headers.subject`;
+2. else the **connection** — the client certificate's fingerprint under mutual
+   TLS, else the peer address;
+3. else `anonymous`, one shared bucket.
+
+Step 2 is an improvement, not a cure, and the distinction matters when you size
+limits. It genuinely separates direct clients that present no token, and it
+separates certificate holders under mutual TLS. It does **not** separate callers
+behind a shared gateway: they arrive on one peer address, so a gateway that
+forwards `trusted_headers.scopes` without `trusted_headers.subject` still lands
+them in one bucket — and those callers are authenticated and hold distinct
+scopes, which is what makes it surprising. Nothing observable at the transport
+can tell them apart, so `serve --http` warns at startup instead of pretending
+otherwise. Set `auth.trusted_headers.subject`, or use bearer tokens.
+
+The connection fallback is a bucket key only. It never appears in an audit line
+and never grants a scope: it names a socket, not a person.
 
 ## Audit log
 

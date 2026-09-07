@@ -49,6 +49,9 @@ hyper = { version = "1", default-features = false, features = ["server", "http1"
 # `std` brings pki-types' PEM file loading, so no rustls-pemfile either.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# SHA-256 for the client-certificate fingerprint that keys rate limits under
+# mutual TLS. Already in the tree as rustls' crypto provider; no new code.
+ring = "0.17"
 # The global in-flight cap is tower's own shared-semaphore layer, wrapped around
 # rmcp's service. (The body cap needs no layer at all: rmcp's service enforces
 # one itself as it streams the POST body, so the configured value is handed to
