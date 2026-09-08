@@ -123,4 +123,112 @@ mod tests {
         assert_eq!(ttl, 3600);
         assert!(parse_token_response(&json!({"token_type": "bearer"})).is_err());
     }
+
+    // --- against a real token endpoint, in-process ---------------------------
+
+    use crate::testserver::{self, Reply};
+
+    fn cfg(token_url: String) -> OAuthConfig {
+        OAuthConfig {
+            token_url,
+            client_id: "id-1".into(),
+            client_secret: "shh".into(),
+            scope: Some("read write".into()),
+        }
+    }
+
+    async fn client(url: String) -> OAuthClient {
+        OAuthClient::new(&cfg(url), &Secrets::env_only()).await.expect("build client")
+    }
+
+    #[tokio::test]
+    async fn fetches_a_token_and_posts_the_client_credentials_grant() {
+        let srv = testserver::spawn(|_, _| Reply::json(r#"{"access_token":"tok-1","expires_in":3600}"#)).await;
+        let c = client(srv.url()).await;
+        assert_eq!(c.bearer().await.unwrap(), "tok-1");
+
+        // The form is what an OAuth server expects, secret included — and the
+        // configured scope is forwarded rather than dropped.
+        let body = &srv.seen()[0].body;
+        for field in ["grant_type=client_credentials", "client_id=id-1", "client_secret=shh", "scope=read"] {
+            assert!(body.contains(field), "form missing {field}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cached_token_is_reused_instead_of_refetched() {
+        // bearer() runs before EVERY upstream request, so a cache miss per call
+        // would put a token round-trip in front of all of them.
+        let srv = testserver::spawn(|n, _| {
+            Reply::json(format!(r#"{{"access_token":"tok-{n}","expires_in":3600}}"#))
+        })
+        .await;
+        let c = client(srv.url()).await;
+        assert_eq!(c.bearer().await.unwrap(), "tok-1");
+        assert_eq!(c.bearer().await.unwrap(), "tok-1", "second call must come from cache");
+        assert_eq!(c.bearer().await.unwrap(), "tok-1");
+        assert_eq!(srv.hits(), 1, "the token endpoint must be hit once");
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_share_one_round_trip() {
+        // Single-flight: without it, a cold cache under load mints one token per
+        // in-flight request and hammers the IdP.
+        let srv = testserver::spawn(|n, _| {
+            Reply::json(format!(r#"{{"access_token":"tok-{n}","expires_in":3600}}"#))
+        })
+        .await;
+        let c = std::sync::Arc::new(client(srv.url()).await);
+        let mut set = Vec::new();
+        for _ in 0..8 {
+            let c = c.clone();
+            set.push(tokio::spawn(async move { c.bearer().await.unwrap() }));
+        }
+        let mut tokens = Vec::new();
+        for t in set {
+            tokens.push(t.await.unwrap());
+        }
+        assert_eq!(srv.hits(), 1, "8 concurrent callers must share one fetch, got {} hits", srv.hits());
+        assert!(tokens.iter().all(|t| t == "tok-1"), "all callers get the same token: {tokens:?}");
+    }
+
+    #[tokio::test]
+    async fn a_token_is_refetched_once_it_nears_expiry() {
+        // The cache expires a minute EARLY, so `expires_in: 61` is usable for
+        // about a second — enough to observe the refresh without a slow test.
+        let srv = testserver::spawn(|n, _| {
+            Reply::json(format!(r#"{{"access_token":"tok-{n}","expires_in":61}}"#))
+        })
+        .await;
+        let c = client(srv.url()).await;
+        assert_eq!(c.bearer().await.unwrap(), "tok-1");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(c.bearer().await.unwrap(), "tok-2", "an expiring token must be refreshed");
+        assert_eq!(srv.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_from_the_token_endpoint_names_the_status() {
+        let srv = testserver::spawn(|_, _| Reply::status(401)).await;
+        let err = format!("{:#}", client(srv.url()).await.bearer().await.unwrap_err());
+        assert!(err.contains("401"), "the error should name the status: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_token_response_is_an_error_not_a_panic() {
+        let srv = testserver::spawn(|_, _| Reply::json("not json at all")).await;
+        assert!(client(srv.url()).await.bearer().await.is_err(), "non-JSON must not panic");
+
+        let srv = testserver::spawn(|_, _| Reply::json(r#"{"token_type":"bearer"}"#)).await;
+        let err = format!("{:#}", client(srv.url()).await.bearer().await.unwrap_err());
+        assert!(err.contains("access_token"), "should say what was missing: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_token_endpoint_names_the_url() {
+        // Port 1 on loopback: nothing listens, so this fails to connect.
+        let c = client("http://127.0.0.1:1/token".into()).await;
+        let err = format!("{:#}", c.bearer().await.unwrap_err());
+        assert!(err.contains("127.0.0.1:1"), "the error should name the endpoint: {err}");
+    }
 }

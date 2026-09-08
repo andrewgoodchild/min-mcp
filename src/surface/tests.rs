@@ -43,6 +43,248 @@ fn anon() -> Caller {
 use crate::upstream::ToolDef;
 
 
+// --- prompts & resources: who can see an upstream through the side doors ----
+//
+// Scoping hides tools; prompts and resources are a second way to reach an
+// upstream, so they have to agree. `upstream_visible` is the one decision
+// behind all four verbs, and it has a non-obvious third case: an upstream that
+// exposes NO tools (a prompt library, a resource server — valid per the spec)
+// has nothing to scope on, so it stays visible rather than being hidden by a
+// rule that never mentions it.
+
+fn scoped_cfg(rules: Value) -> Config {
+    let mut text = String::from("upstreams: [{name: a, command: x}]\nscopes:\n  rules:\n");
+    for r in rules.as_array().unwrap() {
+        text.push_str(&format!(
+            "    - scope: {}\n      tools: [{}]\n",
+            r["scope"].as_str().unwrap(),
+            r["tools"].as_array().unwrap().iter().map(|t| format!("\"{}\"", t.as_str().unwrap())).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Config::from_yaml(&text).expect("scoped config")
+}
+
+fn tool_on(idx: usize, id: &str) -> ToolDef {
+    ToolDef {
+        upstream_idx: idx,
+        name: id.split('.').next_back().unwrap().to_string(),
+        description: "d".into(),
+        input_schema: json!({"type": "object"}),
+        id: id.to_string(),
+        read_only: None,
+    }
+}
+
+#[test]
+fn an_upstream_is_visible_when_a_scope_grants_any_of_its_tools() {
+    let cfg = scoped_cfg(json!([{"scope": "read", "tools": ["a.one"]}]));
+    let s = test_surface(cfg, vec![tool_on(0, "a.one"), tool_on(0, "a.two")]);
+    let granted = Caller::with_scopes(vec!["read".into()]);
+    assert!(s.upstream_visible(&granted, 0), "a granted tool makes its upstream visible");
+}
+
+#[test]
+fn an_upstream_is_hidden_when_scopes_hide_every_one_of_its_tools() {
+    // The security case: prompts and resources must not be a side door into an
+    // upstream whose tools the caller cannot see.
+    let cfg = scoped_cfg(json!([{"scope": "read", "tools": ["a.one"]}]));
+    let s = test_surface(cfg, vec![tool_on(0, "a.one")]);
+    let wrong = Caller::with_scopes(vec!["unrelated".into()]);
+    assert!(!s.upstream_visible(&wrong, 0), "no granted tool must hide the upstream");
+    assert!(!s.upstream_visible(&anon(), 0), "an unscoped caller sees nothing here either");
+}
+
+#[test]
+fn an_upstream_with_no_tools_at_all_stays_visible() {
+    // A prompt library or resource server exposes no tools, so there is nothing
+    // for a scope rule to grant. Hiding it would make it unreachable to every
+    // caller once ANY scope rule existed anywhere in the config.
+    let cfg = scoped_cfg(json!([{"scope": "read", "tools": ["a.one"]}]));
+    let s = test_surface(cfg, vec![tool_on(0, "a.one")]);
+    // upstream #1 owns no tools in the catalog.
+    assert!(s.upstream_visible(&anon(), 1), "a tool-less upstream has nothing to scope on");
+}
+
+#[test]
+fn visibility_is_decided_per_upstream_not_globally() {
+    let cfg = scoped_cfg(json!([{"scope": "read", "tools": ["a.one"]}]));
+    let s = test_surface(cfg, vec![tool_on(0, "a.one"), tool_on(1, "b.one")]);
+    let granted = Caller::with_scopes(vec!["read".into()]);
+    assert!(s.upstream_visible(&granted, 0));
+    assert!(!s.upstream_visible(&granted, 1), "a grant on upstream 0 must not expose upstream 1");
+}
+
+// --- minification: the composition keywords and depth pruning ---------------
+//
+// `minify_schema` promises to be lossless on STRUCTURE — every property name,
+// type and `required` list survives — and lossy only on prose. The recursion
+// into `items`/`anyOf`/`oneOf`/`allOf`/`$defs` is where that promise is easiest
+// to break, because a schema that keeps its fields behind a composition keyword
+// looks like a leaf to a naive walk.
+
+use super::minify::{minify_schema, minify_schema_hard, prune_below_depth, budget_truncate};
+
+/// Every property name reachable anywhere in a schema, for lossless assertions.
+fn field_names(v: &Value) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    fn walk(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            Value::Object(m) => {
+                if let Some(Value::Object(props)) = m.get("properties") {
+                    for (k, child) in props {
+                        out.insert(k.clone());
+                        walk(child, out);
+                    }
+                }
+                for (k, child) in m {
+                    if k != "properties" {
+                        walk(child, out);
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|c| walk(c, out)),
+            _ => {}
+        }
+    }
+    walk(v, &mut out);
+    out
+}
+
+#[test]
+fn minify_reaches_fields_behind_every_composition_keyword() {
+    // One field per keyword, each with prose that minification must strip. If
+    // the walk misses a keyword, that branch's `example` survives — and, worse,
+    // its fields would be invisible to the budget accounting.
+    let mut v = json!({
+        "type": "object",
+        "properties": {"top": {"type": "string", "example": "drop me"}},
+        "items": {"type": "object", "properties": {"in_items": {"type": "string", "example": "drop"}}},
+        "additionalProperties": {"type": "object", "properties": {"in_addl": {"type": "string", "example": "drop"}}},
+        "not": {"type": "object", "properties": {"in_not": {"type": "string", "example": "drop"}}},
+        "anyOf": [{"type": "object", "properties": {"in_anyof": {"type": "string", "example": "drop"}}}],
+        "oneOf": [{"type": "object", "properties": {"in_oneof": {"type": "string", "example": "drop"}}}],
+        "allOf": [{"type": "object", "properties": {"in_allof": {"type": "string", "example": "drop"}}}],
+        "prefixItems": [{"type": "object", "properties": {"in_prefix": {"type": "string", "example": "drop"}}}],
+        "patternProperties": {"^x": {"type": "object", "properties": {"in_pattern": {"type": "string", "example": "drop"}}}},
+        "$defs": {"D": {"type": "object", "properties": {"in_defs": {"type": "string", "example": "drop"}}}}
+    });
+    let before = field_names(&v);
+    minify_schema(&mut v);
+
+    // Lossless on structure: not one field name lost.
+    assert_eq!(field_names(&v), before, "minification must not drop a field name");
+    // Lossy on prose, everywhere — including inside every composition keyword.
+    let rendered = serde_json::to_string(&v).unwrap();
+    assert!(!rendered.contains("drop"), "an `example` survived the walk: {rendered}");
+}
+
+#[test]
+fn hard_minify_keeps_the_field_list_and_zeroes_the_prose() {
+    let mut v = json!({
+        "type": "object",
+        "title": "T",
+        "description": "long prose",
+        "properties": {
+            "a": {"type": "string", "description": "d", "format": "email", "enum": ["x", "y"]},
+            "b": {"type": "object", "properties": {"deep": {"type": "string", "description": "d"}}}
+        },
+        "required": ["a"]
+    });
+    minify_schema_hard(&mut v);
+    assert_eq!(v["required"], json!(["a"]), "required must survive");
+    assert_eq!(field_names(&v), ["a", "b", "deep"].iter().map(|s| s.to_string()).collect());
+    assert!(v.get("description").is_none() && v.get("title").is_none());
+    let a = &v["properties"]["a"];
+    assert!(a.get("description").is_none() && a.get("format").is_none());
+    // An elided enum says so rather than vanishing silently.
+    assert_eq!(a["enum_truncated"], json!("elided"));
+    assert!(a.get("enum").is_none());
+    // Recursion reached the nested schema too.
+    assert!(v["properties"]["b"]["properties"]["deep"].get("description").is_none());
+}
+
+#[test]
+fn prune_below_depth_counts_what_it_elides() {
+    // depth 2 = two levels of named fields survive; the third is replaced by an
+    // explicit count, so the agent can tell "no fields" from "fields elided".
+    let mut v = json!({
+        "type": "object",
+        "properties": {
+            "l1": {"type": "object", "properties": {
+                "l2": {"type": "object", "properties": {
+                    "l3a": {"type": "string"}, "l3b": {"type": "string"}
+                }}
+            }}
+        }
+    });
+    prune_below_depth(&mut v, 2);
+    let l2 = &v["properties"]["l1"]["properties"]["l2"];
+    assert!(l2.get("properties").is_none(), "level 3 should be pruned");
+    assert_eq!(l2["nested_fields_elided"], json!(2), "the count must say how many");
+    // The surviving levels are untouched.
+    assert!(v["properties"]["l1"]["properties"].get("l2").is_some());
+}
+
+#[test]
+fn prune_depth_is_consumed_per_properties_hop_only() {
+    // `items`/`anyOf` wrappers are transparent: a list of objects must not cost
+    // a level, or an array-heavy schema prunes twice as aggressively as a flat
+    // one for no reason the caller can see.
+    let mut v = json!({
+        "type": "object",
+        "properties": {
+            "rows": {"type": "array", "items": {"type": "object", "properties": {
+                "keep": {"type": "string"}
+            }}}
+        }
+    });
+    prune_below_depth(&mut v, 2);
+    assert!(
+        v["properties"]["rows"]["items"]["properties"].get("keep").is_some(),
+        "an `items` hop must not consume a depth level: {v}"
+    );
+
+    // Same through anyOf/oneOf/allOf.
+    let mut v = json!({
+        "type": "object",
+        "properties": {"c": {"anyOf": [{"type": "object", "properties": {"keep": {"type": "string"}}}]}}
+    });
+    prune_below_depth(&mut v, 2);
+    assert!(v["properties"]["c"]["anyOf"][0]["properties"].get("keep").is_some());
+}
+
+#[test]
+fn prune_at_depth_zero_elides_the_top_level_field_list() {
+    let mut v = json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}});
+    prune_below_depth(&mut v, 0);
+    assert!(v.get("properties").is_none());
+    assert_eq!(v["nested_fields_elided"], json!(2));
+}
+
+#[test]
+fn budget_truncate_reserves_room_for_its_own_suffix() {
+    // The bug this guards: appending a label AFTER truncating to `max` pushes
+    // the result over budget, so a downstream cap clips the label itself.
+    let out = budget_truncate("x".repeat(100), 20, " [more]");
+    assert!(out.len() <= 20, "result must fit the budget, got {}", out.len());
+    assert!(out.ends_with(" [more]"), "the suffix must survive: {out}");
+    // Under budget: returned untouched, no suffix.
+    assert_eq!(budget_truncate("short".into(), 20, " [more]"), "short");
+}
+
+#[test]
+fn budget_truncate_never_splits_a_multibyte_char() {
+    // `truncate` panics on a non-boundary index; a description with an em dash
+    // or an accent must not be able to crash the surface.
+    for s in ["é".repeat(50), "—".repeat(50), "🙂".repeat(50)] {
+        for max in 8..24 {
+            let out = budget_truncate(s.clone(), max, "…");
+            assert!(out.len() <= max, "over budget at max={max}");
+            assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        }
+    }
+}
+
 #[test]
 fn sanitize_reserves_room_and_caps_length() {
     assert_eq!(sanitize_name("stripe.PostCustomers", 0), "stripe_PostCustomers");

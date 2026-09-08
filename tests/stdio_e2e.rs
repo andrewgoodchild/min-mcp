@@ -22,7 +22,9 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Server {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
+    /// Set by `Drop` only; keeps `send` from panicking if anything runs after.
+    stdin_closed: bool,
     lines: mpsc::Receiver<String>,
     next_id: i64,
 }
@@ -51,7 +53,7 @@ impl Server {
                 }
             }
         });
-        let mut s = Server { child, stdin, lines: rx, next_id: 0 };
+        let mut s = Server { child, stdin: Some(stdin), stdin_closed: false, lines: rx, next_id: 0 };
         let init = s.request(
             "initialize",
             json!({"protocolVersion": "2025-06-18", "capabilities": {},
@@ -63,10 +65,12 @@ impl Server {
     }
 
     fn send(&mut self, msg: &Value) {
+        assert!(!self.stdin_closed, "send after the server was shut down");
         let mut line = msg.to_string();
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("server stdin");
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.flush().unwrap();
     }
 
     fn notify(&mut self, method: &str, params: Value) {
@@ -90,6 +94,29 @@ impl Server {
                     panic!("{method} returned protocol error: {e}");
                 }
                 return v.get("result").cloned().unwrap_or(Value::Null);
+            }
+        }
+        panic!("no response to {method} within {TIMEOUT:?}");
+    }
+
+    /// Like [`Self::request`] but returns `Err(message)` for an error response,
+    /// so the refusal paths can be asserted rather than panicked on.
+    fn try_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while std::time::Instant::now() < deadline {
+            let Ok(line) = self.lines.recv_timeout(TIMEOUT) else { break };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if v.get("method").is_some() {
+                continue;
+            }
+            if v.get("id") == Some(&json!(id)) {
+                return match v.get("error") {
+                    Some(e) => Err(e["message"].as_str().unwrap_or("").to_string()),
+                    None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+                };
             }
         }
         panic!("no response to {method} within {TIMEOUT:?}");
@@ -123,6 +150,24 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Close stdin and let the server exit on its own before resorting to a
+        // kill. SIGKILL leaves no chance to flush, which matters under
+        // `cargo llvm-cov`: an instrumented binary writes its profile at exit,
+        // so a killed server contributes NO coverage and every path reachable
+        // only over the wire reads as dead code. Falls back to a kill so a
+        // wedged server can still never hang the suite.
+        self.stdin_closed = true;
+        if let Some(stdin) = self.stdin.take() {
+            drop(stdin);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -288,4 +333,95 @@ fn passthrough_declares_every_tool_and_drops_meta() {
     assert_eq!(names.len(), 3, "mini fixture has exactly 3 ops: {names:?}");
     assert!(names.iter().all(|n| n.starts_with("fixture_")), "{names:?}");
     assert!(!names.iter().any(|n| n == "search_tools"), "no meta tools in passthrough");
+}
+
+// --- prompts & resources against a real upstream ---------------------------
+//
+// `resources_expose_the_source_map` covers min-mcp's OWN resource against a
+// spec upstream, which contributes neither resources nor prompts. These drive
+// the other half: an MCP upstream that actually serves both, so forwarding,
+// namespacing, and the refusal paths are exercised rather than assumed.
+
+#[test]
+fn an_upstreams_resources_are_merged_with_our_own_and_readable() {
+    let mut s = Server::spawn("tests/fixtures/e2e-fake.yaml");
+    let listing = s.request("resources/list", json!({}));
+    let uris: Vec<&str> =
+        listing["resources"].as_array().unwrap().iter().filter_map(|r| r["uri"].as_str()).collect();
+    assert!(uris.contains(&"fake://doc/1"), "the upstream's resources must be listed: {uris:?}");
+    assert!(uris.contains(&"minmcp://tools"), "alongside our own: {uris:?}");
+
+    // Forwarded to the upstream that listed it, and its contents come back.
+    let read = s.request("resources/read", json!({"uri": "fake://doc/2"}));
+    let text = read["contents"][0]["text"].as_str().unwrap_or_default();
+    assert_eq!(text, "contents of doc two", "read must forward to the right resource");
+}
+
+#[test]
+fn an_unknown_resource_uri_is_refused_after_a_routing_refresh() {
+    let mut s = Server::spawn("tests/fixtures/e2e-fake.yaml");
+    // Never listed, so the routing table misses, refreshes, and still misses.
+    let err = s
+        .try_request("resources/read", json!({"uri": "fake://nope"}))
+        .expect_err("an unknown uri must be refused");
+    assert!(err.contains("unknown resource uri"), "got: {err}");
+}
+
+#[test]
+fn a_resource_read_works_without_listing_first() {
+    // The routing table refreshes on ANY miss, not just when empty, so a client
+    // that reads a known uri without listing first still gets it.
+    let mut s = Server::spawn("tests/fixtures/e2e-fake.yaml");
+    let read = s.request("resources/read", json!({"uri": "fake://doc/1"}));
+    assert_eq!(read["contents"][0]["text"].as_str().unwrap_or_default(), "contents of doc one");
+}
+
+#[test]
+fn prompts_are_namespaced_and_forwarded_by_their_bare_name() {
+    let mut s = Server::spawn("tests/fixtures/e2e-fake.yaml");
+    let names: Vec<String> = s.request("prompts/list", json!({}))["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"fake.greet".to_string()), "prompts must be namespaced: {names:?}");
+    assert!(names.contains(&"fake.summarize".to_string()), "{names:?}");
+
+    // The upstream echoes the name it received: min-mcp must strip its own
+    // prefix, not forward `fake.greet` to a server that only knows `greet`.
+    let got = s.request("prompts/get", json!({"name": "fake.greet", "arguments": {}}));
+    let text = got["messages"][0]["content"]["text"].as_str().unwrap_or_default();
+    assert_eq!(text, "received bare name: greet", "the namespace prefix must be stripped");
+}
+
+#[test]
+fn an_unnamespaced_or_unknown_prompt_is_refused() {
+    let mut s = Server::spawn("tests/fixtures/e2e-fake.yaml");
+    // Bare name: no upstream prefix, so it resolves to nothing.
+    let err = s
+        .try_request("prompts/get", json!({"name": "greet", "arguments": {}}))
+        .expect_err("a bare prompt name must be refused");
+    assert!(err.contains("unknown prompt"), "got: {err}");
+    // Known prefix, unknown prompt: the upstream refuses it.
+    assert!(s.try_request("prompts/get", json!({"name": "fake.nope", "arguments": {}})).is_err());
+}
+
+#[test]
+fn scoping_out_an_upstream_closes_its_prompt_and_resource_side_doors() {
+    // The security case: a caller who cannot see any of an upstream's tools
+    // must not reach that upstream through prompts or resources either. The
+    // config grants a scope this caller does not hold.
+    let mut s = Server::spawn("tests/fixtures/e2e-prompts-scoped.yaml");
+
+    let listing = s.request("resources/list", json!({}));
+    let uris: Vec<&str> =
+        listing["resources"].as_array().unwrap().iter().filter_map(|r| r["uri"].as_str()).collect();
+    assert!(!uris.iter().any(|u| u.starts_with("fake://")), "hidden upstream leaked resources: {uris:?}");
+    assert!(uris.contains(&"minmcp://tools"), "our own resource is still listed: {uris:?}");
+
+    assert_eq!(s.request("prompts/list", json!({}))["prompts"], json!([]), "prompts must be hidden too");
+
+    // And a direct read of a resource it never listed is refused.
+    assert!(s.try_request("resources/read", json!({"uri": "fake://doc/1"})).is_err());
 }

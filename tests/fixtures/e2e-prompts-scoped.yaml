@@ -1,0 +1,11 @@
+# The fake upstream behind a scope rule that grants NONE of its tools, so the
+# prompt/resource side doors must be closed too (see tests/resources_e2e.rs).
+mode: three_tool
+upstreams:
+  - name: fake
+    command: sh
+    args: ["fake-mcp-server.sh"]
+scopes:
+  rules:
+    - scope: nothing.granted
+      tools: ["fake.create_product"]
