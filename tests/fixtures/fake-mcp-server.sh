@@ -13,6 +13,10 @@
 #   list_items             -> paginated: page 1 has next_cursor, page 2 ends it
 #   whoami                 -> {"user":"tester","plan":"pro"}   (for verify checks)
 #
+# It also answers the prompt/resource verbs, so the side doors onto an upstream
+# (resources/list, resources/read, prompts/list, prompts/get) can be driven
+# end to end — namespacing, forwarding, and scope filtering alike.
+#
 # POSIX sh only: no bashisms, no jq. Crude string matching is deliberate — the
 # inputs are this file's own tests.
 
@@ -71,6 +75,33 @@ while IFS= read -r line; do
         *)
           emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"unknown tool"}}'
           ;;
+      esac
+      ;;
+
+    *'"method":"resources/list"'*)
+      emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"resources":[{"uri":"fake://doc/1","name":"doc-one","mimeType":"text/plain"},{"uri":"fake://doc/2","name":"doc-two","mimeType":"text/plain"}]}}'
+      ;;
+
+    *'"method":"resources/read"'*)
+      # echo which uri was asked for, so forwarding is provable
+      case "$line" in
+        *'fake://doc/1'*) emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":[{"uri":"fake://doc/1","mimeType":"text/plain","text":"contents of doc one"}]}}' ;;
+        *'fake://doc/2'*) emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":[{"uri":"fake://doc/2","mimeType":"text/plain","text":"contents of doc two"}]}}' ;;
+        *)               emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32602,"message":"no such resource"}}' ;;
+      esac
+      ;;
+
+    *'"method":"prompts/list"'*)
+      emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"prompts":[{"name":"greet","description":"Greet someone."},{"name":"summarize","description":"Summarize a document."}]}}'
+      ;;
+
+    *'"method":"prompts/get"'*)
+      # echo the BARE name back: proves min-mcp stripped its own namespace
+      # prefix before forwarding, rather than passing `fake.greet` upstream.
+      case "$line" in
+        *'"name":"greet"'*)     emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"description":"Greet someone.","messages":[{"role":"user","content":{"type":"text","text":"received bare name: greet"}}]}}' ;;
+        *'"name":"summarize"'*) emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"description":"Summarize.","messages":[{"role":"user","content":{"type":"text","text":"received bare name: summarize"}}]}}' ;;
+        *)                      emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32602,"message":"unknown prompt"}}' ;;
       esac
       ;;
 

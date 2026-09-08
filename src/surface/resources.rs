@@ -16,7 +16,7 @@ impl Surface {
     /// its tools — but an upstream that exposes NO tools at all (a prompt
     /// library, a resource server; valid per the MCP spec) has nothing to
     /// scope on and stays visible.
-    fn upstream_visible(&self, caller: &Caller, idx: usize) -> bool {
+    pub(super) fn upstream_visible(&self, caller: &Caller, idx: usize) -> bool {
         let mut has_tools = false;
         for t in self.tools.iter().filter(|t| t.upstream_idx == idx) {
             has_tools = true;

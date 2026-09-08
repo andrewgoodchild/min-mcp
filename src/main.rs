@@ -20,6 +20,8 @@ mod rmcp_serve;
 mod secrets;
 mod spec;
 mod sync;
+#[cfg(test)]
+mod testserver;
 mod tls;
 // note: `jsonrpc` stays — the upstream MCP clients (upstream.rs / http_upstream.rs)
 // still frame JSON-RPC by hand; only the *server* side moved to rmcp.

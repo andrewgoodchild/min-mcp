@@ -335,6 +335,181 @@ impl crate::upstream::McpRpc for HttpUpstream {
 mod tests {
     use super::*;
 
+    // --- against a real remote MCP server, in-process ------------------------
+    //
+    // The pure SSE parsing below is unit-testable on its own; the transport
+    // around it — the handshake, session capture, the 404 re-init, header
+    // forwarding — is only reachable against an endpoint, so these run one.
+
+    use crate::testserver::{self, Received, Reply};
+    use crate::upstream::McpRpc; // `rpc` is a trait method
+
+    /// An upstream pointed at `url`, built the way config does it.
+    async fn connect_to(url: &str, extra_headers: &str) -> Result<HttpUpstream> {
+        let yaml = format!("upstreams:\n  - name: remote\n    url: \"{url}\"\n{extra_headers}");
+        let cfg = crate::config::Config::from_yaml(&yaml).expect("config");
+        HttpUpstream::connect(&cfg.upstreams[0], &Secrets::env_only()).await
+    }
+
+    /// A well-behaved server: assigns a session at initialize, 202s the
+    /// notification, and answers everything else from `reply`.
+    fn mcp_server(reply: impl Fn(usize, &Received) -> Reply + Send + Sync + 'static) -> impl Fn(usize, &Received) -> Reply + Send + Sync + 'static {
+        move |n, got| {
+            if got.body.contains(r#""method":"initialize""#) {
+                return Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#)
+                    .with_header("Mcp-Session-Id", "sess-1");
+            }
+            if got.body.contains("notifications/initialized") {
+                return Reply::status(202);
+            }
+            reply(n, got)
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_handshakes_captures_the_session_and_echoes_it_back() {
+        let srv = testserver::spawn(mcp_server(|_, _| {
+            Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#)
+        }))
+        .await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+
+        let seen = srv.seen();
+        assert!(seen[0].body.contains(r#""method":"initialize""#), "handshake first");
+        assert!(seen[1].body.contains("notifications/initialized"), "then the notification");
+        // The session the server assigned must ride every SUBSEQUENT request —
+        // an upstream that forgets it gets 404ed on the next call.
+        assert_eq!(seen[1].header("mcp-session-id"), Some("sess-1"), "notification carries the session");
+
+        up.rpc("tools/list", json!({}), None).await.expect("list");
+        let seen = srv.seen();
+        let last = seen.last().unwrap();
+        assert_eq!(last.header("mcp-session-id"), Some("sess-1"));
+        // The spec requires the protocol version on every non-initialize call.
+        assert_eq!(last.header("mcp-protocol-version"), Some(PROTOCOL_VERSION));
+        assert_eq!(last.header("accept"), Some("application/json, text/event-stream"));
+    }
+
+    #[tokio::test]
+    async fn configured_headers_are_forwarded_on_every_request() {
+        let srv = testserver::spawn(mcp_server(|_, _| Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#))).await;
+        let up = connect_to(&srv.url(), "    headers:\n      X-Api-Key: \"secret-key\"\n").await.expect("connect");
+        up.rpc("tools/list", json!({}), None).await.expect("list");
+        for got in srv.seen() {
+            assert_eq!(got.header("x-api-key"), Some("secret-key"), "auth header must ride every request");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_sse_reply_is_parsed_like_a_json_one() {
+        let srv = testserver::spawn(mcp_server(|_, _| {
+            Reply::sse("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n")
+        }))
+        .await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        let r = up.rpc("tools/list", json!({}), None).await.expect("sse reply");
+        assert_eq!(r["ok"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_is_reinitialized_once_and_the_request_retried() {
+        // The server forgets the first session (404 on a call carrying it),
+        // then issues a fresh one at the re-handshake. Without the retry the
+        // caller sees a bare transport failure and the upstream stays dead
+        // until restart.
+        let sessions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let srv = testserver::spawn(move |_, got| {
+            if got.body.contains(r#""method":"initialize""#) {
+                let n = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+                return Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#)
+                    .with_header("Mcp-Session-Id", &format!("sess-{n}"));
+            }
+            if got.body.contains("notifications/initialized") {
+                return Reply::status(202);
+            }
+            // Only the FIRST session is expired; the reissued one works.
+            if got.header("mcp-session-id") == Some("sess-1") {
+                return Reply::status(404);
+            }
+            Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#)
+        })
+        .await;
+
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        assert_eq!(up.session().as_deref(), Some("sess-1"), "connect took the first session");
+        let r = up.rpc("tools/list", json!({}), None).await;
+        assert!(r.is_ok(), "an expired session should recover, got {r:?}");
+        assert_eq!(up.session().as_deref(), Some("sess-2"), "the reissued session should be adopted");
+
+        let inits = srv.seen().iter().filter(|g| g.body.contains(r#""method":"initialize""#)).count();
+        assert_eq!(inits, 2, "exactly one re-initialization, not a loop");
+    }
+
+    #[tokio::test]
+    async fn a_404_before_any_session_is_a_plain_error_not_a_reinit_loop() {
+        // No session yet means the 404 is the server saying "no such endpoint",
+        // not "I forgot you" — retrying would loop.
+        let srv = testserver::spawn(|_, _| Reply::status(404)).await;
+        assert!(connect_to(&srv.url(), "").await.is_err(), "a 404 at connect must fail");
+    }
+
+    #[tokio::test]
+    async fn upstream_failures_are_reported_with_their_cause() {
+        // HTTP error status
+        let srv = testserver::spawn(mcp_server(|_, _| Reply::status(503))).await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        let err = format!("{:#}", up.rpc("tools/list", json!({}), None).await.unwrap_err());
+        assert!(err.contains("503"), "should name the status: {err}");
+
+        // JSON-RPC error in the body
+        let srv = testserver::spawn(mcp_server(|_, _| {
+            Reply::json(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}"#)
+        }))
+        .await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        let err = format!("{:#}", up.rpc("tools/list", json!({}), None).await.unwrap_err());
+        assert!(err.contains("nope"), "should surface the upstream's message: {err}");
+
+        // A body that is not JSON at all
+        let srv = testserver::spawn(mcp_server(|_, _| Reply::text("<html>gateway</html>"))).await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        let err = format!("{:#}", up.rpc("tools/list", json!({}), None).await.unwrap_err());
+        assert!(err.contains("non-JSON"), "should say the reply was not JSON: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_list_changed_notification_marks_the_upstream_stale() {
+        // The catalog is a startup snapshot, so the honest thing is to flag it
+        // rather than silently serve a stale surface.
+        let srv = testserver::spawn(mcp_server(|_, _| {
+            Reply::sse(
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n                 event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            )
+        }))
+        .await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        assert!(!up.stale(), "not stale before the announcement");
+        up.rpc("tools/list", json!({}), None).await.expect("list");
+        assert!(up.stale(), "a list_changed announcement must mark the upstream stale");
+    }
+
+    #[tokio::test]
+    async fn a_per_call_deadline_reports_a_timeout_not_a_transport_error() {
+        // dispatch renders TimeoutElapsed as an agent-facing timeout; anything
+        // else becomes an opaque protocol error.
+        let srv = testserver::spawn(mcp_server(|_, _| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)
+        }))
+        .await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        let err = up
+            .rpc("tools/list", json!({}), Some(std::time::Duration::from_millis(50)))
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<TimeoutElapsed>().is_some(), "should be a typed timeout: {err:#}");
+    }
+
     #[test]
     fn parses_response_from_sse_frames() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
