@@ -31,6 +31,7 @@ fn test_surface(cfg: Config, tools: Vec<ToolDef>) -> Surface {
         resource_origin: Mutex::new(std::collections::HashMap::new()),
         breakers: Mutex::new(std::collections::HashMap::new()),
         limits: super::ratelimit::Buckets::default(),
+        upstream_slots: None,
         resolved_cache: RwLock::new(std::collections::HashMap::new()),
     }
 }

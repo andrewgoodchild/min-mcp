@@ -154,6 +154,10 @@ pub struct Limit {
     pub per_s: u64,
 }
 
+fn default_max_concurrent_calls() -> usize {
+    256
+}
+
 fn default_per_s() -> u64 {
     60
 }
@@ -998,6 +1002,19 @@ pub struct Config {
     /// Fleet-wide token-bucket limits on tool calls. See [`RateLimits`].
     #[serde(default)]
     pub rate_limits: RateLimits,
+    /// Ceiling on tool calls in flight to upstreams at once, across every
+    /// caller and both transports. Past it, a call WAITS for a slot.
+    ///
+    /// Distinct from `http.limits.max_in_flight`, which bounds HTTP request
+    /// *handling* and releases its permit before the tool runs (an SSE reply
+    /// resolves as soon as the stream is handed back). This is the cap that
+    /// bounds the upstream work itself — the connections, sockets and buffers a
+    /// burst of calls actually costs.
+    ///
+    /// A ceiling, not a tuning knob: the default is far above any realistic
+    /// agent workload. `0` disables it.
+    #[serde(default = "default_max_concurrent_calls")]
+    pub max_concurrent_calls: usize,
     /// Secret stores for `${…}` references. See [`SecretsConfig`].
     #[serde(default)]
     pub secrets: SecretsConfig,
@@ -1122,6 +1139,13 @@ impl Config {
         // the listener binds, prints its banner, and then hangs every request
         // forever with no error anywhere. An overlarge `max_in_flight` is a
         // panic inside tokio's `Semaphore::new`, so it is caught here too.
+        if self.max_concurrent_calls > tokio::sync::Semaphore::MAX_PERMITS {
+            anyhow::bail!(
+                "max_concurrent_calls {} exceeds the maximum {}",
+                self.max_concurrent_calls,
+                tokio::sync::Semaphore::MAX_PERMITS
+            );
+        }
         if self.http.limits.max_body_bytes == 0 {
             anyhow::bail!(
                 "http.limits.max_body_bytes must be at least 1: 0 refuses every request that \

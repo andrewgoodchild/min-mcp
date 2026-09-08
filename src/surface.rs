@@ -108,6 +108,11 @@ pub struct Surface {
     breakers: Mutex<HashMap<String, breaker::BreakerState>>,
     /// Token buckets for `rate_limits` and overlay `rate_limit`.
     limits: ratelimit::Buckets,
+    /// Slots for tool calls in flight to upstreams (`max_concurrent_calls`).
+    /// `None` when disabled. Held ONLY across the upstream call itself, never
+    /// across cache, breaker or shaping work — and never across a nested call,
+    /// or a pagination follow-up would wait on a slot its own parent holds.
+    upstream_slots: Option<tokio::sync::Semaphore>,
     /// Alternative retrievers scored against real traffic, serving nothing. Empty
     /// (and free) unless `shadow: true`. See `surface/shadow.rs`.
     shadow: shadow::Shadow,
@@ -265,6 +270,8 @@ impl Surface {
                     .with_context(|| format!("opening log_file {path}"))?,
             ))),
         };
+        // Read before `config` is moved into the surface.
+        let config_max_concurrent = config.max_concurrent_calls;
         let mut surface = Surface {
             shadow,
             config,
@@ -284,6 +291,8 @@ impl Surface {
             resource_origin: Mutex::new(HashMap::new()),
             breakers: Mutex::new(HashMap::new()),
             limits: ratelimit::Buckets::default(),
+            upstream_slots: (config_max_concurrent > 0)
+                .then(|| tokio::sync::Semaphore::new(config_max_concurrent)),
             resolved_cache: RwLock::new(HashMap::new()),
         };
         surface.build_exposed();
@@ -330,6 +339,19 @@ impl Surface {
             }
         }
         Ok(surface)
+    }
+
+    /// A slot for one upstream call, when `max_concurrent_calls` is enabled.
+    ///
+    /// The permit must be held across the upstream call ONLY. Holding it any
+    /// wider — over pagination, say — would let a call wait on a slot its own
+    /// parent is holding, which at a cap of 1 is a deadlock rather than a
+    /// throttle.
+    pub(crate) async fn upstream_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        match &self.upstream_slots {
+            Some(s) => s.acquire().await.ok(),
+            None => None,
+        }
     }
 
     /// Append one NDJSON audit event (best-effort; logging never fails a

@@ -27,23 +27,33 @@ pub struct Reply {
     pub body: String,
     /// Extra response headers — `Mcp-Session-Id` is the one that matters here.
     pub headers: Vec<(String, String)>,
+    /// Hold the request open this long before answering. Awaited by the SERVER,
+    /// not slept inside the handler: a blocking sleep in a handler stalls the
+    /// runtime, which silently serialises everything and makes a concurrency
+    /// test pass whether or not the thing it is testing works.
+    pub delay: std::time::Duration,
 }
 
 impl Reply {
     pub fn json(body: impl Into<String>) -> Self {
-        Reply { status: 200, content_type: "application/json", body: body.into(), headers: vec![] }
+        Reply { status: 200, content_type: "application/json", body: body.into(), headers: vec![], delay: std::time::Duration::ZERO }
     }
     pub fn sse(body: impl Into<String>) -> Self {
-        Reply { status: 200, content_type: "text/event-stream", body: body.into(), headers: vec![] }
+        Reply { status: 200, content_type: "text/event-stream", body: body.into(), headers: vec![], delay: std::time::Duration::ZERO }
     }
     pub fn status(code: u16) -> Self {
-        Reply { status: code, content_type: "text/plain", body: String::new(), headers: vec![] }
+        Reply { status: code, content_type: "text/plain", body: String::new(), headers: vec![], delay: std::time::Duration::ZERO }
     }
     pub fn text(body: impl Into<String>) -> Self {
-        Reply { status: 200, content_type: "text/plain", body: body.into(), headers: vec![] }
+        Reply { status: 200, content_type: "text/plain", body: body.into(), headers: vec![], delay: std::time::Duration::ZERO }
     }
     pub fn with_header(mut self, k: &str, v: &str) -> Self {
         self.headers.push((k.to_string(), v.to_string()));
+        self
+    }
+    /// Hold this request open, so overlapping requests are observable.
+    pub fn after(mut self, ms: u64) -> Self {
+        self.delay = std::time::Duration::from_millis(ms);
         self
     }
 }
@@ -67,6 +77,7 @@ pub struct TestServer {
     /// Every request received, in order.
     pub seen: Arc<Mutex<Vec<Received>>>,
     hits: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -76,6 +87,11 @@ impl TestServer {
     }
     pub fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
+    }
+    /// The most requests this server had in flight at once — what a concurrency
+    /// cap is actually asserted against.
+    pub fn peak_in_flight(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
     }
     pub fn seen(&self) -> Vec<Received> {
         self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -100,11 +116,13 @@ where
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
     let addr = listener.local_addr().expect("test server addr");
     let hits = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let in_flight = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(Mutex::new(Vec::new()));
     let (tx, mut rx) = tokio::sync::oneshot::channel();
 
     let handler = Arc::new(handler);
-    let (h, s) = (hits.clone(), seen.clone());
+    let (h, s, pk, fl) = (hits.clone(), seen.clone(), peak.clone(), in_flight.clone());
     tokio::spawn(async move {
         loop {
             let accepted = tokio::select! {
@@ -112,10 +130,10 @@ where
                 a = listener.accept() => a,
             };
             let Ok((tcp, _)) = accepted else { continue };
-            let (handler, h, s) = (handler.clone(), h.clone(), s.clone());
+            let (handler, h, s, pk, fl) = (handler.clone(), h.clone(), s.clone(), pk.clone(), fl.clone());
             tokio::spawn(async move {
                 let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
-                    let (handler, h, s) = (handler.clone(), h.clone(), s.clone());
+                    let (handler, h, s, pk, fl) = (handler.clone(), h.clone(), s.clone(), pk.clone(), fl.clone());
                     async move {
                         let headers = req
                             .headers()
@@ -126,7 +144,13 @@ where
                         let got = Received { body: String::from_utf8_lossy(&body).into_owned(), headers };
                         let n = h.fetch_add(1, Ordering::SeqCst) + 1;
                         s.lock().unwrap_or_else(|e| e.into_inner()).push(got.clone());
+                        let cur = fl.fetch_add(1, Ordering::SeqCst) + 1;
+                        pk.fetch_max(cur, Ordering::SeqCst);
                         let reply = handler(n, &got);
+                        if !reply.delay.is_zero() {
+                            tokio::time::sleep(reply.delay).await;
+                        }
+                        fl.fetch_sub(1, Ordering::SeqCst);
                         let mut builder =
                             Response::builder().status(reply.status).header("content-type", reply.content_type);
                         for (k, v) in &reply.headers {
@@ -144,5 +168,5 @@ where
             });
         }
     });
-    TestServer { addr, seen, hits, shutdown: Some(tx) }
+    TestServer { addr, seen, hits, peak, shutdown: Some(tx) }
 }

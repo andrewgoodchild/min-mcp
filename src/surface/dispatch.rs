@@ -162,11 +162,14 @@ impl Surface {
                     Some(_) => arguments.clone(),
                     None => std::mem::take(&mut arguments),
                 };
-                match self
-                    .upstreams[idx]
-                    .call_tool(&original_name, call_args, &extra_headers, deadline)
-                    .await
-                {
+                // The slot is scoped to the call itself: a permit held across
+                // the shaping, caching and pagination that follow would bound
+                // far more than the upstream work it exists to bound.
+                let called = {
+                    let _slot = self.upstream_slot().await;
+                    self.upstreams[idx].call_tool(&original_name, call_args, &extra_headers, deadline).await
+                };
+                match called {
                     Ok(r) => r,
                     Err(e) if e.downcast_ref::<crate::upstream::TimeoutElapsed>().is_some() => {
                         // An isError the agent can reason about, never a silent
@@ -410,7 +413,11 @@ impl Surface {
             // A follow-up failure — isError, timeout, or transport — must NOT
             // discard the pages already fetched: every failure shape stops
             // pagination and surfaces on the merged (partial) result instead.
-            let next = match self.upstreams[idx].call_tool(name, args.clone(), headers, deadline).await {
+            let paged = {
+                let _slot = self.upstream_slot().await;
+                self.upstreams[idx].call_tool(name, args.clone(), headers, deadline).await
+            };
+            let next = match paged {
                 Ok(n) => n,
                 Err(_) => {
                     partial_error = true;

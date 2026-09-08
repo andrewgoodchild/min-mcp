@@ -1,0 +1,25 @@
+# Dependency updates. Grouped and weekly: this repo pins exact versions in
+# Cargo.lock and ships binaries from it, so updates want reviewing in batches
+# rather than one PR per patch bump.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the routine bumps; anything major still arrives on its own,
+      # because a major is a decision rather than a chore.
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # The workflows pin actions by major tag; this keeps them current, including
+  # the ones that gate releases.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
