@@ -63,6 +63,10 @@ impl Reply {
 pub struct Received {
     pub body: String,
     pub headers: Vec<(String, String)>,
+    /// Request method, e.g. `GET`.
+    pub method: String,
+    /// Path and query, e.g. `/v1/secret/data/app`.
+    pub path: String,
 }
 
 impl Received {
@@ -140,8 +144,11 @@ where
                             .iter()
                             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                             .collect();
+                        let method = req.method().as_str().to_string();
+                        let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
                         let body = req.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
-                        let got = Received { body: String::from_utf8_lossy(&body).into_owned(), headers };
+                        let got =
+                            Received { body: String::from_utf8_lossy(&body).into_owned(), headers, method, path };
                         let n = h.fetch_add(1, Ordering::SeqCst) + 1;
                         s.lock().unwrap_or_else(|e| e.into_inner()).push(got.clone());
                         let cur = fl.fetch_add(1, Ordering::SeqCst) + 1;
