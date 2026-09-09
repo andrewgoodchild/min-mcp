@@ -6,6 +6,18 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`${vault:…}` panicked the process instead of resolving a secret.** vaultrs
+  is built with `rustls-no-provider` so it shares the `ring` provider already in
+  the tree rather than dragging in aws-lc; "no provider" means it takes the
+  process default, and reqwest *panics* while building its client when none is
+  installed. Nothing installed one, so every Vault reference aborted min-mcp —
+  the feature could not work at all, on any path that reached it. A provider is
+  now installed on the Vault path (once, and only when Vault is actually used).
+  Found by testing it: the credential path had no coverage precisely because it
+  needed a Vault to talk to.
+
 ### Added
 
 - **`max_concurrent_calls`** (default 256, `0` disables) — a ceiling on tool

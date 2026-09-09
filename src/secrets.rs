@@ -207,8 +207,29 @@ impl Secrets {
     }
 }
 
+/// Install the process-wide rustls crypto provider that `vaultrs` needs.
+///
+/// vaultrs is built with `rustls-no-provider` so it shares the `ring` provider
+/// already in the tree rather than dragging in aws-lc (a C build on every
+/// platform). The catch: "no provider" means it takes the PROCESS DEFAULT, and
+/// reqwest **panics** while building its client when no default is installed.
+/// Nothing installed one, so every `${vault:…}` reference aborted the process
+/// instead of resolving — the feature could not work at all.
+///
+/// Called on the Vault path only, so a deployment that never references Vault
+/// pays nothing. `install_default` errors if a provider is already installed,
+/// which is not a problem here: any provider will do, and it must not be racy,
+/// hence the `Once`.
+fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl Vault {
     async fn connect(cfg: &VaultConfig) -> Result<Self> {
+        install_crypto_provider();
         let mut b = VaultClientSettingsBuilder::default();
         if let Some(addr) = &cfg.address {
             // the builder's own setter panics on a malformed URL; validate first
@@ -334,6 +355,251 @@ mod tests {
         assert_eq!(out, "Bearer s3cr3t", "trailing newline is not part of the value");
         assert!(s.expand("${file:/nonexistent/minmcp/secret}").await.is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    // --- Vault, against a mock of its HTTP API ------------------------------
+    //
+    // `${vault:…}` resolution, the AppRole/Kubernetes logins, and the re-login
+    // on 403 are the credential path — the code most worth getting right and,
+    // until now, the least covered, because it needs a Vault to talk to.
+    // vaultrs speaks plain JSON over HTTP, so an in-process server is enough.
+
+    use crate::testserver::{self, Received, Reply};
+
+    /// Vault wraps every reply in the same envelope, and vaultrs requires the
+    /// whole of it — `request_id`, `lease_id`, `lease_duration` and `renewable`
+    /// are not optional in its `EndpointResult`, so a trimmed mock fails to
+    /// deserialise rather than failing the assertion under test.
+    fn envelope(data: &str, auth: &str) -> String {
+        format!(
+            r#"{{"request_id":"req-1","lease_id":"","renewable":false,"lease_duration":0,
+                 "data":{data},"wrap_info":null,"warnings":null,"auth":{auth}}}"#
+        )
+    }
+
+    /// KV v2 read response for `{field: value}` pairs.
+    fn kv2(fields: &[(&str, &str)]) -> String {
+        let inner: Vec<String> = fields.iter().map(|(k, v)| format!(r#""{k}":"{v}""#)).collect();
+        // The metadata block is required in full: vaultrs' SecretVersionMetadata
+        // has no optional fields beyond custom_metadata.
+        let data = format!(
+            r#"{{"data":{{{}}},"metadata":{{"created_time":"2026-01-01T00:00:00Z",
+                 "deletion_time":"","custom_metadata":null,"destroyed":false,"version":1}}}}"#,
+            inner.join(",")
+        );
+        envelope(&data, "null")
+    }
+
+    /// A successful Vault login response.
+    fn login_ok(token: &str) -> String {
+        let auth = format!(
+            r#"{{"client_token":"{token}","accessor":"acc","policies":["default"],
+                 "token_policies":["default"],"metadata":{{}},"lease_duration":3600,
+                 "renewable":true,"entity_id":"","token_type":"service","orphan":false}}"#
+        );
+        envelope("null", &auth)
+    }
+
+    fn vault_cfg(addr: String, auth: crate::config::VaultAuth) -> SecretsConfig {
+        SecretsConfig {
+            vault: Some(crate::config::VaultConfig {
+                address: Some(addr),
+                namespace: None,
+                mount: "secret".into(),
+                ca_cert: None,
+                auth,
+            }),
+            cache_ttl_s: 300,
+        }
+    }
+
+    /// Auth by a token taken from a uniquely-named env var, so parallel tests
+    /// cannot race each other through the process environment.
+    fn token_auth(tag: &str) -> (crate::config::VaultAuth, String) {
+        let var = format!("MINMCP_TEST_VAULT_TOKEN_{tag}");
+        std::env::set_var(&var, "root-token");
+        (
+            crate::config::VaultAuth { token_env: Some(var.clone()), approle: None, kubernetes: None },
+            var,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_vault_reference_reads_the_named_field() {
+        let srv = testserver::spawn(|_, _| Reply::json(kv2(&[("api_key", "sk-live-1"), ("other", "x")]))).await;
+        let (auth, var) = token_auth("read");
+        let s = Secrets::from_config(&vault_cfg(srv.url(), auth));
+
+        assert_eq!(s.expand("${vault:acme/prod#api_key}").await.unwrap(), "sk-live-1");
+        // The path is the KV v2 data path under the configured mount.
+        let read = srv.seen().into_iter().find(|r| r.method == "GET").expect("a KV read");
+        // (vaultrs appends an empty query string, hence the trim.)
+        assert_eq!(
+            read.path.trim_end_matches('?'),
+            "/v1/secret/data/acme/prod",
+            "unexpected Vault path: {}",
+            read.path
+        );
+        assert_eq!(read.header("x-vault-token"), Some("root-token"), "the token must be sent");
+        std::env::remove_var(var);
+    }
+
+    #[tokio::test]
+    async fn a_missing_field_names_the_fields_that_do_exist() {
+        // The failure an operator actually hits: right secret, wrong key. The
+        // error has to say what IS there, or debugging is guesswork.
+        let srv = testserver::spawn(|_, _| Reply::json(kv2(&[("username", "u"), ("password", "p")]))).await;
+        let (auth, var) = token_auth("missing");
+        let s = Secrets::from_config(&vault_cfg(srv.url(), auth));
+        let err = format!("{:#}", s.expand("${vault:acme/prod#api_key}").await.unwrap_err());
+        assert!(err.contains("api_key"), "should name the field asked for: {err}");
+        assert!(err.contains("username") && err.contains("password"), "should list what exists: {err}");
+        std::env::remove_var(var);
+    }
+
+    #[tokio::test]
+    async fn a_read_is_cached_for_the_ttl() {
+        // A `user_supplied` field resolves per call; without the cache that is
+        // one Vault round-trip per tool call.
+        let srv = testserver::spawn(|_, _| Reply::json(kv2(&[("k", "v")]))).await;
+        let (auth, var) = token_auth("cache");
+        let s = Secrets::from_config(&vault_cfg(srv.url(), auth));
+        for _ in 0..3 {
+            assert_eq!(s.expand("${vault:a/b#k}").await.unwrap(), "v");
+        }
+        let reads = srv.seen().iter().filter(|r| r.method == "GET").count();
+        assert_eq!(reads, 1, "three resolutions of one reference should read Vault once");
+        std::env::remove_var(var);
+    }
+
+    #[tokio::test]
+    async fn approle_logs_in_then_reads() {
+        let srv = testserver::spawn(|_, got: &Received| {
+            if got.path.contains("/auth/approle/login") {
+                return Reply::json(login_ok("approle-token"));
+            }
+            Reply::json(kv2(&[("k", "from-approle")]))
+        })
+        .await;
+        let auth = crate::config::VaultAuth {
+            token_env: None,
+            approle: Some(crate::config::VaultAppRole {
+                mount: "approle".into(),
+                role_id: "role-1".into(),
+                secret_id: "secret-1".into(),
+            }),
+            kubernetes: None,
+        };
+        let s = Secrets::from_config(&vault_cfg(srv.url(), auth));
+        assert_eq!(s.expand("${vault:a/b#k}").await.unwrap(), "from-approle");
+
+        let seen = srv.seen();
+        let login = seen.iter().find(|r| r.path.contains("login")).expect("a login");
+        assert!(login.body.contains("role-1") && login.body.contains("secret-1"), "credentials: {}", login.body);
+        // The token the login returned is what the read carries.
+        let read = seen.iter().find(|r| r.method == "GET").expect("a read");
+        assert_eq!(read.header("x-vault-token"), Some("approle-token"));
+    }
+
+    #[tokio::test]
+    async fn kubernetes_login_sends_the_service_account_jwt() {
+        let dir = std::env::temp_dir();
+        let jwt = dir.join(format!("minmcp_sa_jwt_{}", std::process::id()));
+        std::fs::write(&jwt, "  eyJhbGciOi.fake.jwt  \n").unwrap();
+
+        let srv = testserver::spawn(|_, got: &Received| {
+            if got.path.contains("/auth/kubernetes/login") {
+                return Reply::json(login_ok("k8s-token"));
+            }
+            Reply::json(kv2(&[("k", "from-k8s")]))
+        })
+        .await;
+        let auth = crate::config::VaultAuth {
+            token_env: None,
+            approle: None,
+            kubernetes: Some(crate::config::VaultKubernetes {
+                mount: "kubernetes".into(),
+                role: "minmcp".into(),
+                jwt_path: jwt.to_string_lossy().into_owned(),
+            }),
+        };
+        let s = Secrets::from_config(&vault_cfg(srv.url(), auth));
+        assert_eq!(s.expand("${vault:a/b#k}").await.unwrap(), "from-k8s");
+
+        let seen = srv.seen();
+        let login = seen.iter().find(|r| r.path.contains("login")).expect("a login");
+        assert!(login.body.contains("eyJhbGciOi.fake.jwt"), "the JWT must be sent: {}", login.body);
+        assert!(!login.body.contains("  eyJ"), "and trimmed, or Vault rejects it");
+        let _ = std::fs::remove_file(&jwt);
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_renewed_once_and_the_read_retried() {
+        // A long-lived proxy outlives its Vault lease. Without this, every
+        // secret resolution fails from the moment the token expires until
+        // someone restarts the process.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let r2 = reads.clone();
+        let srv = testserver::spawn(move |_, got: &Received| {
+            if got.path.contains("/auth/approle/login") {
+                return Reply::json(login_ok("fresh-token"));
+            }
+            // The first read is rejected as if the token had expired.
+            if r2.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Reply { status: 403, ..Reply::json(r#"{"errors":["permission denied"]}"#) };
+            }
+            Reply::json(kv2(&[("k", "after-relogin")]))
+        })
+        .await;
+        let auth = crate::config::VaultAuth {
+            token_env: None,
+            approle: Some(crate::config::VaultAppRole {
+                mount: "approle".into(),
+                role_id: "r".into(),
+                secret_id: "s".into(),
+            }),
+            kubernetes: None,
+        };
+        let s = Secrets::from_config(&vault_cfg(srv.url(), auth));
+        assert_eq!(s.expand("${vault:a/b#k}").await.unwrap(), "after-relogin", "a 403 should recover");
+
+        // Exactly two logins: the one at connect, and the one after the 403.
+        let logins = srv.seen().iter().filter(|r| r.path.contains("login")).count();
+        assert_eq!(logins, 2, "one re-login, not a loop");
+    }
+
+    #[tokio::test]
+    async fn a_403_without_a_login_configured_is_reported_not_retried() {
+        // Token auth has nothing to re-login WITH, so the 403 must surface.
+        let srv = testserver::spawn(|_, _| Reply { status: 403, ..Reply::json(r#"{"errors":["denied"]}"#) }).await;
+        let (auth, var) = token_auth("no_relogin");
+        let s = Secrets::from_config(&vault_cfg(srv.url(), auth));
+        let err = format!("{:#}", s.expand("${vault:a/b#k}").await.unwrap_err());
+        assert!(err.contains("secret/a/b"), "should name the secret it failed to read: {err}");
+        std::env::remove_var(var);
+    }
+
+    #[tokio::test]
+    async fn vault_misconfiguration_fails_with_a_pointed_message() {
+        // A malformed address: the vaultrs builder panics on this, so it is
+        // validated first — a panic here would take the process down at startup.
+        let cfg = vault_cfg("not a url".into(), crate::config::VaultAuth::default());
+        let err = format!("{:#}", Secrets::from_config(&cfg).expand("${vault:a/b#k}").await.unwrap_err());
+        assert!(err.contains("address"), "should name the setting: {err}");
+
+        // No token and no login configured at all.
+        let srv = testserver::spawn(|_, _| Reply::json(kv2(&[("k", "v")]))).await;
+        let cfg = vault_cfg(srv.url(), crate::config::VaultAuth::default());
+        let err = format!("{:#}", Secrets::from_config(&cfg).expand("${vault:a/b#k}").await.unwrap_err());
+        assert!(err.contains("token") || err.contains("approle"), "should say how to authenticate: {err}");
+
+        // A reference missing its `#field`.
+        let (auth, var) = token_auth("shape");
+        let s = Secrets::from_config(&vault_cfg("http://127.0.0.1:1".into(), auth));
+        let err = format!("{:#}", s.expand("${vault:no-hash}").await.unwrap_err());
+        assert!(err.contains("path#field"), "should teach the shape: {err}");
+        std::env::remove_var(var);
     }
 
     #[tokio::test]
