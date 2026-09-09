@@ -25,7 +25,7 @@ anyhow = "1"
 # `env`: lets `--jwt` fall back to MINMCP_JWT so a caller token never has to
 # sit in argv (visible to `ps` and shell history).
 clap = { version = "4", features = ["derive", "env"] }
-jaq-core = "1.5"
+jaq-core = "3.1"
 jaq-interpret = "1.5"
 jaq-parse = "1.0"
 jaq-std = "1.5"
