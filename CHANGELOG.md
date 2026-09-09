@@ -6,7 +6,11 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
-### Fixed
+Nothing yet.
+
+## [0.2.0] — 2026-09-09
+
+### Fixed — secrets
 
 - **`${vault:…}` panicked the process instead of resolving a secret.** vaultrs
   is built with `rustls-no-provider` so it shares the `ring` provider already in
@@ -18,7 +22,7 @@ All notable changes to min-mcp. Format loosely follows
   Found by testing it: the credential path had no coverage precisely because it
   needed a Vault to talk to.
 
-### Added
+### Added — upstream concurrency and dependency auditing
 
 - **`max_concurrent_calls`** (default 256, `0` disables) — a ceiling on tool
   calls in flight to upstreams at once, across every caller and both transports.
@@ -38,8 +42,6 @@ All notable changes to min-mcp. Format loosely follows
   and yanked crates fail; `unmaintained` stays a warning, since it is a
   maintenance signal rather than an exploitable flaw and is usually not ours to
   fix. Plus a Dependabot config for grouped weekly updates.
-
-## [0.2.0] — 2026-09-08
 
 ### Added — caller identity and poisoning enforcement
 
