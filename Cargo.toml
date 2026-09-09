@@ -29,7 +29,7 @@ jaq-core = "1.5"
 jaq-interpret = "1.5"
 jaq-parse = "1.0"
 jaq-std = "1.5"
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Official MCP SDK — serves both agent-facing transports (behind its
 # ServerHandler), while the surface, spec executor, and upstream clients stay
