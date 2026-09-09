@@ -510,6 +510,76 @@ mod tests {
         assert!(err.downcast_ref::<TimeoutElapsed>().is_some(), "should be a typed timeout: {err:#}");
     }
 
+    /// Build a surface over one HTTP upstream that serves a single `echo` tool
+    /// and holds every call open for `hold_ms`, so overlapping calls are
+    /// observable. Returns (server, surface).
+    async fn echo_surface(
+        max_concurrent: usize,
+        hold_ms: u64,
+    ) -> (testserver::TestServer, std::sync::Arc<crate::surface::Surface>) {
+        let srv = testserver::spawn(move |_, got| {
+            if got.body.contains(r#""method":"initialize""#) {
+                return Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#)
+                    .with_header("Mcp-Session-Id", "s");
+            }
+            if got.body.contains("notifications/initialized") {
+                return Reply::status(202);
+            }
+            if got.body.contains(r#""method":"tools/list""#) {
+                return Reply::json(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo.","inputSchema":{"type":"object","properties":{}}}]}}"#,
+                );
+            }
+            Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}}"#)
+                .after(hold_ms)
+        })
+        .await;
+        let yaml = format!(
+            "max_concurrent_calls: {max_concurrent}\nmode: passthrough\nupstreams:\n  - name: remote\n    url: \"{}\"\n",
+            srv.url()
+        );
+        let cfg = crate::config::Config::from_yaml(&yaml).expect("config");
+        let surface =
+            std::sync::Arc::new(crate::surface::Surface::build(cfg, Secrets::env_only()).await.expect("surface"));
+        (srv, surface)
+    }
+
+    /// Fire `n` concurrent calls and return how many the upstream had at once.
+    async fn peak_under_load(srv: &testserver::TestServer, surface: std::sync::Arc<crate::surface::Surface>, n: usize) -> usize {
+        let caller = crate::caller::Caller::default();
+        let mut tasks = Vec::new();
+        for _ in 0..n {
+            let (s, c) = (surface.clone(), caller.clone());
+            tasks.push(tokio::spawn(async move { s.cli_call(&c, "remote.echo", json!({}), &[]).await }));
+        }
+        for t in tasks {
+            t.await.expect("task").expect("call should succeed");
+        }
+        srv.peak_in_flight()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_upstream_calls_are_capped_by_max_concurrent_calls() {
+        // The gap `max_in_flight` does NOT close: it releases its permit when
+        // the SSE stream is handed back, before the tool runs, so it bounds
+        // request handling rather than upstream work. This cap bounds the calls
+        // themselves.
+        let (srv, surface) = echo_surface(2, 60).await;
+        let peak = peak_under_load(&srv, surface, 8).await;
+        assert!(peak <= 2, "at most 2 calls in the upstream at once, saw {peak}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn without_the_cap_upstream_calls_do_overlap() {
+        // The control for the test above. Without it, that assertion would hold
+        // for a cap that does nothing — as it did on the first draft of this
+        // test, where a blocking sleep in the handler serialised everything and
+        // made the capped and uncapped cases indistinguishable.
+        let (srv, surface) = echo_surface(0, 60).await;
+        let peak = peak_under_load(&srv, surface, 8).await;
+        assert!(peak > 2, "uncapped calls should overlap; saw a peak of only {peak}");
+    }
+
     #[test]
     fn parses_response_from_sse_frames() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";

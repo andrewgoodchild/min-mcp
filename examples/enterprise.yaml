@@ -83,6 +83,11 @@ poisoning_policy: strict
 # Buckets key on the caller's subject (set by `trusted_headers.subject` above),
 # falling back to the client certificate or peer address. Callers behind ONE
 # gateway share a peer address, which is why the subject header matters here.
+# Calls in flight to upstreams at once, across every caller. A ceiling on what
+# a burst can make this process hold open — rate limits bound calls per second,
+# which is a different thing. `http.limits.max_in_flight` does NOT cover this.
+max_concurrent_calls: 256
+
 rate_limits:
   per_caller: { calls: 600, per_s: 60 }    # a caller's total tool calls
   per_tool:   { calls: 120, per_s: 60 }    # per (caller, tool)

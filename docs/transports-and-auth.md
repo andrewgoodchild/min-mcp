@@ -228,10 +228,18 @@ across every connection. Past the cap a request **waits** rather than failing.
 response future resolves, and a Streamable HTTP reply resolves as soon as the SSE
 stream is handed back — before the tool call runs. Measured: with
 `max_in_flight: 1`, three concurrent 4-second tool calls still finish in about
-four seconds, not twelve. Treat it as a bound on request *handling*; the controls
-that actually govern upstream work are [rate limits](#rate-limits), per-tool
-`timeout_s`, and `breaker`. Both caps apply to the HTTP transport only; stdio is
-one process and one caller.
+four seconds, not twelve. Treat it as a bound on request *handling*.
+
+The cap on the upstream work itself is top-level **`max_concurrent_calls`**
+(default 256; `0` disables): a ceiling on tool calls in flight to upstreams at
+once, across every caller and both transports, with a call waiting for a slot
+past it. That is what bounds the connections, sockets and buffers a burst
+actually costs. [Rate limits](#rate-limits) bound calls per *second*, which is a
+different question, and `timeout_s` and `breaker` bound how long any one call
+may last.
+
+The two caps under `http.limits` apply to that transport only;
+`max_concurrent_calls` applies to stdio as well.
 
 ### Connection deadlines
 

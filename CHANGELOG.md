@@ -6,7 +6,26 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`max_concurrent_calls`** (default 256, `0` disables) — a ceiling on tool
+  calls in flight to upstreams at once, across every caller and both transports.
+  This closes the gap `http.limits.max_in_flight` was documented as *not*
+  covering: that permit is released when the SSE stream is handed back, before
+  the tool runs, so it bounds request handling rather than upstream work.
+  Nothing previously bounded the connections, sockets and buffers a burst of
+  calls actually costs. The slot is held across the upstream call only — never
+  across caching, shaping or a pagination follow-up, which would let a call wait
+  on a slot its own parent holds.
+- **Dependency advisories in CI** (`.github/workflows/audit.yml`) — `cargo
+  audit` on dependency changes, on push to `main`, and weekly, because
+  advisories are published against dependencies that have not changed. A yanked
+  `chacha20` reached this tree through `rmcp → rand` and was caught only because
+  `cargo publish --dry-run` happened to warn; nothing in the gate would have
+  found it, and release binaries are built from that lockfile. Vulnerabilities
+  and yanked crates fail; `unmaintained` stays a warning, since it is a
+  maintenance signal rather than an exploitable flaw and is usually not ours to
+  fix. Plus a Dependabot config for grouped weekly updates.
 
 ## [0.2.0] — 2026-09-08
 

@@ -1,0 +1,49 @@
+# Dependency advisories, separate from CI so it can run on a schedule.
+#
+# Why this exists: a yanked `chacha20` reached the tree through rmcp -> rand and
+# was caught only because `cargo publish --dry-run` happened to print a warning.
+# Nothing in the gate would have found it, and release.yml ships prebuilt
+# binaries for four platforms — a bad dependency ships inside them.
+name: Audit
+
+on:
+  push:
+    branches: [main]
+  # Only when the dependency set actually changes: an advisory published
+  # mid-review should not fail a PR that never touched a dependency. The
+  # schedule below is what catches those.
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/audit.yml"
+  # Advisories are published against dependencies that have not changed, so
+  # time — not commits — is the trigger that matters most here.
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Vulnerabilities fail by default. `yanked` is denied explicitly because
+      # that is the case that already bit us and it is always actionable — a
+      # yanked release has been withdrawn by its own author.
+      #
+      # `unmaintained` deliberately stays a WARNING: it is a maintenance signal
+      # rather than an exploitable flaw, and it is usually not ours to fix
+      # (today: fxhash, pulled in by the bm25 search crate). Denying it would
+      # make this gate red for something no change to this repo can resolve,
+      # and a gate that is always red gets ignored.
+      - name: Audit dependencies
+        run: cargo audit --deny yanked
