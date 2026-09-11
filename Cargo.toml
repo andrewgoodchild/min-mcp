@@ -29,6 +29,12 @@ jaq-core = "1.5"
 jaq-interpret = "1.5"
 jaq-parse = "1.0"
 jaq-std = "1.5"
+# Held at 9 deliberately. 11 makes the crypto provider pluggable and PANICS
+# unless one is chosen, and neither choice is free: `rust_crypto` pulls `rsa`
+# (RUSTSEC-2023-0071, no fix), which publishing would push into every downstream
+# user's audit; `aws_lc_rs` needs NASM on Windows, the C toolchain `ring` was
+# picked to avoid. 9.3.1 carries no advisory, so waiting costs nothing — and the
+# `cargo audit` job is the tripwire if that changes. See .github/dependabot.yml.
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Official MCP SDK — serves both agent-facing transports (behind its
