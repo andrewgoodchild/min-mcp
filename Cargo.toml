@@ -64,7 +64,7 @@ bytes = "1"
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
 # CSPRNG for request-id generation (UUIDv4). Portable OS entropy (getrandom(2) /
 # SecRandomCopyBytes / RtlGenRandom); already in the tree via rustls.
-getrandom = "0.3"
+getrandom = "0.4"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: keep JSON object keys in source order so response bodies (and
 # TOON encodings) present fields as the API returned them, not alphabetized.
