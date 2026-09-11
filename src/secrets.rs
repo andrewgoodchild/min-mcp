@@ -207,29 +207,9 @@ impl Secrets {
     }
 }
 
-/// Install the process-wide rustls crypto provider that `vaultrs` needs.
-///
-/// vaultrs is built with `rustls-no-provider` so it shares the `ring` provider
-/// already in the tree rather than dragging in aws-lc (a C build on every
-/// platform). The catch: "no provider" means it takes the PROCESS DEFAULT, and
-/// reqwest **panics** while building its client when no default is installed.
-/// Nothing installed one, so every `${vault:…}` reference aborted the process
-/// instead of resolving — the feature could not work at all.
-///
-/// Called on the Vault path only, so a deployment that never references Vault
-/// pays nothing. `install_default` errors if a provider is already installed,
-/// which is not a problem here: any provider will do, and it must not be racy,
-/// hence the `Once`.
-fn install_crypto_provider() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
 impl Vault {
     async fn connect(cfg: &VaultConfig) -> Result<Self> {
-        install_crypto_provider();
+        crate::crypto::install_provider();
         let mut b = VaultClientSettingsBuilder::default();
         if let Some(addr) = &cfg.address {
             // the builder's own setter panics on a malformed URL; validate first

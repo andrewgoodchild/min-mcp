@@ -6,7 +6,30 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **reqwest 0.12 → 0.13, unifying the dependency tree.** vaultrs already pulled
+  0.13, so both majors were being compiled into the binary. One HTTP stack now:
+  **266 packages, down from 277** — reqwest 0.12 itself plus the ten crates only
+  it pulled, including the `quinn` HTTP/3 stack and `webpki-roots`. No `aws-lc`,
+  `native-tls` or `openssl` anywhere in the tree, before or after.
+  - The feature is `rustls-no-provider`, not `rustls`: in 0.13 `rustls` implies
+    `aws-lc-rs`, which needs NASM on Windows x86-64 — the C toolchain this
+    project pins `ring` to avoid. (`form` and `query` also moved behind their
+    own features.)
+  - "No provider" means the process default, and building a client **panics**
+    when there is none. That install now lives in one place
+    (`crate::crypto::install_provider`) and is called from every site that
+    builds a client. Putting it in `main` is not sufficient and was tried: a
+    unit test never runs `main`, so 19 tests panicked on the first client they
+    built. Three crates have now hit this exact failure — vaultrs, jsonwebtoken
+    11, and reqwest 0.13 — so the shared install replaces the Vault-only one.
+  - **Outbound TLS now verifies against the OS trust store**
+    (`rustls-platform-verifier`) rather than a bundled root set. For an upstream
+    with a private CA this means the certificate must be trusted by the host,
+    which is usually what an operator already expects; it is a behaviour change
+    either way. Smoke-tested against a real HTTPS endpoint, since every upstream
+    fixture in the suite is deliberately offline and cannot exercise it.
 
 ## [0.2.0] — 2026-09-09
 

@@ -7,6 +7,7 @@ mod auth;
 mod backend;
 mod caller;
 mod config;
+mod crypto;
 mod exec;
 mod http_upstream;
 mod index;

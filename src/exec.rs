@@ -184,6 +184,7 @@ impl Executor {
         // whole proxy behind the surface mutex (reqwest has NO default). A
         // builder failure is an error, not a silent fallback to a client
         // WITHOUT the ceiling.
+        crate::crypto::install_provider();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()
