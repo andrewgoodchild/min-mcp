@@ -14,6 +14,30 @@ updates:
       # because a major is a decision rather than a chore.
       minor-and-patch:
         update-types: ["minor", "patch"]
+      # jaq is four crates that must move together: 2.x merged `jaq-interpret`
+      # and `jaq-parse` into `jaq-core` and changed the API, so a PR bumping one
+      # of them can never compile. Grouped so the offer is one decision.
+      jaq:
+        patterns: ["jaq-*"]
+    ignore:
+      # Both of these are DEFERRED DECISIONS, not permanent exclusions. The
+      # `cargo audit` job is the tripwire: if either crate is ever flagged, the
+      # gate goes red and the decision gets made then, with better information.
+      #
+      # jsonwebtoken 11 made its crypto provider pluggable and PANICS unless one
+      # is selected. Neither option is free: `rust_crypto` pulls `rsa`, which
+      # carries RUSTSEC-2023-0071 (Marvin attack) with no fix available — and
+      # publishing that to crates.io would put the advisory in every downstream
+      # user's audit; `aws_lc_rs` needs NASM on Windows x86-64, the C toolchain
+      # this project pinned rustls to `ring` specifically to avoid. 9.3.1 is
+      # advisory-clean, so the cost of waiting is currently zero.
+      # REMOVE WHEN: `rsa` gets a fix, or 9.x is flagged.
+      - dependency-name: "jsonwebtoken"
+        update-types: ["version-update:semver-major"]
+      # jaq 1.x -> 3.x is a port of `src/jq.rs`, not a version bump.
+      # REMOVE WHEN: that port is done.
+      - dependency-name: "jaq-*"
+        update-types: ["version-update:semver-major"]
 
   # The workflows pin actions by major tag; this keeps them current, including
   # the ones that gate releases.
