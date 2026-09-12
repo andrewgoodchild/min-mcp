@@ -167,6 +167,28 @@ needs a C toolchain the Windows release build does not have.
 
 ### Changed
 
+- **The `Origin` check is rmcp's now, not ours.** `origin_allowed()` was a
+  hand-rolled ~40-line validator; rmcp 3.x does RFC 6454 normalisation itself,
+  so the rule is expressed as data (`LOOPBACK_ORIGINS`) and the matching is the
+  SDK's. This is the same class of duplication that let the request-body cap
+  silently keep rmcp's 4 MiB default instead of the configured one — our own
+  copy of a transport mechanism, which upstream fixes never reach.
+
+  Behaviour is preserved, verified against a running server: an absent Origin
+  is allowed (every non-browser client sends none), loopback is allowed on any
+  port and either scheme, `null` is allowed, and a cross-origin POST is refused
+  with 403 — including the near-misses a suffix check would let through
+  (`localhost.evil.example`, `127.0.0.1.evil.example`).
+
+  One case is now stricter: `http://::1`, an unbracketed IPv6 literal, was
+  accepted and is now a 400. It is malformed per RFC 3986 and no browser emits
+  it, so this is a tightening rather than a regression.
+
+  The old unit test is replaced by end-to-end tests through a real server. A
+  unit test of our own matcher could not catch the allow-list being wired up
+  wrong, which is now the only way this can break.
+
+
 - **The surface is shared, not locked.** The catalog, index, schemas, and
   backends are read concurrently; per-call state sits behind small locks never
   held across an upstream call; the stdio client multiplexes requests by id; the

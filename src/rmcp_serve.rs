@@ -363,46 +363,41 @@ impl HttpIdentity {
         })
     }
 }
-
-/// Is this `Origin` header value acceptable for a locally-bound MCP server?
+/// Loopback origins, in the form rmcp's `allowed_origins` matches against.
 ///
-/// The MCP spec asks HTTP servers to validate `Origin` against DNS-rebinding:
-/// a page on `https://evil.example` can be made to resolve to 127.0.0.1 and
-/// POST to a local server, and the browser will attach its own origin. rmcp
-/// validates the `Host` header; this adds the `Origin` half.
+/// This USED to be a hand-rolled validator. rmcp does RFC 6454 normalisation
+/// itself (`origin_is_allowed`), and our own copy of a mechanism the transport
+/// owns is exactly how the body cap silently kept rmcp's 4 MiB default instead
+/// of the configured one — so the rule is now expressed as data and the
+/// matching is the SDK's.
 ///
-/// A **missing** Origin is allowed — non-browser clients (agents, curl, the MCP
-/// SDKs) don't send one, and rejecting that would break every normal caller.
-/// A **present** Origin must be loopback, which is the only origin a browser
-/// could legitimately have for a localhost-bound server.
-pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
-    let Some(origin) = origin else { return true };
-    let origin = origin.trim();
-    if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
-        return true; // opaque origin (file://, sandboxed iframe) carries no authority
-    }
-    // Strip scheme, then any :port, then compare the host.
-    let after_scheme = origin.split_once("://").map(|(_, rest)| rest).unwrap_or(origin);
-    let host = after_scheme.split('/').next().unwrap_or("");
-    // Port stripping that survives IPv6. A bracketed literal keeps everything up
-    // to `]` (a port can only follow the bracket); otherwise exactly one colon
-    // means host:port, while zero or several means there is no port to strip
-    // (several = a bare unbracketed IPv6 like `::1`).
-    let host = if host.starts_with('[') {
-        match host.find(']') {
-            Some(i) => &host[..=i],
-            None => host,
-        }
-    } else if host.matches(':').count() == 1 {
-        host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
-    } else {
-        host
-    };
-    matches!(
-        host.trim_end_matches('.'),
-        "localhost" | "127.0.0.1" | "[::1]" | "::1" | "[0:0:0:0:0:0:0:1]"
-    )
-}
+/// Shape matters, and follows rmcp's comparison
+/// (`scheme == scheme && host == host && (allowed_port.is_none() || ports equal)`):
+///
+/// - **No port** on any entry, because a portless entry matches ANY port. A
+///   browser talking to a loopback server can be on any port.
+/// - **Both schemes**, because rmcp compares the scheme exactly, where the old
+///   validator ignored it.
+/// - **`localhost.`** as well as `localhost`: the trailing-dot FQDN form is
+///   legitimate and the old validator accepted it.
+/// - **Both spellings of the IPv6 loopback**, since rmcp normalises brackets
+///   away but does not expand `::1` to its long form.
+/// - **`null`**, the opaque origin a sandboxed iframe or `file://` page sends.
+///   An ABSENT Origin needs no entry: rmcp allows it, as the old validator did,
+///   because non-browser clients (agents, curl, the SDKs) never send one.
+const LOOPBACK_ORIGINS: &[&str] = &[
+    "null",
+    "http://localhost",
+    "https://localhost",
+    "http://localhost.",
+    "https://localhost.",
+    "http://127.0.0.1",
+    "https://127.0.0.1",
+    "http://[::1]",
+    "https://[::1]",
+    "http://[0:0:0:0:0:0:0:1]",
+    "https://[0:0:0:0:0:0:0:1]",
+];
 
 /// Serve the minified surface over Streamable HTTP using rmcp's
 /// `StreamableHttpService` (JSON-RPC over POST, SSE for streamed replies,
@@ -418,7 +413,7 @@ pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
 ///
 /// DNS-rebinding defences depend on the bind. A **loopback** server validates
 /// both headers: `Host` (rmcp's allow-list) and `Origin` (see
-/// [`origin_allowed`]) — that is the attack's shape: a page on
+/// [`LOOPBACK_ORIGINS`], matched by rmcp) — that is the attack's shape: a page on
 /// `evil.example` resolving to 127.0.0.1. A **non-loopback** server cannot
 /// validate `Host` — clients address it by whatever name or address they
 /// reach it on, and rmcp's loopback-only default would 403 every one of them —
@@ -491,6 +486,10 @@ pub async fn serve_http(
     } else {
         StreamableHttpServerConfig::default()
     }
+    // An EMPTY allow-list means rmcp allows every origin, which is how the
+    // check is switched off for the identity-enforced remote case (see the doc
+    // comment above for why that case is exempt).
+    .with_allowed_origins(if check_origin { LOOPBACK_ORIGINS.to_vec() } else { Vec::new() })
     // rmcp enforces the body cap itself while it streams the POST body, and it
     // has its OWN default (4 MiB). Handing it the configured value is what makes
     // `max_body_bytes` real at every size — left at the default, anything above
@@ -563,17 +562,6 @@ pub async fn serve_http(
             let process_caller = process_caller.clone();
             let origin = origin.clone();
             async move {
-                // Borrowed, and only owned on the refusal path; the flag is
-                // tested first so an identity-enforced remote bind (where the
-                // check is off) never reads the header at all.
-                let refused = {
-                    let origin = req.headers().get(hyper::header::ORIGIN).and_then(|v| v.to_str().ok());
-                    (check_origin && !origin_allowed(origin)).then(|| origin.unwrap_or_default().to_string())
-                };
-                if let Some(origin) = refused {
-                    crate::log_warn!("refused an HTTP request from Origin {origin:?} (DNS-rebinding defence)");
-                    return Ok(plain_response(hyper::StatusCode::FORBIDDEN, None, "forbidden: Origin not allowed"));
-                }
                 let caller = match identity.authenticate(req.headers(), &process_caller).await {
                     Ok(c) => c,
                     Err(r) => {
@@ -672,39 +660,6 @@ fn plain_response(
 mod tests {
     use super::*;
     use jsonwebtoken::{encode, EncodingKey, Header};
-
-    #[test]
-    fn origin_allows_absent_and_loopback_only() {
-        // absent / opaque: normal non-browser clients, and sandboxed pages
-        assert!(origin_allowed(None));
-        assert!(origin_allowed(Some("")));
-        assert!(origin_allowed(Some("null")));
-        // loopback in its various spellings, with and without ports
-        for ok in [
-            "http://localhost",
-            "http://localhost:8080",
-            "https://127.0.0.1:3000",
-            "http://[::1]:9000",
-            "http://[::1]",
-            "http://[0:0:0:0:0:0:0:1]",
-            "http://[0:0:0:0:0:0:0:1]:8080",
-            "http://localhost.",
-        ] {
-            assert!(origin_allowed(Some(ok)), "should allow {ok}");
-        }
-        // anything else is a rebinding candidate
-        for bad in [
-            "https://evil.example",
-            "http://evil.example:80",
-            "https://localhost.evil.example",
-            "http://169.254.169.254",
-            "https://sub.localhost.attacker.com",
-            "http://[2001:db8::1]",
-            "http://[2001:db8::1]:8080",
-        ] {
-            assert!(!origin_allowed(Some(bad)), "should refuse {bad}");
-        }
-    }
 
     const SECRET: &str = "test-secret";
 

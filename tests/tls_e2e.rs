@@ -49,7 +49,12 @@ fn post(url: &str, body: &str, extra: &[&str], headers: &[&str]) -> (String, i32
 /// multi-megabyte bodies, and an argv-passed one hits the OS argument limit
 /// (E2BIG) before it ever reaches the server.
 fn post_status(url: &str, body: &str, headers: &[&str]) -> String {
-    let path = std::env::temp_dir().join(format!("minmcp-body-{}-{:p}.json", std::process::id(), body));
+    // A unique name PER CALL, not per body: two tests posting the same const
+    // body in parallel would otherwise derive the same path and delete each
+    // other's file mid-read (curl exit 26).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("minmcp-body-{}-{n}.json", std::process::id()));
     std::fs::write(&path, body).expect("write the request body");
     let at = format!("@{}", path.display());
     let mut args: Vec<&str> = vec![
@@ -200,4 +205,70 @@ fn rate_limit_buckets_are_keyed_per_client_certificate() {
         !other.contains("RATE_LIMITED"),
         "a different client certificate must have its own bucket, got: {other}"
     );
+}
+
+// --- the DNS-rebinding Origin defence, through rmcp ------------------------
+//
+// This was a hand-rolled validator with a unit test. The rule is now data
+// (`LOOPBACK_ORIGINS`) matched by rmcp's own RFC 6454 normalisation, so the
+// cases live here instead: asserted through a real server on the real path,
+// where a mistake in either the list or the wiring actually shows up. A unit
+// test of our own matcher could not have caught the list being wired up wrong.
+
+/// POST with an `Origin` header, returning the HTTP status.
+fn status_with_origin(url: &str, origin: Option<&str>) -> String {
+    let hdr = origin.map(|o| format!("Origin: {o}"));
+    let mut headers: Vec<&str> = Vec::new();
+    if let Some(h) = &hdr {
+        headers.extend(["-H", h.as_str()]);
+    }
+    post_status(url, INIT, &headers)
+}
+
+#[test]
+fn a_loopback_origin_is_allowed_on_any_port_and_either_scheme() {
+    let s = HttpServer::start("127.0.0.1", &["--config", "tests/fixtures/ci-server.yaml"]);
+    for ok in [
+        "http://localhost",
+        "http://localhost:8080",
+        "https://localhost:3000",
+        "http://127.0.0.1:9000",
+        "https://127.0.0.1",
+        "http://[::1]",
+        "http://[::1]:9000",
+        "http://[0:0:0:0:0:0:0:1]:8080",
+        "http://localhost.",
+        "null",
+    ] {
+        let code = status_with_origin(&s.url(), Some(ok));
+        assert_ne!(code, "403", "Origin {ok} should be allowed, got {code}");
+    }
+}
+
+#[test]
+fn an_absent_origin_is_allowed() {
+    // Every non-browser client — agents, curl, the MCP SDKs — sends none.
+    // Refusing this would break the normal case entirely.
+    let s = HttpServer::start("127.0.0.1", &["--config", "tests/fixtures/ci-server.yaml"]);
+    assert_ne!(status_with_origin(&s.url(), None), "403");
+}
+
+#[test]
+fn a_cross_origin_post_is_refused_with_403() {
+    // The attack shape: a page on evil.example resolving to 127.0.0.1, using
+    // the browser to reach a server that is only meant to be local.
+    let s = HttpServer::start("127.0.0.1", &["--config", "tests/fixtures/ci-server.yaml"]);
+    for bad in [
+        "https://evil.example",
+        "http://evil.example:80",
+        // The near-misses that a naive substring or suffix check would let in.
+        "https://localhost.evil.example",
+        "https://sub.localhost.attacker.com",
+        "http://127.0.0.1.evil.example",
+        "http://169.254.169.254",
+        "http://[2001:db8::1]",
+        "http://[2001:db8::1]:8080",
+    ] {
+        assert_eq!(status_with_origin(&s.url(), Some(bad)), "403", "Origin {bad} must be refused");
+    }
 }
