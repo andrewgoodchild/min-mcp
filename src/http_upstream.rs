@@ -78,6 +78,7 @@ impl HttpUpstream {
             Some(o) => Some(OAuthClient::new(o, secrets).await?),
             None => None,
         };
+        crate::crypto::install_provider();
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()

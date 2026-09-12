@@ -34,6 +34,7 @@ impl OAuthClient {
         // Bound the token fetch: bearer() is awaited before every HTTP-upstream
         // request, so a hung token endpoint would stall min-mcp indefinitely
         // (reqwest has no default timeout). Token endpoints respond fast.
+        crate::crypto::install_provider();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()

@@ -119,7 +119,10 @@ impl Jwks {
             keys: RwLock::new(keys),
             source: Some(JwksSource {
                 url: url.to_string(),
-                client: reqwest::Client::new(),
+                client: {
+                    crate::crypto::install_provider();
+                    reqwest::Client::new()
+                },
                 attempted_at: Mutex::new(Instant::now() - ago),
                 flight: tokio::sync::Mutex::new(()),
             }),
@@ -280,6 +283,7 @@ pub fn jwks_from_json(json: &str) -> Result<JwtVerifier> {
 /// A verifier over a JWKS endpoint: fetched now (bounded), refreshed on an
 /// unknown `kid` and on age, never more than once a minute.
 pub async fn jwks_from_url(url: &str) -> Result<JwtVerifier> {
+    crate::crypto::install_provider();
     let client = reqwest::Client::builder()
         .timeout(JWKS_FETCH_TIMEOUT)
         .build()

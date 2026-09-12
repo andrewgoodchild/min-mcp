@@ -36,7 +36,12 @@ jaq-std = "1.5"
 # picked to avoid. 9.3.1 carries no advisory, so waiting costs nothing — and the
 # `cargo audit` job is the tripwire if that changes. See .github/dependabot.yml.
 jsonwebtoken = "9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# 0.13 unifies the tree: vaultrs already pulls it, so 0.12 AND 0.13 were both
+# being compiled in. `rustls-no-provider` rather than `rustls`, because in 0.13
+# `rustls` implies aws-lc-rs (NASM on Windows) — see `crate::crypto` for the
+# provider install that "no provider" then requires. `form`/`query` moved
+# behind their own features in 0.13.
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "query", "rustls-no-provider"] }
 # Official MCP SDK — serves both agent-facing transports (behind its
 # ServerHandler), while the surface, spec executor, and upstream clients stay
 # hand-rolled. `server` = ServerHandler; `transport-io` = stdio();
