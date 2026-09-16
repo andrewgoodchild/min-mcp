@@ -272,6 +272,11 @@ pub async fn serve_stdio(surface: Arc<Surface>, caller: Caller) -> Result<()> {
 /// How HTTP requests are authenticated, from `auth:`.
 pub struct HttpIdentity {
     pub verifier: Option<Arc<JwtVerifier>>,
+    /// Asks the authorization server whether a validly-signed token is still
+    /// live. Separate from the verifier because it answers a different
+    /// question: the verifier says "this was issued and has not lapsed", this
+    /// says "and it has not been revoked since".
+    pub introspector: Option<Arc<crate::auth::Introspector>>,
     pub checks: ClaimChecks,
     pub scope_claim: String,
     pub subject_claim: String,
@@ -291,9 +296,14 @@ impl HttpIdentity {
     /// Everything the request guard needs, from one `auth:` section — so a new
     /// auth knob is added in `Auth` and here, never copied field by field at
     /// the call site (where the HTTP path could silently keep a default).
-    pub fn from_auth(a: &crate::config::Auth, verifier: Option<Arc<JwtVerifier>>) -> Self {
+    pub fn from_auth(
+        a: &crate::config::Auth,
+        verifier: Option<Arc<JwtVerifier>>,
+        introspector: Option<Arc<crate::auth::Introspector>>,
+    ) -> Self {
         HttpIdentity {
             verifier,
+            introspector,
             checks: ClaimChecks { audience: a.audience.clone(), issuer: a.issuer.clone() },
             scope_claim: a.scope_claim.clone(),
             subject_claim: a.subject_claim.clone(),
@@ -327,13 +337,40 @@ impl HttpIdentity {
                 scheme.eq_ignore_ascii_case("bearer").then_some(tok.trim())
             });
         if let (Some(tok), Some(verifier)) = (bearer, &self.verifier) {
-            return match verifier.caller(tok, &self.scope_claim, &self.subject_claim, &self.checks).await {
-                Ok(c) => Ok(Arc::new(c)),
-                Err(e) => Err(Refusal {
-                    challenge: "Bearer error=\"invalid_token\"",
-                    reason: format!("invalid bearer token: {e:#}"),
-                }),
+            let claims = match verifier.claims(tok, &self.checks).await {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(Refusal {
+                        challenge: "Bearer error=\"invalid_token\"",
+                        reason: format!("invalid bearer token: {e:#}"),
+                    })
+                }
             };
+            // Signature and `exp` say the token was issued and has not lapsed.
+            // Only the authorization server knows whether it was revoked since.
+            if let Some(introspector) = &self.introspector {
+                let exp = claims.get("exp").and_then(Value::as_u64);
+                match introspector.active(tok, exp).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(Refusal {
+                            challenge: "Bearer error=\"invalid_token\"",
+                            reason: "bearer token has been revoked".to_string(),
+                        })
+                    }
+                    Err(e) => {
+                        return Err(Refusal {
+                            challenge: "Bearer error=\"temporarily_unavailable\"",
+                            reason: format!("could not verify token status: {e:#}"),
+                        })
+                    }
+                }
+            }
+            let subject = claims.get(&self.subject_claim).and_then(Value::as_str).map(str::to_string);
+            return Ok(Arc::new(Caller::new(
+                crate::auth::extract_scopes(&claims, &self.scope_claim),
+                subject,
+            )));
         }
         if let Some(t) = &self.trusted {
             if let Some(raw) = headers.get(t.scopes.as_str()).and_then(|v| v.to_str().ok()) {
@@ -670,6 +707,7 @@ mod tests {
     fn identity(verifier: bool, trusted: bool, allow_anonymous: bool) -> HttpIdentity {
         HttpIdentity {
             verifier: verifier.then(|| Arc::new(JwtVerifier::Hs256(SECRET.as_bytes().to_vec()))),
+            introspector: None,
             checks: ClaimChecks::default(),
             scope_claim: "scope".into(),
             subject_claim: "sub".into(),

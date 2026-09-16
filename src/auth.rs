@@ -17,12 +17,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::Value;
 
+use secrecy::{ExposeSecret, SecretString};
+
 use crate::caller::Caller;
+use crate::secrets::Secrets;
 use crate::sync::{lock, read, write};
 
 /// Optional registered-claim checks applied on top of the signature and `exp`.
@@ -211,7 +214,7 @@ fn verify(token: &str, alg: Algorithm, key: &DecodingKey, checks: &ClaimChecks) 
         .claims)
 }
 
-fn extract_scopes(claims: &Value, claim: &str) -> Vec<String> {
+pub(crate) fn extract_scopes(claims: &Value, claim: &str) -> Vec<String> {
     match claims.get(claim) {
         Some(Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
         Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -300,8 +303,236 @@ pub async fn jwks_from_url(url: &str) -> Result<JwtVerifier> {
     }))
 }
 
+/// RFC 7662 introspection: asks the authorization server whether a token is
+/// still live.
+///
+/// A signature and an unexpired `exp` prove a token was ISSUED and has not
+/// lapsed. Neither can say it was revoked five minutes ago — an offboarded
+/// user, a leaked credential, a compromised client. JWKS rotation withdraws a
+/// *key*, which invalidates every token it signed; this is how you refuse ONE.
+pub struct Introspector {
+    client: reqwest::Client,
+    url: String,
+    client_id: String,
+    client_secret: SecretString,
+    /// Keyed by a HASH of the token, never the token itself: this map outlives
+    /// any single request, and a raw bearer sitting in a long-lived structure
+    /// is a credential waiting to be printed by a future Debug impl.
+    cache: Mutex<HashMap<String, (Instant, bool)>>,
+    ttl: Duration,
+    fail_open: bool,
+}
+
+impl Introspector {
+    pub async fn new(cfg: &crate::config::IntrospectionConfig, secrets: &Secrets) -> Result<Self> {
+        crate::crypto::install_provider();
+        // Bounded like every other credential fetch: this sits in front of
+        // every request, so a hung endpoint would stall the whole proxy.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("building the introspection HTTP client")?;
+        Ok(Introspector {
+            client,
+            url: cfg.url.clone(),
+            client_id: cfg.client_id.clone(),
+            client_secret: SecretString::from(secrets.expand(&cfg.client_secret).await?),
+            cache: Mutex::new(HashMap::new()),
+            ttl: Duration::from_secs(cfg.cache_ttl_s),
+            fail_open: cfg.fail_open,
+        })
+    }
+
+    /// Is `token` still live? `exp` is the token's own expiry (unix seconds), so
+    /// a result is never cached past the point the token dies anyway.
+    pub async fn active(&self, token: &str, exp: Option<u64>) -> Result<bool> {
+        let key = token_key(token);
+        if let Some(hit) = self.cached(&key) {
+            return Ok(hit);
+        }
+        let form = [
+            ("token", token),
+            ("token_type_hint", "access_token"),
+            ("client_id", self.client_id.as_str()),
+            ("client_secret", self.client_secret.expose_secret()),
+        ];
+        let resp = match self.client.post(&self.url).form(&form).send().await {
+            Ok(r) => r,
+            Err(e) => return self.unreachable(&e.to_string()),
+        };
+        if !resp.status().is_success() {
+            return self.unreachable(&format!("HTTP {}", resp.status()));
+        }
+        let body: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return self.unreachable(&format!("unreadable response: {e}")),
+        };
+        // RFC 7662: `active` is the only REQUIRED field, and a missing one is
+        // not an implicit yes.
+        let active = body.get("active").and_then(Value::as_bool).unwrap_or(false);
+        self.remember(key, active, exp);
+        Ok(active)
+    }
+
+    /// The endpoint could not be consulted. Fail closed unless told otherwise,
+    /// and never cache — an outage must not pin a verdict for the whole TTL.
+    fn unreachable(&self, why: &str) -> Result<bool> {
+        if self.fail_open {
+            crate::log_warn!("token introspection failed ({why}); serving anyway (fail_open)");
+            return Ok(true);
+        }
+        bail!("token introspection failed ({why}) and fail_open is off")
+    }
+
+    fn cached(&self, key: &str) -> Option<bool> {
+        let cache = lock(&self.cache);
+        let (at, active) = cache.get(key)?;
+        (at.elapsed() < self.ttl).then_some(*active)
+    }
+
+    fn remember(&self, key: String, active: bool, exp: Option<u64>) {
+        // Caching past the token's own expiry buys nothing and keeps a verdict
+        // about a dead token alive.
+        if let Some(exp) = exp {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if exp <= now {
+                return;
+            }
+        }
+        let mut cache = lock(&self.cache);
+        // Bounded: a proxy seeing many distinct tokens must not grow forever.
+        if cache.len() >= INTROSPECTION_CACHE_MAX {
+            cache.retain(|_, (at, _)| at.elapsed() < self.ttl);
+            if cache.len() >= INTROSPECTION_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(key, (Instant::now(), active));
+    }
+}
+
+/// How many introspection verdicts to hold. Well above any realistic caller
+/// count; the point is that it cannot grow without bound.
+const INTROSPECTION_CACHE_MAX: usize = 4096;
+
+/// A cache key that is not the credential: SHA-256, hex, truncated. Collision
+/// resistance is all that is needed — this keys a map, it authorises nothing.
+fn token_key(token: &str) -> String {
+    let d = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+    d.as_ref().iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    // --- revocation, against a mock introspection endpoint -------------------
+    //
+    // The point of introspection is the case a signature cannot cover: a token
+    // that is validly signed and unexpired, and revoked anyway.
+
+    use crate::testserver::{self, Reply};
+
+    fn icfg(url: String, ttl: u64, fail_open: bool) -> crate::config::IntrospectionConfig {
+        crate::config::IntrospectionConfig {
+            url,
+            client_id: "minmcp".into(),
+            client_secret: "shh".into(),
+            cache_ttl_s: ttl,
+            fail_open,
+        }
+    }
+
+    async fn introspector(url: String, ttl: u64, fail_open: bool) -> Introspector {
+        Introspector::new(&icfg(url, ttl, fail_open), &Secrets::env_only()).await.expect("build")
+    }
+
+    #[tokio::test]
+    async fn an_active_token_is_accepted_and_the_endpoint_is_authenticated() {
+        let srv = testserver::spawn(|_, _| Reply::json(r#"{"active":true,"sub":"alice"}"#)).await;
+        let i = introspector(srv.url(), 60, false).await;
+        assert!(i.active("tok-abc", None).await.unwrap());
+
+        // RFC 7662 requires the CALLER to authenticate — the endpoint reveals
+        // whether a token is live, which is not public information.
+        let body = &srv.seen()[0].body;
+        assert!(body.contains("client_id=minmcp"), "client credentials: {body}");
+        assert!(body.contains("client_secret=shh"), "client credentials: {body}");
+        assert!(body.contains("token=tok-abc"), "the token under test: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_revoked_token_is_refused() {
+        let srv = testserver::spawn(|_, _| Reply::json(r#"{"active":false}"#)).await;
+        let i = introspector(srv.url(), 60, false).await;
+        assert!(!i.active("tok-abc", None).await.unwrap(), "active:false must be refused");
+    }
+
+    #[tokio::test]
+    async fn a_response_without_active_is_treated_as_not_live() {
+        // `active` is the only REQUIRED field in RFC 7662, and its absence is
+        // not an implicit yes — defaulting the other way would make a
+        // malformed or truncated response grant access.
+        let srv = testserver::spawn(|_, _| Reply::json(r#"{"sub":"alice","scope":"read"}"#)).await;
+        let i = introspector(srv.url(), 60, false).await;
+        assert!(!i.active("tok-abc", None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn verdicts_are_cached_for_the_ttl() {
+        // This runs in front of every authenticated request; a round trip per
+        // request would put the IdP on the hot path.
+        let srv = testserver::spawn(|_, _| Reply::json(r#"{"active":true}"#)).await;
+        let i = introspector(srv.url(), 60, false).await;
+        for _ in 0..4 {
+            assert!(i.active("tok-abc", None).await.unwrap());
+        }
+        assert_eq!(srv.hits(), 1, "four checks of one token should introspect once");
+
+        // A DIFFERENT token is its own verdict, not a cache hit.
+        assert!(i.active("tok-other", None).await.unwrap());
+        assert_eq!(srv.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_verdict_is_not_cached_past_the_tokens_own_expiry() {
+        let srv = testserver::spawn(|_, _| Reply::json(r#"{"active":true}"#)).await;
+        let i = introspector(srv.url(), 3600, false).await;
+        // exp in the past: caching a verdict about a token that is already dead
+        // keeps a stale answer alive for the whole TTL.
+        i.active("tok-expired", Some(1)).await.unwrap();
+        i.active("tok-expired", Some(1)).await.unwrap();
+        assert_eq!(srv.hits(), 2, "an expired token's verdict must not be cached");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_fails_closed_by_default() {
+        // The security property: a revocation check that serves the request
+        // when the authority is unreachable is advisory, not a control. An
+        // attacker who can reach the endpoint can also make it unreachable.
+        let i = introspector("http://127.0.0.1:1/introspect".into(), 60, false).await;
+        let err = format!("{:#}", i.active("tok-abc", None).await.unwrap_err());
+        assert!(err.contains("fail_open"), "the error should name the knob: {err}");
+
+        // A non-2xx is equally "could not be consulted", not "token is fine".
+        let srv = testserver::spawn(|_, _| Reply::status(500)).await;
+        let i = introspector(srv.url(), 60, false).await;
+        assert!(i.active("tok-abc", None).await.is_err(), "HTTP 500 must not pass the token");
+    }
+
+    #[tokio::test]
+    async fn fail_open_serves_the_request_and_does_not_cache_the_outage() {
+        let i = introspector("http://127.0.0.1:1/introspect".into(), 60, true).await;
+        assert!(i.active("tok-abc", None).await.unwrap(), "fail_open should serve");
+
+        // An outage must not pin a verdict: once the endpoint is back, the
+        // next request asks again rather than riding a cached "yes".
+        let srv = testserver::spawn(|_, _| Reply::json(r#"{"active":false}"#)).await;
+        let i2 = introspector(srv.url(), 60, true).await;
+        assert!(!i2.active("tok-abc", None).await.unwrap());
+    }
+
     use super::*;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::json;
