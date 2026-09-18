@@ -450,11 +450,13 @@ so you never mint one by hand. See
 
 - Agent-supplied path params on spec upstreams are strictly segment-encoded, so a
   value like `../` can't escape its endpoint.
-- HTTP serving is loopback-only unless every request must authenticate or
-  `--allow-remote` is given, and validates **both** DNS-rebinding headers: the
-  `Host` header (by rmcp) and the `Origin` header (min-mcp — a *present* Origin
-  must be loopback; an absent one is allowed, since non-browser clients don't
-  send one). A cross-origin POST is refused with 403 and logged.
+- HTTP serving is loopback-only unless every request must authenticate,
+  client certificates are required, or `--allow-remote` is given. Both
+  DNS-rebinding headers are validated by rmcp: the `Host` header, and the
+  `Origin` header against a loopback allow-list min-mcp supplies. A present
+  Origin must be loopback (any port, either scheme); an absent one is allowed,
+  since non-browser clients don't send one. A cross-origin POST is refused with
+  403.
 - A failed upstream call — transport error, timeout, or the upstream's own
   `isError` — always comes back to the agent as an `isError` tool result with
   guidance, never as a JSON-RPC protocol error, so a dead upstream is something
@@ -464,10 +466,21 @@ so you never mint one by hand. See
   ever logged.
 - TLS, and optional mutual TLS, terminate on the listener when `http.tls` is
   configured; without it the port is plaintext and belongs behind a gateway.
-  Request bodies and in-flight requests are capped (`http.limits`).
-- Not built: per-tenant isolation in one process (run one process per tenant
-  behind the gateway), binding an HTTP session to the identity that opened it
-  (scopes always come from the current request's token, never from session
-  state, so a session id carries no privilege), and revocation of an unexpired
-  token (JWKS rotation withdraws a *key*; short token lifetimes are the
-  mitigation for a stolen one).
+  Request bodies and in-flight HTTP requests are capped (`http.limits`),
+  concurrent calls to upstreams are capped (`max_concurrent_calls`), and an
+  accepted socket that produces no request is dropped (connection deadlines).
+- Tool definitions are checked for poisoning at startup (`poisoning_policy`):
+  invisible characters, instructions aimed at the model, and references to
+  local credential files. Descriptions only — not arguments, not responses.
+- Not built, each for a stated reason:
+  - **Revocation of an unexpired token.** JWKS rotation withdraws a *key*, not
+    a token; short lifetimes are the mitigation for a stolen one.
+  - **Tamper-evident audit.** The NDJSON stream is append-only text with no
+    signing or hash chaining.
+  - **Binding an HTTP session to the identity that opened it.** Low risk as
+    built: scopes always come from the current request's token, never from
+    session state, so a session id carries no privilege.
+  - **Per-tenant isolation in one process.** Run one process per tenant behind
+    the gateway; one `Surface` backs every session by design.
+  - **Argument-level taint enforcement and response scanning.** A guardrail
+    product's job, not a proxy's.
