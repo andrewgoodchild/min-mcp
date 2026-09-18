@@ -6,6 +6,25 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Token revocation via RFC 7662 introspection** (`auth.introspection`). A
+  signature and an unexpired `exp` prove a token was *issued* and has not
+  lapsed; neither can say it was revoked since. JWKS rotation withdraws a key,
+  killing every token it signed — this refuses one.
+  - `active: false` is a 401. A response missing `active` is treated as **not
+    live**: it is the only field RFC 7662 requires, and defaulting the other way
+    would let a malformed response grant access.
+  - Verdicts are cached (`cache_ttl_s`, default 60), so **the TTL is the
+    revocation latency** — a revoked token works for at most that long. Never
+    cached past the token's own `exp`, and the cache is bounded.
+  - `fail_open` is **off by default**: an unreachable endpoint refuses the
+    request. A revocation check that serves traffic when the authority is
+    unreachable is advisory, not a control. Turning it on trades revocation for
+    availability during an outage.
+  - Cache keys are a hash of the token, never the token, since the map outlives
+    the request.
+
 ### Changed
 
 - **reqwest 0.12 → 0.13, unifying the dependency tree.** vaultrs already pulled

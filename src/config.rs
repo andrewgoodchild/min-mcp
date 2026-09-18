@@ -782,6 +782,12 @@ pub struct Auth {
     /// header it likes.
     #[serde(default)]
     pub trusted_headers: Option<TrustedHeaders>,
+    /// Ask the authorization server whether a token is still good
+    /// (RFC 7662). A signature and `exp` only prove a token was ISSUED and has
+    /// not lapsed; they cannot say it was revoked five minutes ago. See
+    /// [`IntrospectionConfig`].
+    #[serde(default)]
+    pub introspection: Option<IntrospectionConfig>,
     /// HTTP only. When identity is configured (a verifier or trusted headers),
     /// a request carrying none is refused with 401 — unless this is true, in
     /// which case it gets the process identity (`--jwt` / `--scopes`). Off by
@@ -873,6 +879,44 @@ impl Auth {
     }
 }
 
+/// RFC 7662 token introspection: the only way to refuse a token that is
+/// validly signed and unexpired but has been revoked — an offboarded user, a
+/// leaked credential, a compromised client.
+///
+/// Costs a round trip to the authorization server, so results are cached; the
+/// cache TTL is the window in which a revoked token still works, and is the
+/// knob to trade freshness against load.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct IntrospectionConfig {
+    /// The introspection endpoint.
+    pub url: String,
+    /// Client credentials min-mcp authenticates to the endpoint with. RFC 7662
+    /// requires the caller to be authenticated — the endpoint reveals whether a
+    /// token is live, which is not public information.
+    pub client_id: String,
+    /// `${env:…}` / `${file:…}` / `${vault:…}` like every other credential.
+    pub client_secret: String,
+    /// Seconds an introspection result is reused (default 60). A revoked token
+    /// keeps working for at most this long, so it is the revocation latency.
+    /// Never cached past the token's own `exp`.
+    #[serde(default = "default_introspection_ttl")]
+    pub cache_ttl_s: u64,
+    /// What to do when the endpoint cannot be reached. **False by default:**
+    /// refuse the request. A revocation check that serves the request when the
+    /// authority is unreachable is advisory, not a control — an attacker who
+    /// can reach the endpoint can also make it unreachable.
+    ///
+    /// Set true only where availability outranks revocation, and know that it
+    /// means a revoked token is honoured for as long as the outage lasts.
+    #[serde(default)]
+    pub fail_open: bool,
+}
+
+fn default_introspection_ttl() -> u64 {
+    60
+}
+
 /// Identity headers set by a trusted fronting gateway (see `Auth::trusted_headers`).
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -902,6 +946,7 @@ impl Default for Auth {
             issuer: None,
             subject_claim: default_subject_claim(),
             trusted_headers: None,
+            introspection: None,
             allow_anonymous: false,
         }
     }

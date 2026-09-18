@@ -204,7 +204,14 @@ async fn build(common: &Common) -> Result<Built> {
     let needs_verifier = common.jwt.is_some() || common.http.is_some();
     let verifier = build_verifier(&cfg, &secrets, needs_verifier).await?.map(Arc::new);
     let caller = resolve_caller(&cfg, common, verifier.as_deref()).await?;
-    let identity = rmcp_serve::HttpIdentity::from_auth(&cfg.auth, verifier);
+    // Built only for `serve --http`, and only when configured: introspection
+    // sits in front of every authenticated request, so nothing else should pay
+    // for a client it will never use.
+    let introspector = match (&cfg.auth.introspection, common.http.is_some()) {
+        (Some(i), true) => Some(Arc::new(crate::auth::Introspector::new(i, &secrets).await?)),
+        _ => None,
+    };
+    let identity = rmcp_serve::HttpIdentity::from_auth(&cfg.auth, verifier, introspector);
     let http = cfg.http.clone();
     // Rate limits key on the caller's subject, falling back to what the
     // connection knows (`Caller::rate_key`). That fallback separates direct

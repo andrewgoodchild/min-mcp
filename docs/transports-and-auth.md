@@ -155,6 +155,47 @@ policy) and strips inbound copies of these headers — a client that can reach
 the port directly can set any header it likes. A verifier and trusted headers
 can coexist: a bearer, when present, wins.
 
+### Revocation (`auth.introspection`)
+
+A signature and an unexpired `exp` prove a token was **issued** and has not
+lapsed. Neither can say it was revoked five minutes ago — an offboarded user, a
+leaked credential, a compromised client. JWKS rotation withdraws a *key*, which
+kills every token it signed; this is how you refuse **one**.
+
+```yaml
+auth:
+  jwks_url: https://idp.example.com/.well-known/jwks.json
+  introspection:
+    url: https://idp.example.com/oauth2/introspect
+    client_id: minmcp
+    client_secret: "${vault:minmcp/prod#introspection_secret}"
+    cache_ttl_s: 60        # default; see below
+    fail_open: false       # default; see below
+```
+
+Each authenticated request asks the authorization server whether the token is
+still live ([RFC 7662](https://www.rfc-editor.org/rfc/rfc7662)). `active: false`
+is a 401. `active` is the only field RFC 7662 requires, and a response without
+it is treated as **not live** — defaulting the other way would let a malformed
+or truncated response grant access.
+
+**`cache_ttl_s` is your revocation latency.** Introspecting on every request
+would put the IdP on the hot path of every call, so verdicts are cached — which
+means a revoked token keeps working for at most this long. Lower it if you need
+revocation to bite faster; raise it if IdP load matters more. A verdict is never
+cached past the token's own `exp`.
+
+**`fail_open` is off by default, and that is a deliberate availability
+trade-off.** If the endpoint cannot be reached, the request is refused. A
+revocation check that serves the request when the authority is unreachable is
+advisory rather than a control — an attacker who can reach the endpoint can
+usually also make it unreachable. Turn it on only where availability outranks
+revocation, and understand that during an outage a revoked token is honoured.
+
+The credential is a secret reference like any other, and introspection applies
+to bearer tokens only: a gateway using `trusted_headers` has already done its
+own checking, and min-mcp has no token to introspect.
+
 ### `allow_anonymous`
 
 With identity configured, a request carrying none is refused. Setting
