@@ -6,6 +6,18 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Security
+
+- **rustls 0.23.44 → 0.23.45**, for
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285)
+  (published 2026-09-14): TLS 1.3 handshake messages incorrectly accepted
+  across encryption level boundaries, 5.3 medium. rustls is min-mcp's TLS
+  everywhere — the `serve --http` listener including mutual TLS, and every
+  outbound connection to an upstream, an IdP, or Vault.
+  Caught by the `cargo audit` job, which is exactly the case it was added for:
+  an advisory published against a dependency that had not changed. Nothing in
+  this repo moved; the advisory came to us.
+
 ### Added
 
 - **Token revocation via RFC 7662 introspection** (`auth.introspection`). A
