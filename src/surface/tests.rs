@@ -23,6 +23,7 @@ fn test_surface(cfg: Config, tools: Vec<ToolDef>) -> Surface {
         shadow: super::shadow::Shadow::new(&[], false),
         workflow_by_id: std::collections::HashMap::new(),
         log: None,
+        log_chain: None,
         origin_sha: std::collections::HashMap::new(),
         patched_schemas: std::collections::HashMap::new(),
         tool_headers: std::collections::HashMap::new(),

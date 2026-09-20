@@ -79,6 +79,8 @@ pub struct Surface {
     workflow_by_id: HashMap<String, usize>,
     /// Append-only NDJSON audit events (search/details/call/…), if configured.
     log: Option<AuditSink>,
+    /// Tamper evidence for the audit stream (`log_hmac_key`). None = off.
+    log_chain: Option<Mutex<crate::audit_chain::Chain>>,
     /// tool_id -> fingerprint of the RAW upstream tool (description + input
     /// schema), captured BEFORE overlay patching. `authored_sha` pins this, so a
     /// rug-pull that changes only the top-level description is caught as drift —
@@ -270,6 +272,23 @@ impl Surface {
                     .with_context(|| format!("opening log_file {path}"))?,
             ))),
         };
+        // Tamper evidence, when a key is configured. Resumed from the file so
+        // a restart continues one chain instead of starting a second at seq 1
+        // mid-file, which verification would read as tampering.
+        let log_chain = match (&config.log_hmac_key, &log) {
+            (Some(key_ref), Some(_)) => {
+                let key = secrets.expand(key_ref).await.context("resolving log_hmac_key")?;
+                let mut chain = crate::audit_chain::Chain::new(&key);
+                if let Some(path) = config.log_file.as_deref().filter(|p| *p != "stderr") {
+                    chain.resume_from(path)?;
+                }
+                Some(Mutex::new(chain))
+            }
+            (Some(_), None) => {
+                anyhow::bail!("log_hmac_key is set but log_file is not — there is no audit stream to sign")
+            }
+            _ => None,
+        };
         // Read before `config` is moved into the surface.
         let config_max_concurrent = config.max_concurrent_calls;
         let mut surface = Surface {
@@ -283,6 +302,7 @@ impl Surface {
             index,
             workflow_by_id,
             log,
+            log_chain,
             origin_sha,
             patched_schemas: patched,
             tool_headers,
@@ -364,6 +384,9 @@ impl Surface {
             for (k, v) in extra {
                 obj.insert(k.clone(), v.clone());
             }
+        }
+        if let Some(chain) = &self.log_chain {
+            lock(chain).stamp(&mut line);
         }
         match sink {
             AuditSink::File(f) => {

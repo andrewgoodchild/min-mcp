@@ -1044,6 +1044,16 @@ pub struct Config {
     /// result size; never the arguments.
     #[serde(default)]
     pub log_file: Option<String>,
+    /// Make the audit stream tamper-EVIDENT: every line gets a `seq` and an
+    /// HMAC chaining it to the previous one, so altering or deleting a line is
+    /// detectable with `minmcp audit-verify`.
+    ///
+    /// A secret reference like any other credential (`${vault:…}`,
+    /// `${file:…}`). It belongs somewhere the proxy can read and an intruder on
+    /// the log host cannot — a plain hash chain is NOT evidence, because
+    /// whoever can rewrite the log can recompute it.
+    #[serde(default)]
+    pub log_hmac_key: Option<String>,
     /// Fleet-wide token-bucket limits on tool calls. See [`RateLimits`].
     #[serde(default)]
     pub rate_limits: RateLimits,
