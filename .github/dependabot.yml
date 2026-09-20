@@ -34,10 +34,6 @@ updates:
       # REMOVE WHEN: `rsa` gets a fix, or 9.x is flagged.
       - dependency-name: "jsonwebtoken"
         update-types: ["version-update:semver-major"]
-      # jaq 1.x -> 3.x is a port of `src/jq.rs`, not a version bump.
-      # REMOVE WHEN: that port is done.
-      - dependency-name: "jaq-*"
-        update-types: ["version-update:semver-major"]
 
   # The workflows pin actions by major tag; this keeps them current, including
   # the ones that gate releases.

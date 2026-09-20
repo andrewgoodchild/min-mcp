@@ -25,10 +25,15 @@ anyhow = "1"
 # `env`: lets `--jwt` fall back to MINMCP_JWT so a caller token never has to
 # sit in argv (visible to `ps` and shell history).
 clap = { version = "4", features = ["derive", "env"] }
-jaq-core = "1.5"
-jaq-interpret = "1.5"
-jaq-parse = "1.0"
-jaq-std = "1.5"
+# jaq 3.x: `jaq-interpret` and `jaq-parse` were folded into `jaq-core`, and the
+# JSON value type moved out to `jaq-json`. Four crates became three.
+jaq-core = "3"
+# Default features on purpose. Dropping `time` would save ~11 crates (jiff and
+# a timezone database), but jaq-std gates `extra_funs` on all five features at
+# once — so it would also take `regex` with it, and `test`/`capture`/`sub` are
+# the jq builtins an overlay reshaping a payload actually reaches for.
+jaq-std = "3"
+jaq-json = "2"
 # Held at 9 deliberately. 11 makes the crypto provider pluggable and PANICS
 # unless one is chosen, and neither choice is free: `rust_crypto` pulls `rsa`
 # (RUSTSEC-2023-0071, no fix), which publishing would push into every downstream
