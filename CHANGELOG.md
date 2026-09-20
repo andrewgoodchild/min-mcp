@@ -6,7 +6,11 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
-### Security
+Nothing yet.
+
+## [0.2.0] — 2026-09-20
+
+### Security — rustls advisory
 
 - **rustls 0.23.44 → 0.23.45**, for
   [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285)
@@ -18,7 +22,7 @@ All notable changes to min-mcp. Format loosely follows
   an advisory published against a dependency that had not changed. Nothing in
   this repo moved; the advisory came to us.
 
-### Added
+### Added — token revocation
 
 - **Token revocation via RFC 7662 introspection** (`auth.introspection`). A
   signature and an unexpired `exp` prove a token was *issued* and has not
@@ -37,7 +41,7 @@ All notable changes to min-mcp. Format loosely follows
   - Cache keys are a hash of the token, never the token, since the map outlives
     the request.
 
-### Changed
+### Changed — one HTTP stack, and the Origin check delegated
 
 - **reqwest 0.12 → 0.13, unifying the dependency tree.** vaultrs already pulled
   0.13, so both majors were being compiled into the binary. One HTTP stack now:
@@ -61,8 +65,6 @@ All notable changes to min-mcp. Format loosely follows
     which is usually what an operator already expects; it is a behaviour change
     either way. Smoke-tested against a real HTTPS endpoint, since every upstream
     fixture in the suite is deliberately offline and cannot exercise it.
-
-## [0.2.0] — 2026-09-09
 
 ### Fixed — secrets
 
