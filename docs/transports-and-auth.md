@@ -346,6 +346,46 @@ line carries `ts_ms`, `event`, and `caller` (the subject, or `anonymous`); a
 `latency_ms`, and `result_bytes`. Arguments are deliberately never logged: they
 carry customer data and injected secrets.
 
+### Tamper evidence (`log_hmac_key`)
+
+The audit log says who called what. On its own it is a text file: anyone who can
+write to it can rewrite a line, or delete one, and nothing shows.
+
+```yaml
+log_file: /var/log/minmcp/audit.ndjson
+log_hmac_key: "${vault:minmcp/prod#audit_hmac_key}"
+```
+
+Every line then carries a `seq` and a `mac` chaining it to the one before, and
+`minmcp audit-verify` re-derives them:
+
+```sh
+minmcp audit-verify --file /var/log/minmcp/audit.ndjson --config /etc/minmcp.yaml
+# audit.ndjson: 40231 line(s), chain intact
+```
+
+It exits non-zero on any break, so it can gate a job, and names the first line
+that fails. **Altering** a line changes its MAC, and because the next line's MAC
+covers it, every later line fails too. **Deleting** one leaves a gap in `seq` and
+breaks the following line, so removing the record of a call is not quiet either.
+A restart resumes the chain rather than starting a second one mid-file.
+
+**Why a key and not just a hash chain.** A plain chain is recomputable by
+whoever rewrote the log — it detects corruption, not tampering. Evidence needs
+something the attacker does not have, so the key belongs somewhere the proxy can
+read and an intruder on the log host cannot: `${vault:…}` or a mounted secret,
+never the config file itself.
+
+**What it does not cover.** Someone with the key can forge freely. Someone who
+truncates the tail and stops leaves a prefix that is internally consistent —
+detecting that needs an external record of where the log had reached, which is
+what shipping lines to a SIEM (`log_file: stderr`) gives you. Tamper evidence
+tells you the record was disturbed; it does not keep a copy.
+
+min-mcp refuses to start if `log_hmac_key` is set without `log_file` (nothing to
+sign), or if it is asked to append signed lines to a log that already has
+unsigned ones — chaining onto those would imply they were protected too.
+
 ## Secrets
 
 Anywhere a config value is a credential — upstream `headers`, `oauth.client_secret`,

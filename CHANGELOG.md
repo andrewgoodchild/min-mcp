@@ -6,7 +6,28 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Tamper-evident audit** (`log_hmac_key`). The audit log says who called what;
+  on its own it is a text file, and anyone who can write to it can rewrite or
+  delete a line with nothing to show for it. With a key set, every line carries
+  a `seq` and an HMAC chaining it to the previous one.
+  - `minmcp audit-verify --file … [--key … | --config …]` re-derives the chain,
+    names the first line that fails, and **exits non-zero** so it can gate a job.
+  - **Altering** a line breaks its MAC and every later one, since each covers
+    its predecessor. **Deleting** one leaves a gap in `seq` and breaks the
+    following line, so removing a record is not quiet either.
+  - A restart **resumes** the chain instead of starting a second at seq 1
+    mid-file, which verification would otherwise read as tampering.
+  - Refuses to start if the key is set without `log_file` (nothing to sign), or
+    if asked to append signed lines to a log that already has unsigned ones —
+    chaining onto those would imply they had been protected.
+  - **Why a key rather than a plain hash chain:** a bare chain is recomputable
+    by whoever rewrote the log, so it detects corruption, not tampering. The key
+    belongs in `${vault:…}` or a mounted secret, not the config.
+  - Does not cover an attacker holding the key, or truncation of the tail — a
+    remaining prefix is internally consistent. Detecting that needs an external
+    record of the log's extent, which shipping to a SIEM provides.
 
 ## [0.2.0] — 2026-09-20
 
