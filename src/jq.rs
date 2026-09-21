@@ -13,33 +13,46 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use jaq_interpret::{Ctx, Filter, FilterT, ParseCtx, RcIter, Val};
+use jaq_core::load::{Arena, File, Loader};
+use jaq_core::{data, Compiler, Ctx, Vars};
+use jaq_json::Val;
 use serde_json::Value;
+
+/// A compiled jaq program. `Filter` owns its lookup table and borrows nothing
+/// from the `Arena` it was loaded through, so it can outlive compilation and
+/// be cached — which is what makes the per-call cost just the run.
+type Program = jaq_core::Filter<data::JustLut<Val>>;
 
 thread_local! {
     /// program text -> compiled filter, or None for a program that failed to
     /// parse/compile (warned once, then remembered so a broken overlay doesn't
     /// re-parse and re-warn on every call). Thread-local because jaq's values
     /// are `Rc`-based; the surface runs on one runtime thread behind its mutex.
-    static COMPILED: RefCell<HashMap<String, Option<Filter>>> = RefCell::new(HashMap::new());
+    static COMPILED: RefCell<HashMap<String, Option<Program>>> = RefCell::new(HashMap::new());
 }
 
-fn compile(program: &str) -> Option<Filter> {
-    let mut ctx = ParseCtx::new(Vec::new());
-    ctx.insert_natives(jaq_core::core());
-    ctx.insert_defs(jaq_std::std());
+fn compile(program: &str) -> Option<Program> {
+    // The builtin set is assembled from three crates in jaq 3.x: the core
+    // language, the standard library, and the JSON-specific filters that used
+    // to live inside the interpreter.
+    let defs = jaq_core::defs().chain(jaq_std::defs()).chain(jaq_json::defs());
+    let funs = jaq_core::funs().chain(jaq_std::funs()).chain(jaq_json::funs());
 
-    let (parsed, errs) = jaq_parse::parse(program, jaq_parse::main());
-    if !errs.is_empty() || parsed.is_none() {
-        crate::log_warn!("overlay jq program failed to parse: {program:?}");
-        return None;
+    let arena = Arena::default();
+    let modules = match Loader::new(defs).load(&arena, File { code: program, path: () }) {
+        Ok(m) => m,
+        Err(_) => {
+            crate::log_warn!("overlay jq program failed to parse: {program:?}");
+            return None;
+        }
+    };
+    match Compiler::default().with_funs(funs).compile(modules) {
+        Ok(f) => Some(f),
+        Err(_) => {
+            crate::log_warn!("overlay jq program failed to compile: {program:?}");
+            None
+        }
     }
-    let filter = ctx.compile(parsed?);
-    if !ctx.errs.is_empty() {
-        crate::log_warn!("overlay jq program failed to compile: {program:?}");
-        return None;
-    }
-    Some(filter)
 }
 
 /// Run `program` over `input`, returning the first output value (or None on any
@@ -48,11 +61,20 @@ pub fn run(program: &str, input: &Value) -> Option<Value> {
     COMPILED.with(|cache| {
         let mut cache = cache.borrow_mut();
         let filter = cache.entry(program.to_string()).or_insert_with(|| compile(program)).as_ref()?;
-        let inputs = RcIter::new(core::iter::empty());
-        let mut out = filter.run((Ctx::new(Vec::new(), &inputs), Val::from(input.clone())));
+        // serde_json <-> jaq through text, deliberately: it is stable across
+        // jaq versions, where a direct value conversion is the part that moved
+        // house in 2.x. (jq numbers are f64 either way — see the module note.)
+        let text = serde_json::to_string(input).ok()?;
+        let input: Val = jaq_json::read::parse_single(text.as_bytes()).ok()?;
+        let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
+        // Deliberately NOT jaq's `unwrap_valr`, which the crate's own example
+        // uses: it calls `std::process::exit` on a jq `halt`. That would let a
+        // `halt` in an overlay's jq program terminate the proxy — a config typo
+        // taking the server down. Matching the raw result keeps every failure,
+        // exception and halt alike, on the same best-effort path as any other:
+        // leave the payload unchanged.
+        let mut out = filter.id.run((ctx, input));
         match out.next() {
-            // Val's Display is JSON, so round-trip through a string (version-stable
-            // vs. relying on a direct Val -> serde_json::Value conversion).
             Some(Ok(v)) => serde_json::from_str(&v.to_string()).ok(),
             _ => None,
         }
@@ -83,6 +105,20 @@ mod tests {
         assert!(run("this is not jq (((", &input).is_none());
         // and stays None on the cached retry (a broken program is remembered)
         assert!(run("this is not jq (((", &input).is_none());
+    }
+
+    #[test]
+    fn a_halt_leaves_the_payload_alone_instead_of_exiting() {
+        // jaq's own example pipes results through `unwrap_valr`, which calls
+        // `std::process::exit` on a jq `halt`. Taking that verbatim would let
+        // `halt` in an overlay's jq program kill the proxy. If this ever
+        // regresses, the test process exits and the suite dies outright —
+        // which is exactly the failure being guarded.
+        let input = json!({"a": 1});
+        assert!(run("halt", &input).is_none());
+        assert!(run("halt_error", &input).is_none());
+        // and the module keeps working afterwards
+        assert_eq!(run(".a", &input).unwrap(), json!(1));
     }
 
     #[test]
