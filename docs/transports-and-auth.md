@@ -512,15 +512,19 @@ so you never mint one by hand. See
 - Tool definitions are checked for poisoning at startup (`poisoning_policy`):
   invisible characters, instructions aimed at the model, and references to
   local credential files. Descriptions only — not arguments, not responses.
+- A validly-signed, unexpired token can still be **refused once revoked**
+  (`auth.introspection`), and the audit stream can be made **tamper-evident**
+  (`log_hmac_key`, checked with `minmcp audit-verify`).
 - Not built, each for a stated reason:
-  - **Revocation of an unexpired token.** JWKS rotation withdraws a *key*, not
-    a token; short lifetimes are the mitigation for a stolen one.
-  - **Tamper-evident audit.** The NDJSON stream is append-only text with no
-    signing or hash chaining.
   - **Binding an HTTP session to the identity that opened it.** Low risk as
     built: scopes always come from the current request's token, never from
     session state, so a session id carries no privilege.
   - **Per-tenant isolation in one process.** Run one process per tenant behind
     the gateway; one `Surface` backs every session by design.
-  - **Argument-level taint enforcement and response scanning.** A guardrail
-    product's job, not a proxy's.
+  - **Argument-level taint enforcement, and scanning tool RESPONSES.** A
+    guardrail product's job, not a proxy's. Poisoning checks read tool
+    *definitions*; overlay `response.remove` is the tool for stripping fields
+    out of a payload.
+  - **Protection against an attacker who holds the audit HMAC key**, or who
+    truncates the log's tail and stops — the remaining prefix verifies. Both
+    want an external record, which is what shipping to a SIEM provides.
