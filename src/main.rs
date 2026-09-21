@@ -4,6 +4,7 @@
 //! `minmcp inspect` print what would be minified (counts + token estimates)
 
 mod auth;
+mod audit_chain;
 mod backend;
 mod caller;
 mod config;
@@ -84,6 +85,23 @@ enum Cmd {
     Serve(Common),
     /// Print surface statistics without serving
     Inspect(Common),
+    /// Check the tamper evidence on an audit log written with `log_hmac_key`.
+    ///
+    /// Re-derives every line's MAC and reports the first that does not match.
+    /// Exits non-zero on any failure, so it can gate a job.
+    AuditVerify {
+        /// The NDJSON audit log to check.
+        #[arg(long)]
+        file: String,
+        /// The same key the writer used. Supports `${env:…}` / `${file:…}`;
+        /// `${vault:…}` needs a config, so pass `--config` too.
+        #[arg(long, env = "MINMCP_LOG_HMAC_KEY")]
+        key: Option<String>,
+        /// Config to take `log_hmac_key` (and any secret store) from, when
+        /// `--key` is not given.
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Print the source map: every tool mapped back to its origin
     /// (METHOD /path or upstream tool), overlays applied, and a schema
     /// fingerprint. The minifier's source map / binding registry. With
@@ -239,6 +257,40 @@ async fn main() -> Result<()> {
     logging::init(); // stderr tracing subscriber, filtered by MINMCP_LOG
     let cli = Cli::parse();
     match cli.command {
+        Cmd::AuditVerify { file, key, config } => {
+            // The key may be inline, an `${env:…}`/`${file:…}` reference, or
+            // come from the config that wrote the log — a `${vault:…}` one
+            // needs the config's secret store to resolve at all.
+            let key = match (key, config) {
+                (Some(k), None) => Secrets::from_config(&Default::default()).expand(&k).await?,
+                (k, Some(cfg_path)) => {
+                    let cfg = Config::load(&cfg_path)?;
+                    let secrets = Secrets::from_config(&cfg.secrets);
+                    let reference = k
+                        .or(cfg.log_hmac_key)
+                        .context("no key: pass --key, or set log_hmac_key in the config")?;
+                    secrets.expand(&reference).await?
+                }
+                (None, None) => {
+                    anyhow::bail!("no key: pass --key (or MINMCP_LOG_HMAC_KEY), or --config to read log_hmac_key")
+                }
+            };
+            let verdict = audit_chain::verify(&file, &key)?;
+            if verdict.ok() {
+                println!("{}: {} line(s), chain intact", file, verdict.lines);
+                return Ok(());
+            }
+            for (line, why) in &verdict.failures {
+                eprintln!("{file}:{line}: {why}");
+            }
+            // Non-zero so this can gate a job. The message says what a failure
+            // means, because "MAC mismatch" alone does not tell an operator
+            // whether to worry.
+            anyhow::bail!(
+                "audit chain BROKEN at line {} of {file}. Every line from there on is unverifiable. Either the log was altered or truncated, or it was written with a different key.",
+                verdict.failures[0].0
+            )
+        }
         Cmd::Inspect(common) => {
             let b = build(&common).await?;
             println!("{}", serde_json::to_string_pretty(&b.surface.stats(&b.caller))?);
