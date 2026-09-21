@@ -6,6 +6,13 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+
+- **rmcp 3.3 → 3.4**: `ServerInfo` is deprecated in favour of `ServerConfig`
+  (both aliases for `InitializeResult`), so `get_info` is renamed to match.
+  A deprecation rather than a break, but CI treats warnings as errors, so the
+  dependency bump could not land as a lockfile-only change.
+
 ### Added
 
 - **Tamper-evident audit** (`log_hmac_key`). The audit log says who called what;

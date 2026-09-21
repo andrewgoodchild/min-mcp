@@ -24,7 +24,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
     GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult, ListResourcesResult,
     ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
+    ReadResourceResult, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::io::stdio;
@@ -97,8 +97,8 @@ impl MinMcpServer {
 }
 
 impl ServerHandler for MinMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities =
             ServerCapabilities::builder().enable_tools().enable_resources().enable_prompts().build();
         info.server_info = Implementation::new("min-mcp", env!("CARGO_PKG_VERSION"));
