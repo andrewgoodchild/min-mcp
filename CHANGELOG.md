@@ -36,6 +36,27 @@ All notable changes to min-mcp. Format loosely follows
     remaining prefix is internally consistent. Detecting that needs an external
     record of the log's extent, which shipping to a SIEM provides.
 
+### Changed
+
+- **jaq 1.x → 3.x** for the overlay `response.jq` escape hatch. 2.x folded
+  `jaq-interpret` and `jaq-parse` into `jaq-core` and moved the JSON value type
+  out to `jaq-json`, so four crates became three and the whole compile/run path
+  was rewritten. Behaviour is unchanged — same programs, same best-effort
+  contract (a program that fails to parse, compile or run leaves the payload
+  alone), same per-program compile cache.
+  - **jaq's own example would let an overlay kill the proxy.** It pipes results
+    through `unwrap_valr`, which calls `std::process::exit` on a jq `halt`. A
+    `halt` in an overlay program — a config typo, or a copied snippet — would
+    have taken the server down. The raw result is matched instead, so a halt
+    joins every other failure on the best-effort path. There is a regression
+    test, which kills the suite outright if this ever comes back.
+  - Net +7 crates. `jaq-std` 3.x gates its extra builtins on all five of its
+    features at once, so declining `time` (and ~11 crates including a timezone
+    database) would also decline `regex` — and `test`/`capture`/`sub` are what
+    an overlay reshaping a payload actually uses. Kept the defaults.
+  - The Dependabot `ignore` entry for `jaq-*` is removed: it existed only until
+    this port was done.
+
 ## [0.2.0] — 2026-09-20
 
 ### Security — rustls advisory
