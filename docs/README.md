@@ -26,7 +26,9 @@ New here? Read [Getting started](getting-started.md), then [Concepts](concepts.m
   stream, secret references (env / file / Vault), upstream health, remote MCP
   upstreams, outbound OAuth, security notes.
 - **[CLI reference](cli.md)** — `serve`, `inspect`, `map`, `verify`, `lint`,
-  `search`, `help`, `call`, and their flags.
+  `audit-verify`, `search`, `help`, `call`, and their flags.
+- **[Security](security.md)** — what protects what, what each control does *not*
+  cover, and the deployment shapes each one assumes.
 
 ## Evidence
 - **[Measurements](measurements.md)** — every published number, how to reproduce

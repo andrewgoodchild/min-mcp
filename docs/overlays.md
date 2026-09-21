@@ -311,7 +311,13 @@ response:
   the agent flying blind) unless you set `when: error` explicitly. `remove`/
   `rename`/`set` still run on errors — so secrets are stripped from error bodies.
 - `remove` is the safe default for stripping secrets / PII / noise.
-- `jq` runs last, for reshaping the declarative ops can't express.
+- `jq` runs last, for reshaping the declarative ops can't express. It is
+  **best-effort**: a program that fails to parse, compile or run leaves the
+  payload unchanged rather than failing the call — including a `halt`, which in
+  jaq's own documented usage would exit the process. Prefer the declarative ops
+  where they suffice; jq numbers are f64 (as in jq itself), so a 128-bit id
+  passing *through* a jq program is rewritten even though every other path
+  preserves literals.
 
 > Callers can *also* narrow a response per-call with GraphQL-style field
 > projection (`--fields` on the CLI, a `fields` argument on `call_tool`). Overlay

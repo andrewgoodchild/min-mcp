@@ -121,6 +121,24 @@ respawned, not fatal. → [Transports & auth](docs/transports-and-auth.md),
   everyone; per-caller `scopes:` hide what a caller's identity doesn't grant. A
   `passthrough` mode federates tools directly when the surface is already small.
 
+## Security
+
+Everything is off by default — min-mcp on loopback with no `auth:` is a
+development tool. What you turn on when it becomes infrastructure:
+
+| | |
+|---|---|
+| **Identity** | Per-request caller over HTTP: a validated bearer, or identity headers from a gateway. Scopes are default-deny once any rule exists |
+| **Revocation** | RFC 7662 introspection, so a validly-signed token can still be refused once revoked |
+| **Wire** | TLS on the listener, and mutual TLS — which is what makes trusting a gateway's identity headers sound rather than assumed |
+| **Bounds** | Request body, in-flight requests, concurrent upstream calls, connection deadlines, per-caller rate limits |
+| **Tool integrity** | Tool definitions checked for poisoning at startup; `strict` refuses to serve a flagged tool |
+| **Audit** | Every call recorded with its caller, and optionally HMAC-chained so tampering is detectable (`minmcp audit-verify`) |
+| **Supply chain** | `cargo audit` on every push and weekly — it has already caught a TLS advisory filed against a dependency nothing had touched |
+
+→ **[Security](docs/security.md)** for what each control does *not* cover, and
+[Transports & auth](docs/transports-and-auth.md) for how to configure them.
+
 ## Quickstart
 
 You need [Rust](https://rustup.rs) (stable) and a clone; there's nothing else to

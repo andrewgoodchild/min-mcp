@@ -52,6 +52,25 @@ which overlays must be re-verified — **exit code 1** if anything breaking chan
 Drop it in CI to catch a vendor's breaking change before your agents do. See
 [Overlays → binding](overlays.md#binding-safely-against-upstream-drift).
 
+### `audit-verify`
+Check the tamper evidence on an audit log written with `log_hmac_key`. Re-derives
+every line's HMAC, names the first line that fails, and **exits non-zero** on any
+break — so it can gate a job rather than only inform a human.
+
+```sh
+minmcp audit-verify --file /var/log/minmcp/audit.ndjson --config /etc/minmcp.yaml
+# audit.ndjson: 40231 line(s), chain intact
+
+minmcp audit-verify --file audit.ndjson --key '${env:AUDIT_KEY}'
+# audit.ndjson:812: MAC does not match — this line was altered, or the one before it was
+```
+
+The key comes from `--key` (inline, or an `${env:…}`/`${file:…}` reference),
+`MINMCP_LOG_HMAC_KEY`, or `--config`, which also supplies the secret store a
+`${vault:…}` reference needs. See
+[Tamper evidence](transports-and-auth.md#tamper-evidence-log_hmac_key) for what
+the chain does and does not prove.
+
 ### `lint`
 Static quality lint of every registered tool — best-practice smells (missing/thin
 descriptions, undocumented params, all-optional writes, tools sharing a summary),
