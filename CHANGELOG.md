@@ -6,6 +6,19 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-10-03
+
+### Added — crates.io
+
+- **Published to crates.io**: `cargo install min-mcp` installs a tagged
+  release instead of `cargo install --git`'s tip of `main`. The package is
+  trimmed to the source plus README, licence, notices and changelog — no tests,
+  fixtures, examples, docs or CI files.
+- The release workflow publishes the crate on a version tag, after the full
+  per-platform gate passes, via crates.io trusted publishing (GitHub OIDC), so
+  no registry token is stored in the repo. It refuses a tag that does not match
+  `Cargo.toml`'s version.
+
 ### Changed
 
 - **rmcp 3.3 → 3.4**: `ServerInfo` is deprecated in favour of `ServerConfig`

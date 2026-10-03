@@ -107,3 +107,31 @@ jobs:
           generate_release_notes: true
           body_path: RELEASE_BODY.md
           files: dist/*
+
+  # Publish the crate once every platform's gate has passed. crates.io trusted
+  # publishing: the job trades GitHub's OIDC token for a short-lived registry
+  # token, so no CARGO_REGISTRY_TOKEN secret lives in the repo. One-time setup
+  # on crates.io (min-mcp → Settings → Trusted Publishing): this repo, workflow
+  # `release.yml`. That needs the crate to exist, so the first publish is manual.
+  #
+  # Unlike the GitHub release this is not a draft — a version on crates.io can be
+  # yanked but never replaced — hence the version check before anything uploads.
+  crates-io:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # the OIDC token trusted publishing exchanges
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches Cargo.toml version
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "v$VERSION" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION" >&2; exit 1; }
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
