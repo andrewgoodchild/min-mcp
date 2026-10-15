@@ -46,6 +46,7 @@ mod workflow;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use cache::canonical_args;
 use cache::READ_CACHE_MAX_ENTRIES;
 use generators::{fnv1a, resolve_generators, tool_fingerprint};
 use ids::sanitize_name;
@@ -398,8 +399,19 @@ impl Surface {
         }
     }
 
+    /// Visibility as enforced. Under `scopes.report_only` everything is
+    /// visible and [`Self::note_would_deny`] records what would not have been.
     fn allowed(&self, caller: &Caller, tool_id: &str) -> bool {
-        self.config.allowed(tool_id, &caller.scopes)
+        self.config.scopes.report_only || self.config.allowed(tool_id, &caller.scopes)
+    }
+
+    /// Under `scopes.report_only`, log a call the rules would have refused.
+    /// Calls only: listing and search are not logged, since what a caller
+    /// would lose is the call, and a search per keystroke would bury it.
+    fn note_would_deny(&self, caller: &Caller, tool_id: &str) {
+        if self.config.scopes.report_only && !self.config.allowed(tool_id, &caller.scopes) {
+            self.log_event(caller, "would_deny", json!({"tool_id": tool_id, "scopes": caller.scopes}));
+        }
     }
 
     /// Passthrough mode declares EVERY tool by (sanitized) name; visibility is
@@ -807,6 +819,7 @@ impl Surface {
     /// Route a call to a composite workflow if the id names one, else a tool.
     async fn route_call(&self, caller: &Caller, id: &str, args: Value, fields: &[String]) -> Result<Value> {
         if let Some(&i) = self.visible_workflow(caller, id) {
+            self.note_would_deny(caller, id);
             let wf = &self.config.workflows[i];
             return self.execute_workflow(caller, wf, args).await;
         }

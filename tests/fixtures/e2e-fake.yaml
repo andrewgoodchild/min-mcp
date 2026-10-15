@@ -50,3 +50,18 @@ workflows:
       product_id: "$steps.product.id"
       price_id: "$steps.price.id"
       threaded_product: "$steps.price.product"
+
+  # step 2 is wired to a literal instead of step 1's id, so the upstream refuses
+  # it AFTER step 1's write committed — the partial-failure report under test
+  - id: fake.product_then_bad_price
+    description: "Create a product, then a price wired to the wrong product."
+    steps:
+      - id: product
+        tool: fake.create_product
+        input: { name: "Widget" }
+        output: { id: "id" }
+      - id: price
+        tool: fake.create_price
+        input: { product: "not_threaded", amount: 1 }
+      - id: lookup
+        tool: fake.whoami

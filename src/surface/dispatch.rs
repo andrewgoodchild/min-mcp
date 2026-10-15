@@ -19,6 +19,7 @@ impl Surface {
             ));
         };
         let (idx, original_name, read_only) = (t.upstream_idx, t.name.clone(), t.read_only);
+        self.note_would_deny(caller, tool_id);
         // One overlay lookup for the whole call path: limits, the guards below,
         // the response transform, and the cache all read from this.
         let overlay = self.config.overlay_for(tool_id);
@@ -34,6 +35,14 @@ impl Surface {
                 true,
             ));
         }
+        // The arguments as the CALLER sent them — before defaults and injected
+        // secrets — so an operator can reproduce the mac from arguments they
+        // know. Only when the audit stream is keyed; see `audit_chain::args_mac`.
+        // Canonicalised before taking the chain lock, which every log line needs.
+        let args_mac = self.log_chain.as_ref().map(|c| {
+            let canonical = canonical_args(&arguments);
+            lock(c).args_mac(&canonical)
+        });
         // Everything overlay-derived, from ONE lookup: preflight override (global
         // default is ON — a local structured error beats a raw upstream dump),
         // per-tool timeout + breaker, request defaults, and pagination config.
@@ -292,21 +301,22 @@ impl Surface {
         }
         // Audit: who called what, where it routed, how it went, how long it took,
         // how much came back. Arguments are deliberately NOT logged — they carry
-        // customer data and injected secrets. Guarded, because measuring the
+        // customer data and injected secrets; a keyed `args_mac` names the call
+        // without them. Guarded, because measuring the
         // result and resolving the origin are real work on a large payload and
         // there is nowhere to write them when no audit sink is configured.
         if self.log.is_some() {
             let b = &self.upstreams[idx];
-            self.log_event(
-                caller,
-                "call",
-                json!({
-                    "tool_id": tool_id, "upstream": b.name(), "origin": b.origin(&original_name),
-                    "is_error": is_error, "cached": from_cache,
-                    "latency_ms": started.elapsed().as_millis() as u64,
-                    "result_bytes": json_len(&result),
-                }),
-            );
+            let mut fields = json!({
+                "tool_id": tool_id, "upstream": b.name(), "origin": b.origin(&original_name),
+                "is_error": is_error, "cached": from_cache,
+                "latency_ms": started.elapsed().as_millis() as u64,
+                "result_bytes": json_len(&result),
+            });
+            if let (Some(mac), Some(obj)) = (args_mac, fields.as_object_mut()) {
+                obj.insert("args_mac".into(), json!(mac));
+            }
+            self.log_event(caller, "call", fields);
         }
         Ok(result)
     }
@@ -331,17 +341,20 @@ impl Surface {
         // different questions for a caller nobody named. See `Caller::rate_key`.
         let who = caller.rate_key();
         let rl = &self.config.rate_limits;
-        // (bucket, limit, what to tell the agent) — one list, so adding a tier
-        // is one entry rather than another copy of the take/refund dance.
+        // (bucket, limit, what to tell the agent, enforced) — one list, so
+        // adding a tier is one entry rather than another copy of the
+        // take/refund dance.
+        let enforce = !rl.report_only;
         let tiers = [
             rl.per_caller.map(|l| {
-                (format!("caller:{who}"), l, format!("caller {who} exceeded {} calls per {}s", l.calls, l.per_s))
+                (format!("caller:{who}"), l, format!("caller {who} exceeded {} calls per {}s", l.calls, l.per_s), enforce)
             }),
             rl.per_tool.map(|l| {
                 (
                     format!("tool:{who}:{tool_id}"),
                     l,
                     format!("caller {who} exceeded {} calls per {}s on {tool_id}", l.calls, l.per_s),
+                    enforce,
                 )
             }),
             overlay.and_then(|o| o.rate_limit).map(|l| {
@@ -349,15 +362,27 @@ impl Surface {
                     format!("overlay:{tool_id}"),
                     l,
                     format!("{tool_id} is limited to {} calls per {}s across all callers", l.calls, l.per_s),
+                    true,
                 )
             }),
         ];
         let mut charged: Vec<(&String, crate::config::Limit)> = Vec::new();
-        for (key, limit, message) in tiers.iter().flatten() {
+        for (key, limit, message, enforced) in tiers.iter().flatten() {
             let Err(retry_in_s) = self.limits.take(key, *limit, now) else {
                 charged.push((key, *limit));
                 continue;
             };
+            // Report-only: the bucket behaves exactly as it would enforced (a
+            // refused take spends nothing), so the would-limit lines are the
+            // ones enforcement would produce.
+            if !enforced {
+                self.log_event(
+                    caller,
+                    "would_rate_limit",
+                    json!({"tool_id": tool_id, "limit": message, "retry_in_s": retry_in_s}),
+                );
+                continue;
+            }
             for (k, l) in charged {
                 self.limits.refund(k, l, now);
             }

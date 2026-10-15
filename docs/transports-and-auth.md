@@ -122,6 +122,30 @@ scopes:
 Tool patterns are exact (`up.tool`) or prefix (`up.Post*`). Composite tools
 (`workflows:`) are matched by their `id` like any tool.
 
+**Rolling rules out: `report_only`.** Turning on default-deny for a fleet that
+has been calling everything is the risky step. Run the rules in report-only
+first:
+
+```yaml
+scopes:
+  report_only: true
+  rules: [ ... ]
+```
+
+Nothing is hidden or refused; a call the rules *would* refuse is logged as a
+`would_deny` audit event naming the caller, the tool and the scopes it held.
+When the `would_deny` lines are only the calls you meant to stop, delete
+`report_only`. Only calls are logged, not searches or listings: what a caller
+loses is the call. It needs `log_file` — without one, report-only just turns the
+rules off, and startup says so.
+
+**Check the result: `minmcp access`.** Prints, per scope the rules name, the
+tools and composites it reaches; what a request with no identity gets; the
+limits; whether the audit log is on and tamper-evident; and a warning for each
+way the deployment is more open than it may look (no rules, `allow_anonymous`,
+report-only, an unsigned log). `--strict` exits non-zero on any warning, for CI.
+See [CLI → access](cli.md#access).
+
 ### 3a. Bearer tokens (agents call min-mcp directly)
 
 Each HTTP request carries `Authorization: Bearer <jwt>`; min-mcp validates it
@@ -314,6 +338,12 @@ overlays:
 
 `calls` is also the burst; the bucket refills at `calls / per_s` per second.
 
+`rate_limits.report_only: true` counts calls against `per_caller` / `per_tool`
+exactly as enforcement would, but never refuses: a call that would have been
+limited goes through and is logged as `would_rate_limit`. It is for sizing a
+limit on real traffic before it can lock anyone out. An overlay's `rate_limit`
+is a vendor quota rather than a policy you are trialling, so it still enforces.
+
 Buckets key on the most specific thing actually known about the caller:
 
 1. the **subject**, when the request names one — a bearer's `sub` (or
@@ -338,7 +368,8 @@ and never grants a scope: it names a socket, not a person.
 ## Audit log
 
 `log_file` writes one NDJSON line per event — `search`, `details`, `call`,
-`paginate`, `workflow`, `breaker`, `rate_limited`, `shadow` — to a file, or to
+`paginate`, `workflow`, `breaker`, `rate_limited`, `shadow`, and under
+report-only `would_deny` / `would_rate_limit` — to a file, or to
 `stderr` for containers (where the platform's log shipper forwards it to the
 SIEM; stdout is never an option because on stdio it *is* the protocol). Every
 line carries `ts_ms`, `event`, and `caller` (the subject, or `anonymous`); a
@@ -381,6 +412,25 @@ truncates the tail and stops leaves a prefix that is internally consistent —
 detecting that needs an external record of where the log had reached, which is
 what shipping lines to a SIEM (`log_file: stderr`) gives you. Tamper evidence
 tells you the record was disturbed; it does not keep a copy.
+
+### Which call was it? (`args_mac`)
+
+An audit line says a caller called `crm.delete_customer` at 14:02; it does not
+say *which* customer, because arguments are never logged. With `log_hmac_key`
+set, every `call` line also carries `args_mac`: a keyed fingerprint of the
+arguments as the caller sent them (before overlay defaults and injected
+values), over a canonical form so key order does not matter. It names the call
+without holding what was in it. To check a suspicion, compute it:
+
+```sh
+minmcp audit-args --config /etc/minmcp.yaml --args '{"customerId":"42"}'
+# 9f2c…  — grep the log for it
+```
+
+It is keyed (under a key derived from `log_hmac_key`, separate from the line
+MACs) because arguments are low-entropy: a plain hash of `{"customerId":"42"}` is
+reversed by trying every id. Without the key the fingerprint reveals nothing;
+with it, it confirms a guess and no more. Unset `log_hmac_key`, no `args_mac`.
 
 min-mcp refuses to start if `log_hmac_key` is set without `log_file` (nothing to
 sign), or if it is asked to append signed lines to a log that already has

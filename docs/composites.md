@@ -74,11 +74,35 @@ easy for the agent to call correctly.
 
 ## Safety: a composite is not a transaction
 
-On a step failure the composite **aborts fail-fast** and returns
-`workflow "<id>" failed at step "<step>": <error>` (`isError: true`); remaining
-steps are skipped. But steps that already ran are **not rolled back** — there is
-no compensation/saga logic and no idempotency keys. The hazard is entirely about
-*writes that already committed*, and it is strictly a multi-write problem:
+On a step failure the composite **aborts fail-fast**; remaining steps are
+skipped. But steps that already ran are **not rolled back** — there is no
+compensation/saga logic and no idempotency keys. So the failure says what
+already happened, because the natural recovery — re-run the composite — repeats
+every write that committed:
+
+```text
+WORKFLOW_FAILED: {
+  "workflow": "stripe.checkout",
+  "failed_step": {"step": "price", "tool": "stripe.PostPrices", "outcome": "failed", "error": "…"},
+  "completed": [{"step": "product", "tool": "stripe.PostProducts", "effect": "write", "outputs": {"id": "prod_123"}}],
+  "not_run": [{"step": "session", "tool": "stripe.PostCheckoutSessions"}],
+  "fix": "Step(s) [\"product\"] already took effect upstream and are NOT rolled back. Do not re-run this workflow — …"
+}
+```
+
+- `completed` lists each step that succeeded, with its extracted `outputs`, so
+  the agent can finish the chain by hand without recreating what exists.
+  `effect` is `read` only when the upstream marks the tool read-only (a spec
+  `GET`, or `readOnlyHint`); anything else is assumed to write.
+- `failed_step.outcome` is `not_run` (refused locally — rate limit, preflight,
+  breaker — so nothing was sent), `failed` (the upstream answered with an
+  error), or `unknown` (sent, no answer — a timeout or transport failure — so it
+  may have taken effect).
+- `fix` says a re-run is safe only when no earlier step wrote and the failed
+  step is not an unanswered write.
+
+The hazard is entirely about *writes that already committed*, and it is
+strictly a multi-write problem:
 
 | class | definition | safe? |
 |---|---|---|

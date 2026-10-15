@@ -269,4 +269,139 @@ impl Surface {
             "est_raw_exact": exact,
         })
     }
+
+    /// Who can reach what, from the config alone: the rollout check for
+    /// `serve --http`. One row per scope the rules name, one for a caller with
+    /// no scopes, and one for the process identity (`--scopes` / `--jwt`) that
+    /// stdio and anonymous HTTP requests run as — each with the tools and
+    /// composites the rules grant it. Then how a request is identified, which
+    /// limits apply, whether the audit trail exists and is tamper-evident, and
+    /// a warning for each way the deployment is more open than it may look.
+    ///
+    /// Rows are the rules AS WRITTEN, so under `report_only` they show what
+    /// enforcement would do, and a warning says it is not on yet.
+    pub fn access_report(&self, process: &Caller, sample: usize) -> Value {
+        let cfg = &self.config;
+        let rules = &cfg.scopes.rules;
+        let grants = |scopes: &[String]| -> (Vec<&str>, Vec<&str>) {
+            let tools = self.tools.iter().map(ToolDef::id).filter(|id| cfg.allowed(id, scopes)).collect();
+            let wfs = cfg.workflows.iter().map(|w| w.id.as_str()).filter(|id| cfg.allowed(id, scopes)).collect();
+            (tools, wfs)
+        };
+        let row = |who: String, scopes: &[String]| {
+            let (tools, wfs) = grants(scopes);
+            json!({
+                "caller": who, "scopes": scopes,
+                "tools": tools.len(), "composites": wfs.len(),
+                "sample": tools.iter().take(sample).collect::<Vec<_>>(),
+            })
+        };
+        let mut named: Vec<&str> = rules.iter().map(|r| r.scope.as_str()).collect();
+        named.sort_unstable();
+        named.dedup();
+        let mut callers = vec![row("no scopes".into(), &[])];
+        callers.extend(named.iter().map(|s| row(format!("scope {s}"), &[s.to_string()])));
+        callers.push(row(format!("process caller ({})", process.label()), &process.scopes));
+
+        // Granted to nobody: unreachable once rules enforce. Usually a pattern
+        // typo, not a decision.
+        let orphaned: Vec<&str> = if rules.is_empty() {
+            Vec::new()
+        } else {
+            self.tools
+                .iter()
+                .map(ToolDef::id)
+                .filter(|id| !rules.iter().any(|r| r.tools.iter().any(|p| crate::config::pattern_match(p, id))))
+                .collect()
+        };
+
+        let auth = &cfg.auth;
+        let (bearer, gateway) = (auth.has_verifier(), auth.trusted_headers.is_some());
+        let source = match (bearer, gateway) {
+            (true, true) => "bearer or gateway headers",
+            (true, false) => "bearer",
+            (false, true) => "gateway headers",
+            (false, false) => "none",
+        };
+        let (process_tools, _) = grants(&process.scopes);
+        let unidentified = if source == "none" {
+            "served as the process caller (no identity is configured)"
+        } else if auth.allow_anonymous {
+            "served as the process caller (allow_anonymous)"
+        } else {
+            "refused (401)"
+        };
+
+        let rl = &cfg.rate_limits;
+        let overlay_limits = cfg.overlays.iter().filter(|o| o.rate_limit.is_some()).count();
+        let audit_log = match cfg.log_file.as_deref() {
+            None => "off",
+            Some("stderr") => "stderr",
+            Some(_) => "file",
+        };
+
+        let mut warnings: Vec<String> = Vec::new();
+        if rules.is_empty() {
+            warnings.push(format!(
+                "no scope rules: every caller can call every tool ({} tools, {} composites)",
+                self.tools.len(),
+                cfg.workflows.len()
+            ));
+        } else if cfg.scopes.report_only {
+            warnings.push("scope rules are report-only: every caller can call every tool; rows show what enforcement would allow".into());
+        }
+        if source == "none" {
+            warnings.push(format!(
+                "no caller identity: over HTTP every request is the process caller, scopes {:?}",
+                process.scopes
+            ));
+        } else if auth.allow_anonymous && !process_tools.is_empty() {
+            warnings.push(format!(
+                "allow_anonymous: a request with no identity gets the process scopes {:?} ({} tools)",
+                process.scopes,
+                process_tools.len()
+            ));
+        }
+        if rl.report_only && rl.any() {
+            warnings.push("rate limits are report-only: nothing is refused for exceeding per_caller / per_tool".into());
+        }
+        if rl.any() && source != "none" && !auth.names_the_caller() {
+            warnings.push(
+                "rate limits key on the connection, not the caller: callers behind one gateway share a bucket \
+                 (set auth.trusted_headers.subject)"
+                    .into(),
+            );
+        }
+        if audit_log == "off" {
+            warnings.push("no audit log (log_file): nothing records who called what".into());
+        } else if cfg.log_hmac_key.is_none() {
+            warnings.push("audit log is not tamper-evident (no log_hmac_key)".into());
+        }
+
+        json!({
+            "identity": {
+                "source": source,
+                "without_identity": unidentified,
+                "revocation_checked": auth.introspection.is_some(),
+            },
+            "scopes": {
+                "rules": rules.len(),
+                "enforced": !rules.is_empty() && !cfg.scopes.report_only,
+                "report_only": cfg.scopes.report_only,
+            },
+            "callers": callers,
+            "granted_by_no_rule": {
+                "count": orphaned.len(),
+                "sample": orphaned.iter().take(sample).collect::<Vec<_>>(),
+            },
+            "rate_limits": {
+                "per_caller": rl.per_caller.is_some(),
+                "per_tool": rl.per_tool.is_some(),
+                "report_only": rl.report_only,
+                "overlay_limits": overlay_limits,
+            },
+            "audit": {"log": audit_log, "tamper_evident": cfg.log_hmac_key.is_some()},
+            "warnings": warnings,
+        })
+    }
 }
