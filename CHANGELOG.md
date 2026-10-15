@@ -6,6 +6,8 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-10-15
+
 ### Added
 
 - **A failed composite says what already happened.** It used to return
@@ -27,6 +29,18 @@ All notable changes to min-mcp. Format loosely follows
   composites no rule grants; how a request is identified and what one without identity gets;
   limits and audit posture; and a warning for each way the deployment is more
   open than it may look. `--strict` exits non-zero on any warning.
+
+### Changed
+
+- **A failed composite's error is now JSON.** Anything matching on the old
+  `workflow "x" failed at step "y": …` text should read the `WORKFLOW_FAILED:`
+  report instead (`failed_step.error` holds the step's error, capped at 2,000
+  bytes).
+- Dependencies: rmcp 3.4 → 3.5, hyper 1.11 → 1.12, tokio-rustls 0.26.5 →
+  0.26.6, tokio 1.53.1 → 1.53.2.
+- **rustls 0.23.45 → 0.23.46** for RUSTSEC-2026-0346 through -0349 (session
+  secrets in `Debug` output, ECH and ServerHello downgrade issues, unbounded
+  Brotli certificate decompression).
 
 ## [0.2.1] — 2026-10-03
 
