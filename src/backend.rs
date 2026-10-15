@@ -29,6 +29,29 @@ pub enum Backend {
     Spec(SpecBackend),
 }
 
+/// Whether a call reached the upstream, said by the code that made it — what
+/// a failed composite step needs, to tell whether re-running it is safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// Refused locally; nothing was sent.
+    NotSent,
+    /// Sent with no answer (timeout, transport failure): it may have committed.
+    NoAnswer,
+    /// The upstream answered, success or error.
+    Answered,
+}
+
+impl Reach {
+    /// The failed step's `outcome` in a WORKFLOW_FAILED report.
+    pub(crate) fn outcome(self) -> &'static str {
+        match self {
+            Reach::NotSent => "not_run",
+            Reach::NoAnswer => "unknown",
+            Reach::Answered => "failed",
+        }
+    }
+}
+
 impl Backend {
     /// `idx` is this backend's position in the Surface's backend list, stamped
     /// onto each ToolDef so dispatch can route back here.
@@ -51,6 +74,19 @@ impl Backend {
         extra_headers: &[(String, String)],
         deadline: Option<std::time::Duration>,
     ) -> Result<Value> {
+        Ok(self.call_tool_reach(name, args, extra_headers, deadline).await?.0)
+    }
+
+    /// [`Self::call_tool`], plus whether the call reached the upstream. An MCP
+    /// upstream that returns a result answered; its transport failures are the
+    /// `Err`. A spec upstream folds its own into the envelope, so it says.
+    pub async fn call_tool_reach(
+        &self,
+        name: &str,
+        args: Value,
+        extra_headers: &[(String, String)],
+        deadline: Option<std::time::Duration>,
+    ) -> Result<(Value, Reach)> {
         let mut r = match self {
             // Spec results compact in exec.rs, where the envelope is built.
             Backend::Spec(s) => return s.call_tool(name, args, extra_headers, deadline).await,
@@ -60,7 +96,7 @@ impl Backend {
         if self.result_format() == crate::config::ResultFormat::Json {
             compact_json_texts(&mut r);
         }
-        Ok(r)
+        Ok((r, Reach::Answered))
     }
 
     fn result_format(&self) -> crate::config::ResultFormat {
@@ -210,9 +246,9 @@ impl SpecBackend {
         args: Value,
         extra_headers: &[(String, String)],
         deadline: Option<std::time::Duration>,
-    ) -> Result<Value> {
+    ) -> Result<(Value, Reach)> {
         let Some(op) = self.spec.get(op_id) else {
-            return Ok(err_result(format!("unknown operation {op_id:?}")));
+            return Ok((err_result(format!("unknown operation {op_id:?}")), Reach::NotSent));
         };
         let pp = args.get("path_params").cloned().unwrap_or(json!({}));
         let qp = args.get("query_params").cloned().unwrap_or(json!({}));
@@ -221,10 +257,15 @@ impl SpecBackend {
         // shape into an MCP tool result; mark isError on HTTP >= 400 or transport error
         let is_error = out.get("error").is_some()
             || out.get("status").and_then(Value::as_u64).map(|s| s >= 400).unwrap_or(false);
-        Ok(json!({
+        // An envelope with no `status` never got an HTTP answer: a timeout or
+        // transport error (or a request exec refused to build — counted as
+        // NoAnswer too, which only errs toward "check before re-running").
+        let reach = if out.get("status").is_some() { Reach::Answered } else { Reach::NoAnswer };
+        let r = json!({
             "content": [{"type": "text", "text": serde_json::to_string(&out).unwrap_or_default()}],
             "isError": is_error,
-        }))
+        });
+        Ok((r, reach))
     }
 }
 

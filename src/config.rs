@@ -187,6 +187,11 @@ impl RateLimits {
     pub fn any(&self) -> bool {
         self.per_caller.is_some() || self.per_tool.is_some()
     }
+
+    /// Report-only with something to report on.
+    pub fn report_only_active(&self) -> bool {
+        self.report_only && self.any()
+    }
 }
 
 /// Secret stores beyond the environment. `${file:…}` needs no configuration;
@@ -727,6 +732,13 @@ pub struct Scopes {
     /// audit event instead. The rollout step before default-deny.
     #[serde(default)]
     pub report_only: bool,
+}
+
+impl Scopes {
+    /// Report-only with rules to report on.
+    pub fn report_only_active(&self) -> bool {
+        self.report_only && !self.rules.is_empty()
+    }
 }
 
 /// Static, config-level tool filtering (distinct from per-caller `scopes`).

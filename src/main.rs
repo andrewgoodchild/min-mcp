@@ -276,8 +276,8 @@ async fn build(common: &Common) -> Result<Built> {
         );
     }
     for (on, what, event) in [
-        (cfg.scopes.report_only && !cfg.scopes.rules.is_empty(), "scopes are", "would_deny"),
-        (cfg.rate_limits.report_only && cfg.rate_limits.any(), "rate limits are", "would_rate_limit"),
+        (cfg.scopes.report_only_active(), "scopes are", "would_deny"),
+        (cfg.rate_limits.report_only_active(), "rate limits are", "would_rate_limit"),
     ] {
         if !on {
             continue;
@@ -305,14 +305,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Cmd::AuditArgs { args, key, config } => {
             let key = audit_key(key, config).await?;
-            let mut arguments: Value = serde_json::from_str(&args).context("--args must be a JSON object")?;
-            // as call_tool normalises them: null is no arguments, anything else
-            // but an object is never dispatched, so has no mac to find
-            if arguments.is_null() {
-                arguments = serde_json::json!({});
-            }
-            anyhow::ensure!(arguments.is_object(), "--args must be a JSON object");
-            println!("{}", audit_chain::args_mac(&key, &surface::canonical_args(&arguments)));
+            let raw: Value = serde_json::from_str(&args).context("--args must be a JSON object")?;
+            // a non-object is never dispatched, so has no mac to find
+            let arguments = surface::call_arguments(Some(&raw)).context("--args must be a JSON object")?;
+            println!("{}", audit_chain::ArgsKey::new(&key).mac(&surface::canonical_args(&arguments)));
             Ok(())
         }
         Cmd::AuditVerify { file, key, config } => {

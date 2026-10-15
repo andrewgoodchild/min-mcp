@@ -83,10 +83,10 @@ every write that committed:
 ```text
 WORKFLOW_FAILED: {
   "workflow": "stripe.checkout",
+  "fix": "Step(s) [\"product\"] already took effect upstream and are NOT rolled back. Do not re-run this workflow — …",
   "failed_step": {"step": "price", "tool": "stripe.PostPrices", "outcome": "failed", "error": "…"},
   "completed": [{"step": "product", "tool": "stripe.PostProducts", "effect": "write", "outputs": {"id": "prod_123"}}],
-  "not_run": [{"step": "session", "tool": "stripe.PostCheckoutSessions"}],
-  "fix": "Step(s) [\"product\"] already took effect upstream and are NOT rolled back. Do not re-run this workflow — …"
+  "not_run": [{"step": "session", "tool": "stripe.PostCheckoutSessions"}]
 }
 ```
 

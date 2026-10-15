@@ -95,8 +95,10 @@ before `serve --http` takes traffic, and after any change to `scopes:` or
   with a sample of ids. Rows are the rules as written, so under `report_only`
   they show what enforcement would allow. A real caller holding several scopes
   reaches the union of their rows.
-- `granted_by_no_rule` — tools no rule grants, so nobody can call them once
-  rules enforce. Usually a pattern typo.
+- `granted_by_no_rule` — tools (a count and sample) and composites (all of
+  them) no rule grants, so nobody can call them once rules enforce. Usually a
+  pattern typo. A composite is checked by its own id, so it can be orphaned
+  even when every step tool is granted.
 - `identity` — how a request is identified (bearer, gateway headers, none),
   what happens to one without identity, and whether revocation is checked.
 - `rate_limits`, `audit` — what is on, and whether the log is tamper-evident.

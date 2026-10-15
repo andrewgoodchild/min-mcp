@@ -23,8 +23,8 @@ All notable changes to min-mcp. Format loosely follows
   `rate_limits.report_only`): evaluate without enforcing, and log
   `would_deny` / `would_rate_limit` for what enforcement would refuse — the
   rollout step before default-deny. Overlay `rate_limit`s still enforce.
-- **`minmcp access`**: per scope, the tools and composites it reaches; tools no
-  rule grants; how a request is identified and what one without identity gets;
+- **`minmcp access`**: per scope, the tools and composites it reaches; tools and
+  composites no rule grants; how a request is identified and what one without identity gets;
   limits and audit posture; and a warning for each way the deployment is more
   open than it may look. `--strict` exits non-zero on any warning.
 

@@ -33,8 +33,6 @@ use serde_json::Value;
 /// the previous one.
 pub struct Chain {
     key: ring::hmac::Key,
-    /// Keys `args_mac`; derived from the same secret (see [`args_key`]).
-    args_key: ring::hmac::Key,
     next_seq: u64,
     prev_mac: String,
 }
@@ -47,7 +45,6 @@ impl Chain {
     pub fn new(secret: &str) -> Self {
         Chain {
             key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes()),
-            args_key: args_key(secret),
             next_seq: 1,
             prev_mac: GENESIS.to_string(),
         }
@@ -75,11 +72,6 @@ impl Chain {
         self.next_seq = seq + 1;
         self.prev_mac = mac.to_string();
         Ok(())
-    }
-
-    /// The `args_mac` of one call's canonical arguments. See [`args_mac`].
-    pub fn args_mac(&self, canonical_args: &str) -> String {
-        hex(ring::hmac::sign(&self.args_key, canonical_args.as_bytes()).as_ref())
     }
 
     /// Stamp `line` with its sequence number and MAC, in place.
@@ -116,18 +108,17 @@ fn mac_for(key: &ring::hmac::Key, prev: &str, seq: u64, line: &Value) -> String 
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// Domain separation for the argument digest: its key is derived from
 /// `log_hmac_key` under this label, so an `args_mac` can never be passed off
 /// as a line `mac` or the other way round.
 const ARGS_LABEL: &[u8] = b"minmcp/args-mac/v1";
-
-fn args_key(secret: &str) -> ring::hmac::Key {
-    let root = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
-    ring::hmac::Key::new(ring::hmac::HMAC_SHA256, ring::hmac::sign(&root, ARGS_LABEL).as_ref())
-}
 
 /// A fingerprint of one call's arguments: which call this was, without what
 /// was in it.
@@ -142,8 +133,21 @@ fn args_key(secret: &str) -> ring::hmac::Key {
 /// key, the digest says nothing about the arguments; with it, it confirms a
 /// guess and no more. Over the canonical form (keys sorted), so a retry that
 /// reorders JSON keys is recognisably the same call.
-pub fn args_mac(secret: &str, canonical_args: &str) -> String {
-    hex(ring::hmac::sign(&args_key(secret), canonical_args.as_bytes()).as_ref())
+///
+/// Immutable once derived, so it lives outside the chain's mutex: minting one
+/// never waits on a line being stamped.
+pub struct ArgsKey(ring::hmac::Key);
+
+impl ArgsKey {
+    pub fn new(secret: &str) -> Self {
+        let root = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        ArgsKey(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, ring::hmac::sign(&root, ARGS_LABEL).as_ref()))
+    }
+
+    /// The `args_mac` of one call's canonical arguments.
+    pub fn mac(&self, canonical_args: &str) -> String {
+        hex(ring::hmac::sign(&self.0, canonical_args.as_bytes()).as_ref())
+    }
 }
 
 /// What a verification run found.
@@ -229,10 +233,10 @@ mod tests {
 
     #[test]
     fn args_mac_names_a_call_without_revealing_it() {
+        let args_mac = |secret, args| ArgsKey::new(secret).mac(args);
         let a = args_mac(KEY, r#"{"customerId":"42"}"#);
         // stable, so a suspected call can be looked up by its arguments
         assert_eq!(a, args_mac(KEY, r#"{"customerId":"42"}"#));
-        assert_eq!(a, Chain::new(KEY).args_mac(r#"{"customerId":"42"}"#), "chain and CLI agree");
         assert_ne!(a, args_mac(KEY, r#"{"customerId":"43"}"#));
         // keyed: without the key, a guess cannot be confirmed
         assert_ne!(a, args_mac("another-key", r#"{"customerId":"42"}"#));

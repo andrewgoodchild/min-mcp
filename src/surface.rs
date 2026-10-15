@@ -47,6 +47,15 @@ mod workflow;
 mod tests;
 
 pub(crate) use cache::canonical_args;
+
+/// A call's `arguments` as dispatched: an explicit null is treated like
+/// omitted (clients send it for no-arg tools); any OTHER non-object would hand
+/// the upstream a protocol-invalid call, so is `None`. `minmcp audit-args`
+/// normalises with this too, so its mac matches the one logged.
+pub(crate) fn call_arguments(raw: Option<&Value>) -> Option<Value> {
+    let v = raw.filter(|v| !v.is_null()).cloned().unwrap_or(json!({}));
+    v.is_object().then_some(v)
+}
 use cache::READ_CACHE_MAX_ENTRIES;
 use generators::{fnv1a, resolve_generators, tool_fingerprint};
 use ids::sanitize_name;
@@ -82,6 +91,8 @@ pub struct Surface {
     log: Option<AuditSink>,
     /// Tamper evidence for the audit stream (`log_hmac_key`). None = off.
     log_chain: Option<Mutex<crate::audit_chain::Chain>>,
+    /// Keys each `call` line's `args_mac`; set exactly when `log_chain` is.
+    args_key: Option<crate::audit_chain::ArgsKey>,
     /// tool_id -> fingerprint of the RAW upstream tool (description + input
     /// schema), captured BEFORE overlay patching. `authored_sha` pins this, so a
     /// rug-pull that changes only the top-level description is caught as drift —
@@ -276,19 +287,19 @@ impl Surface {
         // Tamper evidence, when a key is configured. Resumed from the file so
         // a restart continues one chain instead of starting a second at seq 1
         // mid-file, which verification would read as tampering.
-        let log_chain = match (&config.log_hmac_key, &log) {
+        let (log_chain, args_key) = match (&config.log_hmac_key, &log) {
             (Some(key_ref), Some(_)) => {
                 let key = secrets.expand(key_ref).await.context("resolving log_hmac_key")?;
                 let mut chain = crate::audit_chain::Chain::new(&key);
                 if let Some(path) = config.log_file.as_deref().filter(|p| *p != "stderr") {
                     chain.resume_from(path)?;
                 }
-                Some(Mutex::new(chain))
+                (Some(Mutex::new(chain)), Some(crate::audit_chain::ArgsKey::new(&key)))
             }
             (Some(_), None) => {
                 anyhow::bail!("log_hmac_key is set but log_file is not — there is no audit stream to sign")
             }
-            _ => None,
+            _ => (None, None),
         };
         // Read before `config` is moved into the surface.
         let config_max_concurrent = config.max_concurrent_calls;
@@ -304,6 +315,7 @@ impl Surface {
             workflow_by_id,
             log,
             log_chain,
+            args_key,
             origin_sha,
             patched_schemas: patched,
             tool_headers,
@@ -400,18 +412,24 @@ impl Surface {
     }
 
     /// Visibility as enforced. Under `scopes.report_only` everything is
-    /// visible and [`Self::note_would_deny`] records what would not have been.
+    /// visible, and [`Self::may_call`] records what would not have been.
     fn allowed(&self, caller: &Caller, tool_id: &str) -> bool {
         self.config.scopes.report_only || self.config.allowed(tool_id, &caller.scopes)
     }
 
-    /// Under `scopes.report_only`, log a call the rules would have refused.
-    /// Calls only: listing and search are not logged, since what a caller
-    /// would lose is the call, and a search per keystroke would bury it.
-    fn note_would_deny(&self, caller: &Caller, tool_id: &str) {
-        if self.config.scopes.report_only && !self.config.allowed(tool_id, &caller.scopes) {
-            self.log_event(caller, "would_deny", json!({"tool_id": tool_id, "scopes": caller.scopes}));
+    /// The gate for a CALL — every call path goes through this, so
+    /// report-only cannot be bypassed by a new one. Logs `would_deny` for a
+    /// call the rules would refuse under `scopes.report_only`. Listing and
+    /// search use [`Self::allowed`] and are not logged: what a caller would
+    /// lose is the call, and a search per keystroke would bury it.
+    fn may_call(&self, caller: &Caller, id: &str) -> bool {
+        if !self.config.scopes.report_only {
+            return self.config.allowed(id, &caller.scopes);
         }
+        if !self.config.allowed(id, &caller.scopes) {
+            self.log_event(caller, "would_deny", json!({"tool_id": id, "scopes": caller.scopes}));
+        }
+        true
     }
 
     /// Passthrough mode declares EVERY tool by (sanitized) name; visibility is
@@ -635,17 +653,9 @@ impl Surface {
                         );
                     }
                 }
-                // An explicit null is treated like omitted (clients send it for
-                // no-arg tools); any OTHER non-object would hand the upstream a
-                // protocol-invalid call — reject it client-side.
-                let inner = args
-                    .get("arguments")
-                    .filter(|v| !v.is_null())
-                    .cloned()
-                    .unwrap_or(json!({}));
-                if !inner.is_object() {
+                let Some(inner) = call_arguments(args.get("arguments")) else {
                     return Ok(bad_arg("call_tool 'arguments' must be a JSON object"));
-                }
+                };
                 // optional GraphQL-style field projection to shrink the response
                 let fields: Vec<String> = args
                     .get("fields")
@@ -818,8 +828,7 @@ impl Surface {
 
     /// Route a call to a composite workflow if the id names one, else a tool.
     async fn route_call(&self, caller: &Caller, id: &str, args: Value, fields: &[String]) -> Result<Value> {
-        if let Some(&i) = self.visible_workflow(caller, id) {
-            self.note_would_deny(caller, id);
+        if let Some(&i) = self.workflow_by_id.get(id).filter(|_| self.may_call(caller, id)) {
             let wf = &self.config.workflows[i];
             return self.execute_workflow(caller, wf, args).await;
         }

@@ -24,6 +24,7 @@ fn test_surface(cfg: Config, tools: Vec<ToolDef>) -> Surface {
         workflow_by_id: std::collections::HashMap::new(),
         log: None,
         log_chain: None,
+        args_key: None,
         origin_sha: std::collections::HashMap::new(),
         patched_schemas: std::collections::HashMap::new(),
         tool_headers: std::collections::HashMap::new(),
@@ -1225,52 +1226,35 @@ fn mcp_result_shaped_like_an_envelope_is_not_unwrapped() {
 }
 
 #[test]
-fn a_failed_steps_outcome_comes_from_the_prefix_dispatch_wrote() {
-    use super::workflow::step_outcome;
-    // refused locally: never reached the upstream
-    for e in ["RATE_LIMITED: x", "PREFLIGHT_ERROR: {}", "BREAKER_OPEN: x", "USER_SUPPLIED_MISSING: {}", "unknown tool_id \"a.b\""] {
-        assert_eq!(step_outcome(e, false), "not_run", "{e}");
-    }
-    // sent, no answer: may have taken effect
-    assert_eq!(step_outcome("TIMEOUT: a.b did not respond", false), "unknown");
-    assert_eq!(step_outcome("UPSTREAM_ERROR: a.b — boom", false), "unknown");
-    // a spec upstream's envelope: no status means the API never answered
-    let spec = |e| step_outcome(e, true);
-    assert_eq!(spec(r#"{"error":"TIMEOUT after 5s: …"}"#), "unknown");
-    assert_eq!(spec(r#"{"error":"transport error: connection reset"}"#), "unknown");
-    assert_eq!(spec(r#"{"error":"missing path parameter [\"id\"] for GetX"}"#), "not_run");
-    assert_eq!(spec(r#"unknown operation "GetX""#), "not_run");
-    // the upstream's own error, even one that mentions a timeout mid-text
-    assert_eq!(spec(r#"{"status":504,"body":{"error":"gateway TIMEOUT: try later"}}"#), "failed");
-    assert_eq!(spec(r#"{"status":400,"body":{"error":{"message":"bad"}}}"#), "failed");
-    // an MCP upstream's {"error": …} is an answer, not an envelope
-    assert_eq!(step_outcome(r#"{"error":"product not threaded"}"#, false), "failed");
-}
-
-#[test]
 fn a_composite_failure_only_calls_a_rerun_safe_when_it_is() {
     use super::workflow::workflow_failure;
+    use crate::backend::Reach;
     let wf: crate::config::Workflow = serde_yaml::from_str(
-        "id: w\ndescription: d\nsteps:\n  - {id: a, tool: u.A}\n  - {id: b, tool: u.B}\n",
+        "id: w\ndescription: d\nsteps:\n  - {id: a, tool: u.A, output: {id: id}}\n  - {id: b, tool: u.B}\n  - {id: c, tool: u.C}\n",
     )
     .unwrap();
-    let fix = |completed: Vec<Value>, outcome: &str, effect: &str| {
-        workflow_failure(&wf, &wf.steps[1], "e", outcome, completed, vec![], effect)["fix"]
-            .as_str()
-            .unwrap()
-            .to_string()
+    let outs: HashMap<String, Value> = [("a.id".to_string(), json!("a_1"))].into();
+    // `a_effect` is what step a did; step b (the failed one) writes
+    let report = |a_effect: &'static str, reach| {
+        workflow_failure(&wf, 1, "e", reach, &outs, |t| if t == "u.A" { a_effect } else { "write" })
     };
-    let read = json!({"step": "a", "tool": "u.A", "effect": "read", "outputs": {}});
-    let write = json!({"step": "a", "tool": "u.A", "effect": "write", "outputs": {}});
+    let fix = |a_effect, reach| report(a_effect, reach)["fix"].as_str().unwrap().to_string();
     // only reads ran and the failed step definitely failed → safe to re-run
-    assert!(fix(vec![read.clone()], "failed", "write").contains("repeats no effect"));
+    assert!(fix("read", Reach::Answered).contains("repeats no effect"));
+    assert!(fix("read", Reach::NotSent).contains("repeats no effect"));
     // an earlier write committed → never re-run
-    assert!(fix(vec![write], "failed", "write").contains("Do not re-run"));
+    assert!(fix("write", Reach::Answered).contains("Do not re-run"));
     // nothing written before, but the failed write itself is in doubt
-    let f = fix(vec![read], "unknown", "write");
+    let f = fix("read", Reach::NoAnswer);
     assert!(!f.contains("repeats no effect") && f.contains("check state"), "{f}");
+    // the report hands back what ran, how the failed step ended, and what did not run
+    let r = report("write", Reach::NoAnswer);
+    assert_eq!(r["completed"], json!([{"step": "a", "tool": "u.A", "effect": "write", "outputs": {"id": "a_1"}}]));
+    assert_eq!(r["failed_step"]["outcome"], "unknown");
+    assert_eq!(r["not_run"], json!([{"step": "c", "tool": "u.C"}]));
     // an unanswered READ is no reason to hold back
-    assert!(fix(vec![], "unknown", "read").contains("repeats no effect"));
+    let wf_read = workflow_failure(&wf, 0, "e", Reach::NoAnswer, &outs, |_| "read");
+    assert!(wf_read["fix"].as_str().unwrap().contains("repeats no effect"));
 }
 
 /// A surface over one tool (`up.X`, one required field so preflight answers
@@ -1359,7 +1343,8 @@ fn the_access_report_shows_each_scopes_reach_and_names_the_gaps() {
 
     // rules with a typo'd pattern, report-only, anonymous fallback, no audit
     let yaml = "mode: three_tool\nupstreams: []\nauth:\n  trusted_headers: {scopes: X-Scopes}\n  allow_anonymous: true\n\
-                scopes:\n  report_only: true\n  rules:\n    - {scope: r, tools: [\"up.Get*\"]}\n    - {scope: w, tools: [\"up.Post*\", \"up.Get*\"]}\n";
+                scopes:\n  report_only: true\n  rules:\n    - {scope: r, tools: [\"up.Get*\"]}\n    - {scope: w, tools: [\"up.Post*\", \"up.Get*\"]}\n\
+                workflows:\n  - {id: up.Flow, description: d, steps: [{id: a, tool: up.GetA}]}\n";
     let s = test_surface(Config::from_yaml(yaml).unwrap(), tools());
     let r = s.access_report(&Caller::with_scopes(vec!["r".into()]), 5);
     let reach: Vec<(String, u64)> = r["callers"]
@@ -1374,6 +1359,7 @@ fn the_access_report_shows_each_scopes_reach_and_names_the_gaps() {
         "rows are the rules as written, even under report_only: {r}"
     );
     assert_eq!(r["granted_by_no_rule"]["sample"], json!(["up.Orphan"]));
+    assert_eq!(r["granted_by_no_rule"]["composites"], json!(["up.Flow"]), "every step granted, the composite not");
     assert_eq!(r["scopes"]["enforced"], json!(false));
     let warnings = r["warnings"].to_string();
     for w in ["report-only", "allow_anonymous", "no audit log"] {

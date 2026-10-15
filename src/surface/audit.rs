@@ -288,8 +288,7 @@ impl Surface {
             let wfs = cfg.workflows.iter().map(|w| w.id.as_str()).filter(|id| cfg.allowed(id, scopes)).collect();
             (tools, wfs)
         };
-        let row = |who: String, scopes: &[String]| {
-            let (tools, wfs) = grants(scopes);
+        let row = |who: String, scopes: &[String], (tools, wfs): &(Vec<&str>, Vec<&str>)| {
             json!({
                 "caller": who, "scopes": scopes,
                 "tools": tools.len(), "composites": wfs.len(),
@@ -299,32 +298,38 @@ impl Surface {
         let mut named: Vec<&str> = rules.iter().map(|r| r.scope.as_str()).collect();
         named.sort_unstable();
         named.dedup();
-        let mut callers = vec![row("no scopes".into(), &[])];
-        callers.extend(named.iter().map(|s| row(format!("scope {s}"), &[s.to_string()])));
-        callers.push(row(format!("process caller ({})", process.label()), &process.scopes));
+        let process_grants = grants(&process.scopes);
+        let mut callers = vec![row("no scopes".into(), &[], &grants(&[]))];
+        callers.extend(named.iter().map(|s| {
+            let scopes = [s.to_string()];
+            row(format!("scope {s}"), &scopes, &grants(&scopes))
+        }));
+        callers.push(row(format!("process caller ({})", process.label()), &process.scopes, &process_grants));
 
         // Granted to nobody: unreachable once rules enforce. Usually a pattern
-        // typo, not a decision.
-        let orphaned: Vec<&str> = if rules.is_empty() {
-            Vec::new()
+        // typo, not a decision. Composites are scope-checked by their own id,
+        // so a composite can be orphaned even when every step tool is granted.
+        let granted = |id: &&str| rules.iter().any(|r| r.tools.iter().any(|p| crate::config::pattern_match(p, id)));
+        let (orphaned, orphaned_wfs): (Vec<&str>, Vec<&str>) = if rules.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            self.tools
-                .iter()
-                .map(ToolDef::id)
-                .filter(|id| !rules.iter().any(|r| r.tools.iter().any(|p| crate::config::pattern_match(p, id))))
-                .collect()
+            (
+                self.tools.iter().map(ToolDef::id).filter(|id| !granted(id)).collect(),
+                cfg.workflows.iter().map(|w| w.id.as_str()).filter(|id| !granted(id)).collect(),
+            )
         };
 
         let auth = &cfg.auth;
         let (bearer, gateway) = (auth.has_verifier(), auth.trusted_headers.is_some());
+        let identified = bearer || gateway;
         let source = match (bearer, gateway) {
             (true, true) => "bearer or gateway headers",
             (true, false) => "bearer",
             (false, true) => "gateway headers",
             (false, false) => "none",
         };
-        let (process_tools, _) = grants(&process.scopes);
-        let unidentified = if source == "none" {
+        let process_tools = &process_grants.0;
+        let unidentified = if !identified {
             "served as the process caller (no identity is configured)"
         } else if auth.allow_anonymous {
             "served as the process caller (allow_anonymous)"
@@ -334,11 +339,12 @@ impl Surface {
 
         let rl = &cfg.rate_limits;
         let overlay_limits = cfg.overlays.iter().filter(|o| o.rate_limit.is_some()).count();
-        let audit_log = match cfg.log_file.as_deref() {
+        let audit_log = match &self.log {
             None => "off",
-            Some("stderr") => "stderr",
-            Some(_) => "file",
+            Some(AuditSink::Stderr) => "stderr",
+            Some(AuditSink::File(_)) => "file",
         };
+        let tamper_evident = self.log_chain.is_some();
 
         let mut warnings: Vec<String> = Vec::new();
         if rules.is_empty() {
@@ -347,10 +353,10 @@ impl Surface {
                 self.tools.len(),
                 cfg.workflows.len()
             ));
-        } else if cfg.scopes.report_only {
+        } else if cfg.scopes.report_only_active() {
             warnings.push("scope rules are report-only: every caller can call every tool; rows show what enforcement would allow".into());
         }
-        if source == "none" {
+        if !identified {
             warnings.push(format!(
                 "no caller identity: over HTTP every request is the process caller, scopes {:?}",
                 process.scopes
@@ -362,19 +368,19 @@ impl Surface {
                 process_tools.len()
             ));
         }
-        if rl.report_only && rl.any() {
+        if rl.report_only_active() {
             warnings.push("rate limits are report-only: nothing is refused for exceeding per_caller / per_tool".into());
         }
-        if rl.any() && source != "none" && !auth.names_the_caller() {
+        if rl.any() && identified && !auth.names_the_caller() {
             warnings.push(
                 "rate limits key on the connection, not the caller: callers behind one gateway share a bucket \
                  (set auth.trusted_headers.subject)"
                     .into(),
             );
         }
-        if audit_log == "off" {
+        if self.log.is_none() {
             warnings.push("no audit log (log_file): nothing records who called what".into());
-        } else if cfg.log_hmac_key.is_none() {
+        } else if !tamper_evident {
             warnings.push("audit log is not tamper-evident (no log_hmac_key)".into());
         }
 
@@ -393,6 +399,7 @@ impl Surface {
             "granted_by_no_rule": {
                 "count": orphaned.len(),
                 "sample": orphaned.iter().take(sample).collect::<Vec<_>>(),
+                "composites": orphaned_wfs,
             },
             "rate_limits": {
                 "per_caller": rl.per_caller.is_some(),
@@ -400,7 +407,7 @@ impl Surface {
                 "report_only": rl.report_only,
                 "overlay_limits": overlay_limits,
             },
-            "audit": {"log": audit_log, "tamper_evident": cfg.log_hmac_key.is_some()},
+            "audit": {"log": audit_log, "tamper_evident": tamper_evident},
             "warnings": warnings,
         })
     }
