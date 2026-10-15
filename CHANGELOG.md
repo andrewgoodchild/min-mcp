@@ -38,6 +38,9 @@ All notable changes to min-mcp. Format loosely follows
   bytes).
 - Dependencies: rmcp 3.4 → 3.5, hyper 1.11 → 1.12, tokio-rustls 0.26.5 →
   0.26.6, tokio 1.53.1 → 1.53.2.
+- **rustls 0.23.45 → 0.23.46** for RUSTSEC-2026-0346 through -0349 (session
+  secrets in `Debug` output, ECH and ServerHello downgrade issues, unbounded
+  Brotli certificate decompression).
 
 ## [0.2.1] — 2026-10-03
 
