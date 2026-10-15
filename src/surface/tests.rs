@@ -24,6 +24,7 @@ fn test_surface(cfg: Config, tools: Vec<ToolDef>) -> Surface {
         workflow_by_id: std::collections::HashMap::new(),
         log: None,
         log_chain: None,
+        args_key: None,
         origin_sha: std::collections::HashMap::new(),
         patched_schemas: std::collections::HashMap::new(),
         tool_headers: std::collections::HashMap::new(),
@@ -1222,4 +1223,156 @@ fn mcp_result_shaped_like_an_envelope_is_not_unwrapped() {
     let parsed: Value =
         serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(parsed, json!({"status": 200, "body": {"id": "z1"}}));
+}
+
+#[test]
+fn a_composite_failure_only_calls_a_rerun_safe_when_it_is() {
+    use super::workflow::workflow_failure;
+    use crate::backend::Reach;
+    let wf: crate::config::Workflow = serde_yaml::from_str(
+        "id: w\ndescription: d\nsteps:\n  - {id: a, tool: u.A, output: {id: id}}\n  - {id: b, tool: u.B}\n  - {id: c, tool: u.C}\n",
+    )
+    .unwrap();
+    let outs: HashMap<String, Value> = [("a.id".to_string(), json!("a_1"))].into();
+    // `a_effect` is what step a did; step b (the failed one) writes
+    let report = |a_effect: &'static str, reach| {
+        workflow_failure(&wf, 1, "e", reach, &outs, |t| if t == "u.A" { a_effect } else { "write" })
+    };
+    let fix = |a_effect, reach| report(a_effect, reach)["fix"].as_str().unwrap().to_string();
+    // only reads ran and the failed step definitely failed → safe to re-run
+    assert!(fix("read", Reach::Answered).contains("repeats no effect"));
+    assert!(fix("read", Reach::NotSent).contains("repeats no effect"));
+    // an earlier write committed → never re-run
+    assert!(fix("write", Reach::Answered).contains("Do not re-run"));
+    // nothing written before, but the failed write itself is in doubt
+    let f = fix("read", Reach::NoAnswer);
+    assert!(!f.contains("repeats no effect") && f.contains("check state"), "{f}");
+    // the report hands back what ran, how the failed step ended, and what did not run
+    let r = report("write", Reach::NoAnswer);
+    assert_eq!(r["completed"], json!([{"step": "a", "tool": "u.A", "effect": "write", "outputs": {"id": "a_1"}}]));
+    assert_eq!(r["failed_step"]["outcome"], "unknown");
+    assert_eq!(r["not_run"], json!([{"step": "c", "tool": "u.C"}]));
+    // an unanswered READ is no reason to hold back
+    let wf_read = workflow_failure(&wf, 0, "e", Reach::NoAnswer, &outs, |_| "read");
+    assert!(wf_read["fix"].as_str().unwrap().contains("repeats no effect"));
+}
+
+/// A surface over one tool (`up.X`, one required field so preflight answers
+/// without an upstream) logging to a fresh temp file.
+fn logged_surface(yaml: &str, name: &str) -> (Surface, std::path::PathBuf) {
+    let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]});
+    let tools = vec![ToolDef {
+        upstream_idx: 0,
+        name: "X".into(),
+        description: "x".into(),
+        input_schema: schema.clone(),
+        id: "up.X".into(),
+        read_only: None,
+    }];
+    let mut s = test_surface(Config::from_yaml(yaml).unwrap(), tools);
+    s.patched_schemas.insert("up.X".into(), schema);
+    let path = std::env::temp_dir().join(format!("minmcp_{name}_{}.ndjson", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+    s.log = Some(AuditSink::File(Mutex::new(file)));
+    (s, path)
+}
+
+#[tokio::test]
+async fn report_only_scopes_let_the_call_through_and_log_what_they_would_deny() {
+    let yaml = "mode: three_tool\nupstreams: []\nscopes:\n  report_only: true\n  rules:\n    - scope: w\n      tools: [\"up.*\"]\n";
+    let (s, path) = logged_surface(yaml, "ro_scopes");
+    let unscoped = Caller::new(vec![], Some("alice".into()));
+    let granted = Caller::new(vec!["w".into()], Some("bob".into()));
+    let call = json!({"tool_id": "up.X", "arguments": {}});
+    for c in [&unscoped, &granted] {
+        let r = s.call(c, "call_tool", call.clone()).await.unwrap();
+        assert!(result_text(&r).contains("PREFLIGHT_ERROR"), "not hidden, reaches the call path: {r}");
+    }
+    assert_eq!(s.list_tools(&unscoped), s.list_tools(&granted), "nothing is hidden");
+    drop(s);
+    let logged = std::fs::read_to_string(&path).unwrap();
+    let denies: Vec<&str> = logged.lines().filter(|l| l.contains("\"event\":\"would_deny\"")).collect();
+    assert_eq!(denies.len(), 1, "only the unscoped caller would be denied: {logged}");
+    assert!(denies[0].contains("\"caller\":\"alice\"") && denies[0].contains("up.X"), "{}", denies[0]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn report_only_rate_limits_count_but_never_refuse() {
+    let yaml = "mode: three_tool\nupstreams: []\nrate_limits:\n  report_only: true\n  per_caller: {calls: 1, per_s: 60}\n";
+    let (s, path) = logged_surface(yaml, "ro_limits");
+    let alice = Caller::new(vec![], Some("alice".into()));
+    let call = json!({"tool_id": "up.X", "arguments": {}});
+    for _ in 0..3 {
+        let r = s.call(&alice, "call_tool", call.clone()).await.unwrap();
+        assert!(result_text(&r).contains("PREFLIGHT_ERROR"), "never refused: {r}");
+    }
+    drop(s);
+    let logged = std::fs::read_to_string(&path).unwrap();
+    let would = logged.lines().filter(|l| l.contains("\"event\":\"would_rate_limit\"")).count();
+    assert_eq!(would, 2, "the 2nd and 3rd calls are what enforcement would refuse: {logged}");
+    assert!(!logged.contains("\"event\":\"rate_limited\""), "{logged}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn report_only_rate_limits_leave_an_overlay_limit_enforced() {
+    let yaml = "mode: three_tool\nupstreams: []\nrate_limits:\n  report_only: true\n  per_caller: {calls: 100, per_s: 60}\noverlays:\n  - tool: up.X\n    rate_limit: {calls: 1, per_s: 60}\n";
+    let (s, path) = logged_surface(yaml, "ro_overlay");
+    let alice = Caller::new(vec![], Some("alice".into()));
+    let call = json!({"tool_id": "up.X", "arguments": {}});
+    let r = s.call(&alice, "call_tool", call.clone()).await.unwrap();
+    assert!(result_text(&r).contains("PREFLIGHT_ERROR"), "{r}");
+    let r = s.call(&alice, "call_tool", call).await.unwrap();
+    assert!(result_text(&r).contains("RATE_LIMITED"), "the overlay's own limit still refuses: {r}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_access_report_shows_each_scopes_reach_and_names_the_gaps() {
+    let mk = |id: &str| ToolDef {
+        upstream_idx: 0,
+        name: id.into(),
+        description: "x".into(),
+        input_schema: json!({"type": "object"}),
+        id: format!("up.{id}"),
+        read_only: None,
+    };
+    let tools = || vec![mk("GetA"), mk("PostA"), mk("Orphan")];
+
+    // rules with a typo'd pattern, report-only, anonymous fallback, no audit
+    let yaml = "mode: three_tool\nupstreams: []\nauth:\n  trusted_headers: {scopes: X-Scopes}\n  allow_anonymous: true\n\
+                scopes:\n  report_only: true\n  rules:\n    - {scope: r, tools: [\"up.Get*\"]}\n    - {scope: w, tools: [\"up.Post*\", \"up.Get*\"]}\n\
+                workflows:\n  - {id: up.Flow, description: d, steps: [{id: a, tool: up.GetA}]}\n";
+    let s = test_surface(Config::from_yaml(yaml).unwrap(), tools());
+    let r = s.access_report(&Caller::with_scopes(vec!["r".into()]), 5);
+    let reach: Vec<(String, u64)> = r["callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["caller"].as_str().unwrap().to_string(), c["tools"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(
+        reach,
+        [("no scopes".into(), 0), ("scope r".into(), 1), ("scope w".into(), 2), ("process caller (anonymous)".into(), 1)],
+        "rows are the rules as written, even under report_only: {r}"
+    );
+    assert_eq!(r["granted_by_no_rule"]["sample"], json!(["up.Orphan"]));
+    assert_eq!(r["granted_by_no_rule"]["composites"], json!(["up.Flow"]), "every step granted, the composite not");
+    assert_eq!(r["scopes"]["enforced"], json!(false));
+    let warnings = r["warnings"].to_string();
+    for w in ["report-only", "allow_anonymous", "no audit log"] {
+        assert!(warnings.contains(w), "missing {w:?}: {warnings}");
+    }
+
+    // no rules and no identity: the open defaults, each named
+    let s = test_surface(Config::from_yaml("mode: three_tool\nupstreams: []\n").unwrap(), tools());
+    let r = s.access_report(&Caller::default(), 0);
+    let warnings = r["warnings"].to_string();
+    assert!(warnings.contains("no scope rules: every caller can call every tool (3 tools"), "{warnings}");
+    assert!(warnings.contains("no caller identity"), "{warnings}");
+    assert_eq!(r["callers"][0]["tools"], json!(3), "no rules → everyone sees everything");
+    assert_eq!(r["callers"][0]["sample"], json!([]), "sample 0 → counts only");
+    assert_eq!(r["identity"]["without_identity"], json!("served as the process caller (no identity is configured)"));
 }

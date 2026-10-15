@@ -71,6 +71,47 @@ The key comes from `--key` (inline, or an `${env:…}`/`${file:…}` reference),
 [Tamper evidence](transports-and-auth.md#tamper-evidence-log_hmac_key) for what
 the chain does and does not prove.
 
+### `audit-args`
+Print the `args_mac` a call with these arguments carries in a log written with
+`log_hmac_key`, so you can find a call by what you suspect it was sent without
+the log ever holding the arguments. Pass them as the agent sent them; key order
+does not matter. Takes the key the same ways as `audit-verify`.
+
+```sh
+minmcp audit-args --config /etc/minmcp.yaml --args '{"customerId":"42"}'
+grep "$(minmcp audit-args --config /etc/minmcp.yaml --args '{"customerId":"42"}')" audit.ndjson
+```
+
+See [Which call was it?](transports-and-auth.md#which-call-was-it-args_mac).
+
+### `access`
+Who can reach what, read from the config with no calls made — the check to run
+before `serve --http` takes traffic, and after any change to `scopes:` or
+`auth:`. Prints:
+
+- `callers` — for a caller with no scopes, for each scope the rules name, and
+  for the process caller (`--scopes` / `--jwt`; stdio, and HTTP requests without
+  identity under `allow_anonymous`): how many tools and composites it reaches,
+  with a sample of ids. Rows are the rules as written, so under `report_only`
+  they show what enforcement would allow. A real caller holding several scopes
+  reaches the union of their rows.
+- `granted_by_no_rule` — tools (a count and sample) and composites (all of
+  them) no rule grants, so nobody can call them once rules enforce. Usually a
+  pattern typo. A composite is checked by its own id, so it can be orphaned
+  even when every step tool is granted.
+- `identity` — how a request is identified (bearer, gateway headers, none),
+  what happens to one without identity, and whether revocation is checked.
+- `rate_limits`, `audit` — what is on, and whether the log is tamper-evident.
+- `warnings` — each way the deployment is more open than it may look: no scope
+  rules, report-only scopes or limits, no caller identity, `allow_anonymous`
+  granting tools, limits that key on the connection, no audit log, an unsigned
+  one.
+
+```sh
+minmcp access --config examples/enterprise.yaml
+minmcp access --config prod.yaml --sample 0 --strict   # CI: exit 1 on any warning
+```
+
 ### `lint`
 Static quality lint of every registered tool — best-practice smells (missing/thin
 descriptions, undocumented params, all-optional writes, tools sharing a summary),

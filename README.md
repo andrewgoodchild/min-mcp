@@ -133,7 +133,8 @@ development tool. What you turn on when it becomes infrastructure:
 | **Wire** | TLS on the listener, and mutual TLS — which is what makes trusting a gateway's identity headers sound rather than assumed |
 | **Bounds** | Request body, in-flight requests, concurrent upstream calls, connection deadlines, per-caller rate limits |
 | **Tool integrity** | Tool definitions checked for poisoning at startup; `strict` refuses to serve a flagged tool |
-| **Audit** | Every call recorded with its caller, and optionally HMAC-chained so tampering is detectable (`minmcp audit-verify`) |
+| **Audit** | Every call recorded with its caller, and optionally HMAC-chained so tampering is detectable (`minmcp audit-verify`), with a keyed fingerprint of its arguments that names the call without logging them |
+| **Rollout** | `minmcp access` shows who can reach what and flags open defaults; scopes and rate limits can run `report_only`, logging what they would refuse before they do |
 | **Supply chain** | `cargo audit` on every push and weekly — it has already caught a TLS advisory filed against a dependency nothing had touched |
 
 → **[Security](docs/security.md)** for what each control does *not* cover, and

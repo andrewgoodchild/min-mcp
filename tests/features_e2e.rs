@@ -30,6 +30,66 @@ fn composite_threads_one_steps_output_into_the_next() {
 
 #[cfg(unix)]
 #[test]
+fn a_failed_composite_says_which_steps_already_took_effect() {
+    // Step 1 writes, step 2 is refused. "failed at step price" alone invites a
+    // re-run that creates a second product; the report must name the committed
+    // write, hand back its output, and say not to re-run.
+    let (out, _, _) = run(&[
+        "call", "--config", "tests/fixtures/e2e-fake.yaml",
+        "fake.product_then_bad_price", "--args", "{}",
+    ]);
+    let json = out.trim().strip_prefix("WORKFLOW_FAILED: ").unwrap_or_else(|| panic!("{out}"));
+    let r: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(r["failed_step"]["step"], "price", "{r}");
+    assert_eq!(r["failed_step"]["outcome"], "failed", "the upstream answered: {r}");
+    assert_eq!(r["completed"][0]["step"], "product", "{r}");
+    assert_eq!(r["completed"][0]["effect"], "write", "no readOnlyHint → assumed to write: {r}");
+    assert_eq!(r["completed"][0]["outputs"]["id"], "prod_1", "the committed id is handed back: {r}");
+    assert_eq!(r["not_run"][0]["step"], "lookup", "{r}");
+    assert!(r["fix"].as_str().unwrap().contains("Do not re-run"), "{r}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_keyed_audit_line_fingerprints_the_arguments_without_logging_them() {
+    let dir = std::env::temp_dir();
+    let root = std::env::current_dir().unwrap();
+    let log = dir.join(format!("minmcp_argsmac_{}.ndjson", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let cfg = dir.join(format!("minmcp_argsmac_{}.yaml", std::process::id()));
+    std::fs::write(
+        &cfg,
+        format!(
+            "mode: three_tool\nupstreams:\n  - name: fake\n    command: sh\n    args: [\"{}\"]\nlog_file: {}\nlog_hmac_key: k3y\n",
+            root.join("tests/fixtures/fake-mcp-server.sh").display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    let (out, err, ok) = run(&[
+        "call", "--config", cfg.to_str().unwrap(), "fake.create_product", "--args", r#"{"name":"Secret Widget"}"#,
+    ]);
+    assert!(ok, "{out}{err}");
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(!logged.contains("Secret Widget"), "arguments must never reach the log: {logged}");
+    let line: serde_json::Value = serde_json::from_str(logged.lines().last().unwrap()).unwrap();
+    let mac = line["args_mac"].as_str().unwrap_or_else(|| panic!("no args_mac: {line}"));
+
+    // an operator who suspects the arguments can confirm them, in any key order
+    let (printed, err, ok) = run(&["audit-args", "--key", "k3y", "--args", r#"{ "name": "Secret Widget" }"#]);
+    assert!(ok, "{err}");
+    assert_eq!(printed.trim(), mac);
+    let (other, _, _) = run(&["audit-args", "--key", "k3y", "--args", r#"{"name":"Other"}"#]);
+    assert_ne!(other.trim(), mac);
+    // and the field is inside the chain like every other
+    let (_, err, ok) = run(&["audit-verify", "--file", log.to_str().unwrap(), "--key", "k3y"]);
+    assert!(ok, "{err}");
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&cfg);
+}
+
+#[cfg(unix)]
+#[test]
 fn auto_pagination_follows_the_cursor_and_concatenates() {
     // Upstream serves 2 items + next_cursor, then 2 more and has_more:false.
     // The agent should see one merged list and a closed `more` gate.

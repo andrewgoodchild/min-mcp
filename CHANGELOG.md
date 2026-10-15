@@ -6,6 +6,28 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **A failed composite says what already happened.** It used to return
+  `workflow "x" failed at step "y"`, and the natural recovery — re-run it —
+  repeats every write that committed. It now returns `WORKFLOW_FAILED` with the
+  failed step and whether it reached the upstream (`not_run` / `failed` /
+  `unknown`), each completed step with its effect (`read` / `write`) and
+  extracted outputs, the steps that never ran, and a `fix` that says a re-run is
+  safe only when it is.
+- **`args_mac` on audit `call` lines** when `log_hmac_key` is set: a keyed
+  fingerprint of the call's arguments, so an incident review can tell *which*
+  call it was without the log holding the arguments. `minmcp audit-args`
+  computes it for arguments you suspect.
+- **Report-only scopes and rate limits** (`scopes.report_only`,
+  `rate_limits.report_only`): evaluate without enforcing, and log
+  `would_deny` / `would_rate_limit` for what enforcement would refuse — the
+  rollout step before default-deny. Overlay `rate_limit`s still enforce.
+- **`minmcp access`**: per scope, the tools and composites it reaches; tools and
+  composites no rule grants; how a request is identified and what one without identity gets;
+  limits and audit posture; and a warning for each way the deployment is more
+  open than it may look. `--strict` exits non-zero on any warning.
+
 ## [0.2.1] — 2026-10-03
 
 ### Added — crates.io

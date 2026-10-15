@@ -12,7 +12,7 @@ pub(super) const READ_CACHE_MAX_ENTRIES: usize = 512;
 /// the same entry. (serde_json's `preserve_order` keeps insertion order, which
 /// would otherwise split identical calls across spurious keys; mined from
 /// ContextForge's `cached_tool_result`, which sorts keys for exactly this.)
-pub(super) fn canonical_args(v: &Value) -> String {
+pub(crate) fn canonical_args(v: &Value) -> String {
     fn write_canon(v: &Value, out: &mut String) {
         match v {
             Value::Object(map) => {

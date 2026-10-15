@@ -104,7 +104,50 @@ fn mac_for(key: &ring::hmac::Key, prev: &str, seq: u64, line: &Value) -> String 
     // re-serialised from the file hashes identically to the one written.
     let payload = format!("{prev}\u{1f}{seq}\u{1f}{body}");
     let tag = ring::hmac::sign(key, payload.as_bytes());
-    tag.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    hex(tag.as_ref())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Domain separation for the argument digest: its key is derived from
+/// `log_hmac_key` under this label, so an `args_mac` can never be passed off
+/// as a line `mac` or the other way round.
+const ARGS_LABEL: &[u8] = b"minmcp/args-mac/v1";
+
+/// A fingerprint of one call's arguments: which call this was, without what
+/// was in it.
+///
+/// Arguments are never logged — they carry customer data. But "a call to
+/// `crm.delete_customer` at 14:02" does not say WHICH customer, and an incident
+/// review needs that. `args_mac` answers it by comparison: compute the mac of
+/// the arguments you suspect (`minmcp audit-args`) and look for it.
+///
+/// Keyed rather than a plain hash because arguments are low-entropy: a bare
+/// SHA-256 of `{"customerId":"42"}` is reversed by trying every id. Without the
+/// key, the digest says nothing about the arguments; with it, it confirms a
+/// guess and no more. Over the canonical form (keys sorted), so a retry that
+/// reorders JSON keys is recognisably the same call.
+///
+/// Immutable once derived, so it lives outside the chain's mutex: minting one
+/// never waits on a line being stamped.
+pub struct ArgsKey(ring::hmac::Key);
+
+impl ArgsKey {
+    pub fn new(secret: &str) -> Self {
+        let root = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        ArgsKey(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, ring::hmac::sign(&root, ARGS_LABEL).as_ref()))
+    }
+
+    /// The `args_mac` of one call's canonical arguments.
+    pub fn mac(&self, canonical_args: &str) -> String {
+        hex(ring::hmac::sign(&self.0, canonical_args.as_bytes()).as_ref())
+    }
 }
 
 /// What a verification run found.
@@ -186,6 +229,20 @@ mod tests {
         }
         std::fs::write(&path, out).unwrap();
         path
+    }
+
+    #[test]
+    fn args_mac_names_a_call_without_revealing_it() {
+        let args_mac = |secret, args| ArgsKey::new(secret).mac(args);
+        let a = args_mac(KEY, r#"{"customerId":"42"}"#);
+        // stable, so a suspected call can be looked up by its arguments
+        assert_eq!(a, args_mac(KEY, r#"{"customerId":"42"}"#));
+        assert_ne!(a, args_mac(KEY, r#"{"customerId":"43"}"#));
+        // keyed: without the key, a guess cannot be confirmed
+        assert_ne!(a, args_mac("another-key", r#"{"customerId":"42"}"#));
+        // and domain-separated from the line MAC under the same key
+        let line_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, KEY.as_bytes());
+        assert_ne!(a, hex(ring::hmac::sign(&line_key, br#"{"customerId":"42"}"#).as_ref()));
     }
 
     #[test]

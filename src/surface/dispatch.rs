@@ -5,11 +5,31 @@ use std::time::Instant;
 
 use super::*;
 
+use crate::backend::Reach;
+
+/// A call refused before anything was sent upstream.
+fn not_sent(result: Value) -> Result<(Value, Reach)> {
+    Ok((result, Reach::NotSent))
+}
+
 impl Surface {
     pub(super) async fn dispatch(&self, caller: &Caller, tool_id: &str, arguments: Value, fields: &[String]) -> Result<Value> {
+        Ok(self.dispatch_reach(caller, tool_id, arguments, fields).await?.0)
+    }
+
+    /// [`Self::dispatch`], plus whether the call reached the upstream — set
+    /// where each refusal, timeout or answer happens, for a composite's
+    /// failure report.
+    pub(super) async fn dispatch_reach(
+        &self,
+        caller: &Caller,
+        tool_id: &str,
+        arguments: Value,
+        fields: &[String],
+    ) -> Result<(Value, Reach)> {
         let started = Instant::now();
-        let Some(t) = self.visible_def(caller, tool_id) else {
-            return Ok(text_result(
+        let Some(t) = self.def_for(tool_id).filter(|_| self.may_call(caller, tool_id)) else {
+            return not_sent(text_result(
                 format!(
                     "unknown tool_id {tool_id:?} —{} {}",
                     self.suggest_near_misses(caller, tool_id),
@@ -26,7 +46,7 @@ impl Surface {
         // hidden tools), before any work. A refusal is a continuation prompt.
         if let Some((what, retry_in_s)) = self.rate_limited(caller, tool_id, overlay) {
             self.log_event(caller, "rate_limited", json!({"tool_id": tool_id, "limit": what, "retry_in_s": retry_in_s}));
-            return Ok(text_result(
+            return not_sent(text_result(
                 format!(
                     "RATE_LIMITED: {what} — retry in ~{retry_in_s}s. Do not retry before then; \
                      batch the work or use a different tool meanwhile."
@@ -34,6 +54,9 @@ impl Surface {
                 true,
             ));
         }
+        // Over the arguments as the CALLER sent them, before defaults and
+        // injected secrets, so an operator can reproduce it with `audit-args`.
+        let args_mac = self.args_key.as_ref().map(|k| k.mac(&canonical_args(&arguments)));
         // Everything overlay-derived, from ONE lookup: preflight override (global
         // default is ON — a local structured error beats a raw upstream dump),
         // per-tool timeout + breaker, request defaults, and pagination config.
@@ -90,7 +113,7 @@ impl Surface {
                             "source": source,
                             "fix": "this value comes from the session/environment, not the agent; it is not available"
                         });
-                        return Ok(text_result(format!("USER_SUPPLIED_MISSING: {e}"), true));
+                        return not_sent(text_result(format!("USER_SUPPLIED_MISSING: {e}"), true));
                     }
                 }
             }
@@ -109,7 +132,7 @@ impl Surface {
                      over-declares its requirements, set `preflight: false` in its overlay (or \
                      globally) to let the call reach the upstream."
                 );
-                return Ok(text_result(format!("PREFLIGHT_ERROR: {se}"), true));
+                return not_sent(text_result(format!("PREFLIGHT_ERROR: {se}"), true));
             }
         }
         // Idempotent-read cache: keyed on (tool, post-default arguments), only for
@@ -130,6 +153,7 @@ impl Surface {
         });
         let from_cache = cached.is_some();
         let mut was_probe = false;
+        let mut reach = Reach::Answered;
         let mut result = match cached {
             Some(v) => v,
             None => {
@@ -144,7 +168,7 @@ impl Surface {
                     match decision {
                         breaker::Decision::Block { failures, retry_in_s } => {
                             self.log_event(caller, "breaker", json!({"tool_id": tool_id, "state": "open"}));
-                            return Ok(text_result(
+                            return not_sent(text_result(
                                 format!(
                                     "BREAKER_OPEN: {tool_id} has failed {failures} time(s) in a row and is paused for ~{retry_in_s}s. \
                                      Do not retry it now — use a different tool or report what is failing."
@@ -167,10 +191,16 @@ impl Surface {
                 // far more than the upstream work it exists to bound.
                 let called = {
                     let _slot = self.upstream_slot().await;
-                    self.upstreams[idx].call_tool(&original_name, call_args, &extra_headers, deadline).await
+                    self.upstreams[idx].call_tool_reach(&original_name, call_args, &extra_headers, deadline).await
                 };
+                if called.is_err() {
+                    reach = Reach::NoAnswer;
+                }
                 match called {
-                    Ok(r) => r,
+                    Ok((r, r_reach)) => {
+                        reach = r_reach;
+                        r
+                    }
                     Err(e) if e.downcast_ref::<crate::upstream::TimeoutElapsed>().is_some() => {
                         // An isError the agent can reason about, never a silent
                         // stall — with the shared write-safety guidance.
@@ -292,23 +322,24 @@ impl Surface {
         }
         // Audit: who called what, where it routed, how it went, how long it took,
         // how much came back. Arguments are deliberately NOT logged — they carry
-        // customer data and injected secrets. Guarded, because measuring the
-        // result and resolving the origin are real work on a large payload and
-        // there is nowhere to write them when no audit sink is configured.
+        // customer data and injected secrets; a keyed `args_mac` names the call
+        // without them. Guarded, because measuring the result and resolving the
+        // origin are real work on a large payload and there is nowhere to write
+        // them when no audit sink is configured.
         if self.log.is_some() {
             let b = &self.upstreams[idx];
-            self.log_event(
-                caller,
-                "call",
-                json!({
-                    "tool_id": tool_id, "upstream": b.name(), "origin": b.origin(&original_name),
-                    "is_error": is_error, "cached": from_cache,
-                    "latency_ms": started.elapsed().as_millis() as u64,
-                    "result_bytes": json_len(&result),
-                }),
-            );
+            let mut fields = json!({
+                "tool_id": tool_id, "upstream": b.name(), "origin": b.origin(&original_name),
+                "is_error": is_error, "cached": from_cache,
+                "latency_ms": started.elapsed().as_millis() as u64,
+                "result_bytes": json_len(&result),
+            });
+            if let Some(mac) = args_mac {
+                fields["args_mac"] = json!(mac);
+            }
+            self.log_event(caller, "call", fields);
         }
-        Ok(result)
+        Ok((result, reach))
     }
 
     /// The first exhausted limit for this call, as (what, retry_in_s): the
@@ -331,17 +362,20 @@ impl Surface {
         // different questions for a caller nobody named. See `Caller::rate_key`.
         let who = caller.rate_key();
         let rl = &self.config.rate_limits;
-        // (bucket, limit, what to tell the agent) — one list, so adding a tier
-        // is one entry rather than another copy of the take/refund dance.
+        // (bucket, limit, what to tell the agent, enforced) — one list, so
+        // adding a tier is one entry rather than another copy of the
+        // take/refund dance.
+        let enforce = !rl.report_only;
         let tiers = [
             rl.per_caller.map(|l| {
-                (format!("caller:{who}"), l, format!("caller {who} exceeded {} calls per {}s", l.calls, l.per_s))
+                (format!("caller:{who}"), l, format!("caller {who} exceeded {} calls per {}s", l.calls, l.per_s), enforce)
             }),
             rl.per_tool.map(|l| {
                 (
                     format!("tool:{who}:{tool_id}"),
                     l,
                     format!("caller {who} exceeded {} calls per {}s on {tool_id}", l.calls, l.per_s),
+                    enforce,
                 )
             }),
             overlay.and_then(|o| o.rate_limit).map(|l| {
@@ -349,15 +383,27 @@ impl Surface {
                     format!("overlay:{tool_id}"),
                     l,
                     format!("{tool_id} is limited to {} calls per {}s across all callers", l.calls, l.per_s),
+                    true,
                 )
             }),
         ];
         let mut charged: Vec<(&String, crate::config::Limit)> = Vec::new();
-        for (key, limit, message) in tiers.iter().flatten() {
+        for (key, limit, message, enforced) in tiers.iter().flatten() {
             let Err(retry_in_s) = self.limits.take(key, *limit, now) else {
                 charged.push((key, *limit));
                 continue;
             };
+            // Report-only: the bucket behaves exactly as it would enforced (a
+            // refused take spends nothing), so the would-limit lines are the
+            // ones enforcement would produce.
+            if !enforced {
+                self.log_event(
+                    caller,
+                    "would_rate_limit",
+                    json!({"tool_id": tool_id, "limit": message, "retry_in_s": retry_in_s}),
+                );
+                continue;
+            }
             for (k, l) in charged {
                 self.limits.refund(k, l, now);
             }

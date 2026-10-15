@@ -174,6 +174,11 @@ pub struct RateLimits {
     /// Calls per (caller, tool).
     #[serde(default)]
     pub per_tool: Option<Limit>,
+    /// Count against `per_caller` / `per_tool` but never refuse: a call that
+    /// would have been limited is logged as `would_rate_limit` and goes
+    /// through. Overlay `rate_limit`s are unaffected and still enforce.
+    #[serde(default)]
+    pub report_only: bool,
 }
 
 impl RateLimits {
@@ -181,6 +186,11 @@ impl RateLimits {
     /// by tool across all callers, so it is unaffected by the caller's subject.)
     pub fn any(&self) -> bool {
         self.per_caller.is_some() || self.per_tool.is_some()
+    }
+
+    /// Report-only with something to report on.
+    pub fn report_only_active(&self) -> bool {
+        self.report_only && self.any()
     }
 }
 
@@ -717,6 +727,18 @@ impl Overlay {
 pub struct Scopes {
     #[serde(default)]
     pub rules: Vec<ScopeRule>,
+    /// Evaluate the rules but do not enforce them: every caller sees every
+    /// tool, and a call the rules would refuse is logged as a `would_deny`
+    /// audit event instead. The rollout step before default-deny.
+    #[serde(default)]
+    pub report_only: bool,
+}
+
+impl Scopes {
+    /// Report-only with rules to report on.
+    pub fn report_only_active(&self) -> bool {
+        self.report_only && !self.rules.is_empty()
+    }
 }
 
 /// Static, config-level tool filtering (distinct from per-caller `scopes`).
