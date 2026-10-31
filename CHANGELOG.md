@@ -6,6 +6,27 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-10-31
+
+### Security
+
+- **rustls-webpki 0.103.15 → 0.103.16** for
+  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382)
+  (certificate verification may accept distrusted intermediates). It sits on the
+  TLS path of every outbound HTTPS connection, so upgrade from the 0.2.2 binaries.
+- **webpki-root-certs 1.0.9 → 1.0.11** for
+  [RUSTSEC-2026-0383](https://rustsec.org/advisories/RUSTSEC-2026-0383)
+  (bundled roots allow trust in distrusted emSign intermediates).
+- **tokio 1.53.2 → 1.54.1** for
+  [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386)
+  (`AsyncFd::new` and related constructors violate I/O safety).
+
+### Changed
+
+- Dependencies: rmcp 3.5 → 3.8, hyper-rustls 0.27.9 → 0.27.10, serde_json
+  1.0.151 → 1.0.154, jaq-core 3.1.1 → 3.1.2, jaq-std 3.0.3 → 3.0.4, and a full
+  lockfile refresh of everything else.
+
 ## [0.2.2] — 2026-10-15
 
 ### Added
