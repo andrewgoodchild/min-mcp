@@ -14,6 +14,16 @@ const HTTP_METHODS: &[&str] = &["get", "post", "put", "patch", "delete", "head",
 /// Cap on a $ref expansion chain (ref -> schema -> ref -> ...). Structural
 /// nesting does not count; cycles are cut via the seen-set.
 const MAX_REF_CHAIN: usize = 12;
+/// JSON nodes one resolved schema may hold. Three times the largest real schema
+/// measured (Stripe, 2,978 nodes), so only runaway expansion is cut.
+const MAX_RESOLVED_NODES: usize = 10_000;
+
+/// State of one depth-limited pass of [`Spec::resolve`].
+struct Expansion {
+    limit: usize,
+    budget: usize,
+    cut: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct Operation {
@@ -134,35 +144,71 @@ impl Spec {
         self.by_id.get(op_id).map(|&i| &self.operations[i])
     }
 
-    /// Inline $refs, cutting cycles. `depth` counts ref expansions only.
-    pub fn resolve(&self, node: &Value, depth: usize, seen: &[String]) -> Value {
-        match node {
+    /// Inline $refs, cutting cycles, within [`MAX_RESOLVED_NODES`].
+    ///
+    /// A cycle is only cut along the current path, so a densely cross-linked spec
+    /// re-expands the same schema on every route to it, and the tree grows
+    /// exponentially: Microsoft Graph reached a 165 GB footprint resolving its
+    /// catalog. So expansion deepens one ref level at a time and keeps the deepest
+    /// pass that fits. Shallow passes come first, which means top-level fields always
+    /// survive, and a schema that fits comes out whole.
+    pub fn resolve(&self, node: &Value) -> Value {
+        let mut best = None;
+        for limit in 0..=MAX_REF_CHAIN {
+            let mut pass = Expansion { limit, budget: MAX_RESOLVED_NODES, cut: false };
+            let Some(value) = self.expand(node, 0, &[], &mut pass) else { break };
+            best = Some(value);
+            if !pass.cut {
+                break;
+            }
+        }
+        best.unwrap_or_else(|| node.clone())
+    }
+
+    /// One pass of [`Spec::resolve`]; `None` means the pass ran out of budget.
+    /// `depth` counts ref expansions only.
+    fn expand(&self, node: &Value, depth: usize, seen: &[String], pass: &mut Expansion) -> Option<Value> {
+        pass.budget = pass.budget.checked_sub(1)?;
+        Some(match node {
             Value::Object(map) => {
                 if let Some(Value::String(r)) = map.get("$ref") {
                     if seen.iter().any(|s| s == r) {
-                        return json!({ "$circular": r });
+                        return Some(json!({ "$circular": r }));
                     }
-                    if !r.starts_with("#/") || depth >= MAX_REF_CHAIN {
-                        return node.clone();
+                    if !r.starts_with("#/") {
+                        return Some(node.clone());
+                    }
+                    if depth >= pass.limit {
+                        pass.cut = true;
+                        // the chain cap keeps the raw ref; a size cut says what it left out
+                        return Some(if pass.limit == MAX_REF_CHAIN { node.clone() } else { json!({ "$omitted": r }) });
                     }
                     let mut target = &self.root;
                     for part in r[2..].split('/') {
                         match target.get(part) {
                             Some(t) => target = t,
-                            None => return node.clone(), // dangling
+                            None => return Some(node.clone()), // dangling
                         }
                     }
                     let mut next = seen.to_vec();
                     next.push(r.clone());
-                    return self.resolve(target, depth + 1, &next);
+                    return self.expand(target, depth + 1, &next, pass);
                 }
-                Value::Object(
-                    map.iter().map(|(k, v)| (k.clone(), self.resolve(v, depth, seen))).collect(),
-                )
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (k, v) in map {
+                    out.insert(k.clone(), self.expand(v, depth, seen, pass)?);
+                }
+                Value::Object(out)
             }
-            Value::Array(a) => Value::Array(a.iter().map(|v| self.resolve(v, depth, seen)).collect()),
+            Value::Array(a) => {
+                let mut out = Vec::with_capacity(a.len());
+                for v in a {
+                    out.push(self.expand(v, depth, seen, pass)?);
+                }
+                Value::Array(out)
+            }
             other => other.clone(),
-        }
+        })
     }
 
     /// The request-body schema (the JSON the caller's `body` fills), or null.
@@ -172,7 +218,7 @@ impl Spec {
         let rb = op.raw.get("requestBody").cloned().unwrap_or(Value::Null);
         // `resolve` expands $refs inline (needed for get_tool_details); skipping it
         // keeps load O(op) for huge specs — refs are expanded lazily on demand.
-        let rb = if resolve { self.resolve(&rb, 0, &[]) } else { rb };
+        let rb = if resolve { self.resolve(&rb) } else { rb };
         let content = rb.get("content").and_then(Value::as_object);
         let Some(content) = content else { return Value::Null };
         pick_media(content)
@@ -198,7 +244,7 @@ impl Spec {
     /// array the same way is wrong for one of them.
     pub fn query_styles(&self, op: &Operation) -> HashMap<String, QueryStyle> {
         let raw = op.raw.get("parameters").cloned().unwrap_or(json!([]));
-        let params = self.resolve(&raw, 0, &[]);
+        let params = self.resolve(&raw);
         let empty = Vec::new();
         params
             .as_array()
@@ -271,7 +317,7 @@ impl Spec {
 
     fn build_input_schema(&self, op: &Operation, resolve: bool) -> Value {
         let raw_params = op.raw.get("parameters").cloned().unwrap_or(json!([]));
-        let params = if resolve { self.resolve(&raw_params, 0, &[]) } else { raw_params };
+        let params = if resolve { self.resolve(&raw_params) } else { raw_params };
         let empty = Vec::new();
         let params = params.as_array().unwrap_or(&empty);
 
@@ -304,7 +350,7 @@ impl Spec {
                 // Swagger 2.0 body/form (OpenAPI 3.0 uses requestBody, handled above)
                 "body" => {
                     let s = p.get("schema").cloned().unwrap_or(Value::Null);
-                    body = if resolve { self.resolve(&s, 0, &[]) } else { s };
+                    body = if resolve { self.resolve(&s) } else { s };
                 }
                 "formData" => {
                     form_props.insert(name, param_prop(p));
@@ -606,5 +652,69 @@ mod tests {
             "components": {"schemas": schemas}
         })).unwrap();
         let _ = s.body_schema(s.get("Op").unwrap(), true); // must return, not hang
+    }
+
+    /// Every schema refers to every other, as Graph's entity types do. Cycle cutting
+    /// alone leaves N! paths through 12 schemas, so this hangs without a budget.
+    fn cross_linked() -> Spec {
+        let names: Vec<String> = (0..12).map(|i| format!("S{i}")).collect();
+        let mut schemas = serde_json::Map::new();
+        for name in &names {
+            let props: serde_json::Map<String, Value> = names
+                .iter()
+                .map(|n| (format!("to_{n}"), json!({"$ref": format!("#/components/schemas/{n}")})))
+                .collect();
+            schemas.insert(name.clone(), json!({"type": "object", "properties": props}));
+        }
+        Spec::from_value(json!({
+            "info": {"title": "Linked", "version": "1"},
+            "paths": {"/x": {"post": {"operationId": "Op",
+                "requestBody": {"content": {"application/json": {"schema":
+                    {"$ref": "#/components/schemas/S0"}}}}}}},
+            "components": {"schemas": schemas}
+        }))
+        .unwrap()
+    }
+
+    fn node_count(v: &Value) -> usize {
+        1 + match v {
+            Value::Object(m) => m.values().map(node_count).sum(),
+            Value::Array(a) => a.iter().map(node_count).sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn a_cross_linked_spec_resolves_within_the_budget() {
+        let s = cross_linked();
+        let schema = s.body_schema(s.get("Op").unwrap(), true);
+        assert!(node_count(&schema) <= MAX_RESOLVED_NODES, "{} nodes", node_count(&schema));
+        assert!(schema.to_string().contains("$omitted"), "a size cut must say what it left out");
+    }
+
+    #[test]
+    fn a_size_cut_keeps_every_top_level_field() {
+        let s = cross_linked();
+        let schema = s.body_schema(s.get("Op").unwrap(), true);
+        let fields = schema["properties"].as_object().unwrap();
+        assert_eq!(fields.len(), 12, "the shallow pass must survive a deep one running out");
+    }
+
+    #[test]
+    fn a_schema_within_budget_is_never_marked_omitted() {
+        let s = Spec::from_value(json!({
+            "info": {"title": "Small", "version": "1"},
+            "paths": {"/x": {"post": {"operationId": "Op",
+                "requestBody": {"content": {"application/json": {"schema":
+                    {"$ref": "#/components/schemas/A"}}}}}}},
+            "components": {"schemas": {
+                "A": {"type": "object", "properties": {"b": {"$ref": "#/components/schemas/B"}}},
+                "B": {"type": "object", "properties": {"name": {"type": "string"}}}
+            }}
+        }))
+        .unwrap();
+        let schema = s.body_schema(s.get("Op").unwrap(), true);
+        assert_eq!(schema["properties"]["b"]["properties"]["name"]["type"], "string");
+        assert!(!schema.to_string().contains("$omitted"));
     }
 }

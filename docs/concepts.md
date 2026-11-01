@@ -75,10 +75,12 @@ tiered disclosure: three declarations regardless of upstream size.
   words before stemming. That splitter is load-bearing, not cosmetic — a plain
   Unicode tokenizer *joins* on `_`, which would make every snake_case tool name a
   single opaque token no natural query can match. On top of the lexical score:
-  a damped usage prior counting **successful** calls only (a failing tool can
-  never rise by being retried), a verb-affinity boost that favours the right
-  read/write sibling (a "create" query leans to `Post…` over `Get…`), and a bias
-  toward shorter/canonical ids. Returns ids + one-line summaries; an empty result
+  a query that spells a tool's name returns that tool first, a damped usage prior
+  counts **successful** calls only (a failing tool can never rise by being
+  retried), a verb-affinity boost favours the right read/write sibling (a "create"
+  query leans to `Post…` over `Get…`), and queries of up to 8 words lean toward
+  shorter/canonical ids.
+  Returns ids + one-line summaries; an empty result
   tells the agent to retry with resource/action vocabulary rather than leaving it
   guessing.
 - `get_tool_details(tool_id)` — the full input schema on demand (the source map).

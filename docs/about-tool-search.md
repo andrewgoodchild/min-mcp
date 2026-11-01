@@ -24,9 +24,9 @@ platforms and peers had shipped only afterwards — this page is the result of
 checking. At minimum, the repo is a measured, working reference for the pattern:
 point your coding agent at it and build the same capability into your own stack.
 
-The Anthropic and Codex sections were checked on 2026-08-10 against Anthropic's
-documentation and the `openai/codex` source; "What this means for min-mcp" was
-rechecked on 2026-11-01. Where a claim is inference rather than documentation, it
+The Anthropic section was checked on 2026-08-10 against Anthropic's documentation.
+The Codex section and "What this means for min-mcp" were rechecked on 2026-11-01,
+the Codex section against the `openai/codex` source. Where a claim is inference rather than documentation, it
 says so.
 
 ## Anthropic — the tool search tool
@@ -71,9 +71,11 @@ Codex CLI is open source, so this is observable rather than announced:
 | the per-tool flag | `DynamicToolFunctionSpec { …, defer_loading: bool }` in `codex-rs/protocol/src/dynamic_tools.rs` |
 | how it's described to the model | *"Searches over apps/connectors tool metadata with BM25 and exposes matching tools for the next model call."* |
 
-The search text is built by walking the tool spec including its JSON Schema
-(`append_schema_search_text`), the BM25 index is cached and rebuilt when the tool
-registry changes, and a `limit` parameter caps results. Schema migrations
+For an MCP tool, the search text is its names, server, title, description and
+top-level parameter names (`build_mcp_search_text`). Dynamic and built-in tools walk
+the whole JSON Schema instead (`append_schema_search_text`). The BM25 index is cached
+and rebuilt when the tool registry changes, and `limit` caps results at 8 by default.
+Each hit returns the full tool definition. Schema migrations
 (`0004_thread_dynamic_tools` → `0019_…_defer_loading` → `0026_…_namespace`) show a
 maturing feature rather than an experiment — and it has since graduated past
 optional: the feature flags for it are retained only as removed no-ops, whose own
@@ -91,12 +93,15 @@ differences, both measured on our side:
   fixing this measured **+15 points recall@1** on a snake_case MCP server. No such
   splitting layer is visible in the Codex source ahead of their tokenizer — stated
   as inference from reading, not as a measurement of their binary.
-- **Schema text in the index.** Codex indexes parameter names and descriptions;
-  we measured that three ways on single-API corpora and it lost every time (down
+- **Schema text in the index.** Codex indexes an MCP tool's top-level parameter
+  names; we measured indexing schema text three ways on single-API corpora and it
+  lost every time (down
   to 0.42 recall@1 at worst) — within one REST API, parameter vocabulary is nearly
   uniform (`expand`, `metadata`, `currency`), so it dilutes without discriminating.
   On a federated multi-server surface their choice may well be right; ours is the
   measured choice for the spec-mounting case min-mcp exists for.
+
+[Measurements](measurements.md#compared-with-codex-tool-search) has the head-to-head.
 
 They also carry a *fielded* BM25 (`ext/skills/src/dynamic_skill_selector/fielded_bm25.rs`)
 and a shadow-mode selection experiment, because the `bm25` crate is single-field.

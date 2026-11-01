@@ -279,8 +279,8 @@ fn walk(schema: &Value, depth: usize, w: &mut Walk) {
 /// A parameter schema with no type information at all — no `type`, no nested
 /// shape, no `$ref`/cut-cycle, no enum, no composition. The agent gets a blank.
 fn is_opaque(p: &Value) -> bool {
-    const SIGNALS: [&str; 8] =
-        ["type", "properties", "items", "enum", "$ref", "$circular", "allOf", "oneOf"];
+    const SIGNALS: [&str; 9] =
+        ["type", "properties", "items", "enum", "$ref", "$circular", "$omitted", "allOf", "oneOf"];
     let Some(o) = p.as_object() else { return false };
     !SIGNALS.iter().any(|k| o.contains_key(*k)) && p.get("anyOf").is_none()
 }

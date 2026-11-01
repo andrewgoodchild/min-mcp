@@ -6,6 +6,35 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Densely cross-linked specs no longer exhaust memory.** Passthrough on Microsoft Graph
+  reached a 165 GB footprint and was killed, because one schema could expand exponentially.
+  A resolved schema is now capped at 10,000 nodes: expansion deepens one level at a time,
+  keeps the deepest pass that fits, and marks what it cut with `$omitted`. Top-level fields
+  always survive, and the Stripe, GitHub and NetBox schemas came out unchanged. Startup
+  statistics no longer hold the whole listing in memory, and schemas over 64 KB aren't
+  cached. `minmcp map` on Graph now takes 5 seconds.
+- **`search_tools` puts an exact tool name first.** `GetCharges` could return
+  `GetChargesCharge` above it. A query that spells a tool's name now wins, with or
+  without the upstream prefix.
+- **Corrected the description of Codex search.** For MCP tools it indexes top-level
+  parameter names, not parameter descriptions, and returns 8 results by default.
+
+### Changed
+
+- **`search_tools` returns 20 results by default, up from 10.** On real agent queries over
+  three held-out catalogs, models named the right tool 90.8% of the time instead of 87.5%.
+  The right tool often ranks just past 10, behind near-identical siblings. Results stay
+  around 2.4 KB per search.
+- **Startup warns when passthrough declares over 1,000,000 tokens of tools.** Graph is
+  about 335 million, so three-tool mode remains the way to serve a catalog that size.
+- **Simpler search ranking.** The substring boost is removed, because it stopped helping
+  once the exact-name tier existed. The short-id bias now applies only to queries of up to
+  8 words, which stops it burying specific tools on long queries.
+- **README leads with what deferred loading doesn't cover:** large OpenAPI specs and
+  stacks without native tool search.
+
 ## [0.3.0] — 2026-11-01
 
 ### Added
