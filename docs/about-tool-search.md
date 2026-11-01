@@ -1,6 +1,8 @@
 # About tool search — native, and the proxies before it
 
-Both major agent platforms now search a tool catalog and load definitions on demand.
+Most major agent clients now search a tool catalog and load definitions on demand:
+Anthropic's and OpenAI's platforms, and on top of them clients such as Claude Code,
+Codex and [VS Code](https://code.visualstudio.com/blogs/2026/06/17/improving-token-efficiency-in-github-copilot).
 If you run a handful of ordinary MCP servers, **your client may already solve the
 context-tax problem**, and you should know that before adopting anything. This page
 sets out what they do, verified against primary sources, and where the limits
@@ -22,9 +24,10 @@ platforms and peers had shipped only afterwards — this page is the result of
 checking. At minimum, the repo is a measured, working reference for the pattern:
 point your coding agent at it and build the same capability into your own stack.
 
-Everything here was checked on 2026-08-10 against Anthropic's documentation and the
-`openai/codex` source. Where a claim is inference rather than documentation, it says
-so.
+The Anthropic and Codex sections were checked on 2026-08-10 against Anthropic's
+documentation and the `openai/codex` source; "What this means for min-mcp" was
+rechecked on 2026-11-01. Where a claim is inference rather than documentation, it
+says so.
 
 ## Anthropic — the tool search tool
 
@@ -167,27 +170,51 @@ including request-body encoding chosen from the declared media type — and only
 minifies it. Nothing in either platform does this.
 
 **2. The 10,000-tool ceiling.** A 17,531-operation surface cannot use `defer_loading`
-at all; it exceeds the documented per-request maximum. Behind min-mcp the client sees
-three tools, so no client-side limit applies.
+at all; it exceeds Anthropic's documented per-request maximum. Other clients stop far
+earlier: [VS Code allows 128 tools in a request](https://code.visualstudio.com/docs/chat/chat-tools).
+Behind min-mcp the client sees three tools, so no client-side limit applies.
 
-**3. Context is not payload.** Deferred definitions are still uploaded on every
-request. A proxy that exposes three tools uploads three tool definitions. Whether
-that matters depends on how much you care about request size and upload latency, and
-it matters more the larger the catalog.
+**3. Context is not payload.** On Anthropic's platform, deferred definitions are
+still uploaded on every request; a proxy that exposes three tools uploads three
+tool definitions. This is the weakest of the four. It doesn't generalize to
+client-executed search, where the application holds the catalog, and it only matters
+if you care about request size and upload latency.
 
-**4. Neither platform can fix a tool.** This is the durable one. Codex has
-`tool_filter` for visibility (`codex-mcp/src/connection_manager/tool_catalog.rs`),
-and gateways offer description overrides. But no platform lets you mark an
-undocumented parameter `required`, strip a field so the model *structurally cannot*
-fabricate it, turn an opaque `404` into `{field, allowed_values, fix}`, pin the
-schema an overlay was written against and fail closed on drift, or prove any of it
-with real calls in CI. That is what [overlays](overlays.md) and `minmcp verify` are
-for, and it is the half of the problem the platforms are not converging on.
+**4. Fixing a tool is only partly covered.** This is the durable one, but it is not
+untouched. [Claude Code hooks](https://code.claude.com/docs/en/hooks) can replace a
+tool's arguments (`updatedInput`) and result (`updatedToolOutput`), per client and
+per call; the page didn't confirm the same for MCP tools specifically, though it
+says they raise the same hook events. They don't change what the model reads as the
+tool's description or schema. [FastMCP's `ToolTransform`](https://gofastmcp.com/servers/transforms/tool-transformation)
+reshapes proxied tools in depth, as Python code, and gateways offer description
+overrides. What we haven't found in those is the combination: a declarative patch
+that can mark an undocumented parameter `required`, strip a field so the model
+*structurally cannot* fabricate it, turn an opaque `404` into
+`{field, allowed_values, fix}`, pin the schema it was written against and fail closed
+on drift, and prove all of it with real calls in CI. That is what
+[overlays](overlays.md) and `minmcp verify` are for.
 
-Stated carefully on point 4: we searched the Codex source for `tool_overrides`,
-`description override`, `exclude_tools`, `patch schema` and `annotations override`
-and found nothing. Absent code-search hits are suggestive, not proof — indexing has
-gaps and we may have missed their vocabulary.
+Stated carefully on point 4: that is a statement about what we read, not a survey of
+everything shipped. Absence from docs and code search is suggestive, not proof. And
+whether overlays add task success under native search is a separate, empirical
+question. Our first test found no lift on a well-documented API; see
+[Measurements](measurements.md#overlays-under-native-tool-search).
+
+### What a proxy costs
+
+Search through a proxy isn't free of trade-offs, and the MCP Progressive Disclosure
+working group [sets them out](https://github.com/modelcontextprotocol/progressive-disclosure-wg/blob/main/docs/limits-of-tool-search.md).
+In `three_tool` mode the discovered tools "remain data behind `execute_tool`", so the
+model provider validates only the generic executor's schema and not the real tool's
+arguments. (min-mcp's own preflight validates them, which is a different layer.) A
+client's per-tool permission rules see one tool, `call_tool`, for the same reason.
+The proxy "must own every downstream connection, credential, and MCP feature", and it
+"becomes a new availability and trust boundary."
+
+`mode: passthrough` keeps native calls: each tool is declared under its own name, with
+the upstream's title, annotations, output schema and `_meta` intact, so native search
+and permission rules work on real tools, over overlaid descriptions and schemas.
+That's the shape to use behind a search-capable client.
 
 ## The accuracy question, unresolved
 
@@ -207,9 +234,11 @@ because a blended average hides the only structure that matters:
   ranking deficiency — a tool document is a few id tokens and a one-line summary,
   so a vocabulary-avoiding query has zero term overlap and the candidate set is
   empty. Any BM25-based tool search has this failure mode, including the
-  platforms'; embeddings only dent it (we measured a small significant gain on
-  paraphrases at the cost of a significant regression on verbatim queries, so we
-  ship neither). The production mitigation is the loop: an empty result tells the
+  platforms' BM25 variants. Embeddings only dented it on our corpus (we measured a
+  small significant gain on paraphrases at the cost of a significant regression on
+  verbatim queries, so we ship neither), though VS Code
+  [moved to client-side embedding search](https://code.visualstudio.com/blogs/2026/06/17/improving-token-efficiency-in-github-copilot)
+  and reports it matches intent better. The production mitigation is the loop: an empty result tells the
   agent to re-query with resource/action vocabulary, and the caller is an LLM.
 
 Real traffic sits between the two arms; the adversarial floor is a floor, not an

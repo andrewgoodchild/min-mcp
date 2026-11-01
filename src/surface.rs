@@ -61,8 +61,8 @@ use generators::{fnv1a, resolve_generators, tool_fingerprint};
 use ids::sanitize_name;
 use minify::{budget_truncate, minify_schema, minify_schema_hard, prune_below_depth, truncate_in_place};
 use patch::{apply_field_patches, binding_status};
-use preflight::{preflight_error, structured_field_error_at};
-use results::{apply_response_transform, bad_arg, eval_expect, get_path, json_len, nudge_projection, result_payload, result_text, text_result, transform_result, truncate_result_text, AGENT_RESULT_BUDGET};
+use preflight::{decode_stringified, preflight_error, structured_field_error_at};
+use results::{apply_response_transform, bad_arg, eval_expect, get_path, json_len, nudge_projection, result_payload, result_text, text_result, transform_result, truncate_passthrough_text, truncate_result_text, AGENT_RESULT_BUDGET};
 
 /// Where audit events (NDJSON, one per line) go.
 pub(crate) enum AuditSink {
@@ -150,6 +150,7 @@ impl Surface {
         let mut patched: HashMap<String, Value> = HashMap::new();
         let mut tool_headers: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let mut user_supplied: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut skipped = 0usize;
         for ucfg in &config.upstreams {
             // A fully filtered-out upstream is never spawned/loaded — so an
             // excluded API needs no command and no credentials.
@@ -183,6 +184,7 @@ impl Surface {
                         "optional upstream {:?} unavailable and skipped: {e:#}",
                         ucfg.name
                     );
+                    skipped += 1;
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -303,6 +305,11 @@ impl Surface {
         };
         // Read before `config` is moved into the surface.
         let config_max_concurrent = config.max_concurrent_calls;
+        // Degrading is the point of `optional`, but a proxy with nothing behind
+        // it looks healthy to every client while serving no tools.
+        if skipped > 0 && tools.is_empty() {
+            crate::log_error!("every upstream failed and was skipped as optional: serving an EMPTY tool catalog");
+        }
         let mut surface = Surface {
             shadow,
             config,
@@ -434,20 +441,27 @@ impl Surface {
 
     /// Passthrough mode declares EVERY tool by (sanitized) name; visibility is
     /// applied per caller at list/call time. Three-tool mode declares none —
-    /// the agent reaches them via the meta-tools.
+    /// the agent reaches them via the meta-tools. A tool keeps its upstream name,
+    /// which is what host permission rules are written against; only a name two
+    /// upstreams share takes the `upstream_` prefix, on both sides, so the
+    /// outcome doesn't depend on upstream order.
     fn build_exposed(&mut self) {
-        let ids: Vec<String> = match self.config.mode {
-            Mode::Passthrough => self.tools.iter().map(|t| t.id().to_string()).collect(),
+        let ids: Vec<(String, String)> = match self.config.mode {
+            Mode::Passthrough => self.tools.iter().map(|t| (t.id().to_string(), sanitize_name(&t.name, 0))).collect(),
             Mode::ThreeTool => vec![],
         };
-        for id in ids {
-            let mut name = sanitize_name(&id, 0);
+        let mut uses: HashMap<&str, usize> = HashMap::new();
+        for (_, bare) in &ids {
+            *uses.entry(bare).or_default() += 1;
+        }
+        for (id, bare) in &ids {
+            let mut name = if uses[bare.as_str()] == 1 { bare.clone() } else { sanitize_name(id, 0) };
             if self.exposed.contains_key(&name) {
                 // Reserve room for a "_N" suffix up front so the disambiguated
                 // name is strictly shorter than the 64-char cap — otherwise a
                 // re-truncated name could reproduce the colliding string and
                 // loop forever.
-                let base = sanitize_name(&id, 4);
+                let base = sanitize_name(id, 4);
                 let mut n = 2;
                 loop {
                     name = format!("{base}_{n}");
@@ -457,8 +471,17 @@ impl Surface {
                     n += 1;
                 }
             }
-            self.exposed.insert(name, id);
+            self.exposed.insert(name, id.clone());
         }
+    }
+
+    /// Has an overlay changed what this tool returns? Its upstream `outputSchema`
+    /// then describes a shape the result no longer has, and clients validate
+    /// `structuredContent` against it.
+    fn reshapes_result(&self, tool_id: &str) -> bool {
+        self.config
+            .overlay_for(tool_id)
+            .is_some_and(|o| o.paginate.is_some() || (o.response.applies(false) && !o.response.is_noop()))
     }
 
     fn meta_search(&self) -> Value {
@@ -561,13 +584,18 @@ impl Surface {
         let mut defs: Vec<Value> = Vec::new();
         for (name, id) in &self.exposed {
             if let Some(t) = self.visible_def(caller, id) {
-                let mut desc = t.description.clone();
-                truncate_in_place(&mut desc, 1_000);
-                defs.push(json!({
+                let mut def = json!({
                     "name": name,
-                    "description": desc,
+                    "description": t.description,
                     "inputSchema": self.resolved_schema(t), // resolve $refs on demand
-                }));
+                });
+                if let Some(obj) = def.as_object_mut() {
+                    obj.extend(t.extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    if self.reshapes_result(id) {
+                        obj.remove("outputSchema");
+                    }
+                }
+                defs.push(def);
             }
         }
         defs.extend(self.meta_tool_defs());
@@ -690,7 +718,7 @@ impl Surface {
                     ));
                 };
                 let mut r = self.dispatch(caller, &id, args, &[]).await?;
-                truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
+                truncate_passthrough_text(&mut r);
                 Ok(r)
             }
         }

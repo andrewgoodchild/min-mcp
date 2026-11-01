@@ -93,6 +93,31 @@ pub(super) fn preflight_walk(container: &Value, args: &Value, prefix: &str) -> O
     None
 }
 
+/// Undo a double-encoded argument: models regularly send an object- or
+/// array-typed parameter as a JSON string (`"path_params": "{\"owner\": …}"`).
+/// The intent is unambiguous, and left alone preflight reports the fields inside
+/// it as missing, which the agent can't act on because it did supply them. Only a
+/// string that parses to the declared type is replaced.
+pub(super) fn decode_stringified(schema: &Value, args: &mut Value) {
+    let (Some(props), Some(args)) = (schema.get("properties").and_then(Value::as_object), args.as_object_mut()) else {
+        return;
+    };
+    for (name, pschema) in props {
+        let Some(val) = args.get_mut(name) else { continue };
+        let declared = pschema.get("type").and_then(Value::as_str);
+        if let (Some(text), Some("object" | "array")) = (val.as_str(), declared) {
+            match serde_json::from_str::<Value>(text) {
+                Ok(parsed) if parsed.is_object() && declared == Some("object") => *val = parsed,
+                Ok(parsed) if parsed.is_array() && declared == Some("array") => *val = parsed,
+                _ => continue,
+            }
+        }
+        if declared == Some("object") {
+            decode_stringified(pschema, val);
+        }
+    }
+}
+
 /// Enum membership with JSON-Schema number semantics: `2` and `2.0` are the
 /// same number even though `serde_json::Value` equality says otherwise (a JS or
 /// YAML client that float-encodes an integer is spec-valid, and preflight must

@@ -236,6 +236,11 @@ impl SpecBackend {
                 input_schema: self.spec.tool_input_schema_shallow(op),
                 // GET operations are read-only by HTTP semantics → cacheable.
                 read_only: Some(op.method.eq_ignore_ascii_case("get")),
+                // Only the claim HTTP semantics back; a POST says nothing.
+                extra: match op.method.eq_ignore_ascii_case("get") {
+                    true => serde_json::Map::from_iter([("annotations".to_string(), json!({"readOnlyHint": true}))]),
+                    false => serde_json::Map::new(),
+                },
             })
             .collect()
     }

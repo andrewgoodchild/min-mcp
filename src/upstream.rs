@@ -1,5 +1,7 @@
 //! Stdio MCP client: spawn an upstream server, speak newline-delimited
-//! JSON-RPC, expose initialize / tools/list / tools/call.
+//! JSON-RPC, expose tools/list / tools/call. Dual-era: `server/discover` probes
+//! for the stateless 2026-07-28 revision, and a server that doesn't answer it
+//! gets the `initialize` handshake.
 //!
 //! **Multiplexed.** One reader task per child routes each response to the call
 //! that sent it (by id), so concurrent callers of the same upstream don't queue
@@ -25,6 +27,7 @@ use tokio::time::timeout;
 
 use crate::config::UpstreamConfig;
 use crate::jsonrpc::{self, response_id};
+use crate::modern::{self, Era, RpcError};
 use crate::sync::{lock, read, write};
 
 /// The transport-level ceiling every per-call deadline is clamped to. An overlay
@@ -142,8 +145,9 @@ pub trait McpRpc {
     }
 }
 
-/// Protocol version min-mcp announces to *upstream* servers it proxies. (The
-/// agent-facing server side negotiates versions via rmcp.)
+/// Protocol version min-mcp announces in the legacy `initialize` handshake. (The
+/// agent-facing server side negotiates versions via rmcp; modern upstreams get
+/// [`modern::MODERN_VERSION`].)
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[derive(Debug, Clone)]
@@ -158,7 +162,15 @@ pub struct ToolDef {
     /// The upstream's own read-only signal (`annotations.readOnlyHint` for MCP
     /// tools; `method == GET` for spec operations). Drives read-result caching.
     pub read_only: Option<bool>,
+    /// The tool's other definition fields ([`FORWARDED_FIELDS`]), held verbatim
+    /// so passthrough can hand them to the client.
+    pub extra: serde_json::Map<String, Value>,
 }
+
+/// Definition fields passthrough forwards as the upstream wrote them. An
+/// allowlist: a field min-mcp cannot honour (`execution`) must not be promised
+/// to the client.
+const FORWARDED_FIELDS: [&str; 5] = ["title", "annotations", "outputSchema", "icons", "_meta"];
 
 impl ToolDef {
     pub fn id(&self) -> &str {
@@ -191,6 +203,10 @@ pub fn push_tools_page(
                 .get("annotations")
                 .and_then(|a| a.get("readOnlyHint"))
                 .and_then(Value::as_bool),
+            extra: FORWARDED_FIELDS
+                .iter()
+                .filter_map(|k| t.get(*k).map(|v| (k.to_string(), v.clone())))
+                .collect(),
         });
     }
     result.get("nextCursor").and_then(Value::as_str).map(str::to_string)
@@ -201,8 +217,8 @@ struct Shared {
     name: String,
     writer: tokio::sync::Mutex<ChildStdin>,
     /// request id -> the caller waiting for that response (Ok(result) or
-    /// Err(JSON-RPC error text)).
-    pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>,
+    /// Err(the JSON-RPC error object)).
+    pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, Value>>>>,
     /// Set by the reader on EOF/error; `Upstream::connection` respawns.
     dead: AtomicBool,
     /// Set when the upstream announces `tools/list_changed` (catalog snapshot
@@ -216,6 +232,8 @@ struct Conn {
     shared: Arc<Shared>,
     next_id: AtomicI64,
     reader: tokio::task::JoinHandle<()>,
+    /// Requests carry the modern `_meta`. Set for the probe, then by its verdict.
+    modern: AtomicBool,
 }
 
 impl Drop for Conn {
@@ -227,7 +245,30 @@ impl Drop for Conn {
 }
 
 impl Conn {
-    async fn spawn(cfg: &UpstreamConfig, stale: Arc<AtomicBool>) -> Result<Conn> {
+    /// A connected child, and the era it turned out to be. `known` skips the
+    /// probe on a respawn: the era belongs to the server, not the process.
+    async fn spawn(cfg: &UpstreamConfig, stale: Arc<AtomicBool>, known: Option<Era>) -> Result<(Conn, Era)> {
+        let mut conn = Self::start(cfg, stale.clone()).await?;
+        let era = match known {
+            Some(era) => era,
+            None => {
+                conn.modern.store(true, Ordering::Relaxed);
+                let probe = conn.request("server/discover", json!({}), Some(modern::PROBE_TIMEOUT)).await;
+                modern::classify_probe(&cfg.name, &probe)?
+            }
+        };
+        conn.modern.store(era == Era::Modern, Ordering::Relaxed);
+        if era == Era::Legacy {
+            // A server may crash on a method it doesn't know before `initialize`.
+            if conn.shared.dead.load(Ordering::Relaxed) {
+                conn = Self::start(cfg, stale).await?;
+            }
+            conn.handshake(cfg).await?;
+        }
+        Ok((conn, era))
+    }
+
+    async fn start(cfg: &UpstreamConfig, stale: Arc<AtomicBool>) -> Result<Conn> {
         let command = cfg.command.as_ref().ok_or_else(|| {
             anyhow!(
                 "upstream {} has no `command` (expected an MCP server subprocess; `url` and `spec` are the other kinds)",
@@ -256,8 +297,12 @@ impl Conn {
             stale,
         });
         let reader = tokio::spawn(read_loop(BufReader::new(stdout).lines(), shared.clone()));
-        let conn = Conn { _child: child, shared, next_id: AtomicI64::new(0), reader };
-        conn.request(
+        Ok(Conn { _child: child, shared, next_id: AtomicI64::new(0), reader, modern: AtomicBool::new(false) })
+    }
+
+    /// The legacy `initialize` exchange.
+    async fn handshake(&self, cfg: &UpstreamConfig) -> Result<()> {
+        self.request(
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
@@ -268,8 +313,7 @@ impl Conn {
         )
         .await
         .with_context(|| format!("initializing upstream {}", cfg.name))?;
-        conn.notify("notifications/initialized", json!({})).await?;
-        Ok(conn)
+        self.notify("notifications/initialized", json!({})).await
     }
 
     /// Write one frame. The writer lock makes a frame atomic: two concurrent
@@ -295,6 +339,7 @@ impl Conn {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         lock(&self.shared.pending).insert(id, tx);
+        let params = if self.modern.load(Ordering::Relaxed) { modern::with_meta(params) } else { params };
         let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if let Err(e) = Self::send_line(&self.shared, &frame).await {
             lock(&self.shared.pending).remove(&id);
@@ -302,8 +347,9 @@ impl Conn {
             return Err(e).with_context(|| format!("writing {method} to upstream {}", self.shared.name));
         }
         // The reader may have drained `pending` (child gone) between our
-        // insert and this point — its `dead` store happens after that drain,
-        // so seeing `dead` here means nothing will ever answer us. Without
+        // insert and this point — its `dead` store happens before that drain,
+        // so a failed call always finds it set, and seeing `dead` here means
+        // nothing will ever answer us. Without
         // this check such a call waits out the full deadline for a reply that
         // cannot come, and the agent sees a timeout instead of a dead upstream.
         if self.shared.dead.load(Ordering::Relaxed) {
@@ -314,7 +360,11 @@ impl Conn {
         let wait = async {
             match rx.await {
                 Ok(Ok(v)) => Ok(v),
-                Ok(Err(err)) => Err(anyhow!("upstream {name} error on {method}: {err}")),
+                Ok(Err(error)) => Err(anyhow::Error::new(RpcError {
+                    upstream: name.clone(),
+                    method: method.to_string(),
+                    error,
+                })),
                 Err(_) => Err(anyhow!("upstream {name} closed its stdout")),
             }
         };
@@ -377,12 +427,13 @@ async fn read_loop(mut lines: Lines<BufReader<ChildStdout>>, shared: Arc<Shared>
         let waiting = lock(&shared.pending).remove(&id);
         if let Some(tx) = waiting {
             let outcome = match v.get("error") {
-                Some(e) => Err(e.to_string()),
+                Some(e) => Err(e.clone()),
                 None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
             };
             let _ = tx.send(outcome); // caller may have timed out and left
         }
     }
+    // Before the drain: a caller woken by it reads `dead` to learn why.
     shared.dead.store(true, Ordering::Relaxed);
     let in_flight = std::mem::take(&mut *lock(&shared.pending));
     if in_flight.is_empty() {
@@ -411,12 +462,16 @@ pub struct Upstream {
     respawn: tokio::sync::Mutex<()>,
     stale: Arc<AtomicBool>,
     last_spawn: Mutex<Instant>,
+    /// What the probe found, reused on respawn so a server that stays silent
+    /// on `server/discover` costs its timeout once.
+    era: Era,
 }
 
 impl Upstream {
     pub async fn spawn(cfg: &UpstreamConfig) -> Result<Self> {
         let stale = Arc::new(AtomicBool::new(false));
-        let conn = Conn::spawn(cfg, stale.clone()).await?;
+        let (conn, era) = Conn::spawn(cfg, stale.clone(), None).await?;
+        crate::log_debug!("upstream {} speaks the {era:?} protocol", cfg.name);
         Ok(Upstream {
             name: cfg.name.clone(),
             result_format: cfg.result_format(),
@@ -425,6 +480,7 @@ impl Upstream {
             respawn: tokio::sync::Mutex::new(()),
             stale,
             last_spawn: Mutex::new(Instant::now()),
+            era,
         })
     }
 
@@ -465,7 +521,7 @@ impl Upstream {
             self.cfg.command.as_deref().unwrap_or("")
         );
         *lock(&self.last_spawn) = now;
-        let conn = Conn::spawn(&self.cfg, self.stale.clone())
+        let (conn, _) = Conn::spawn(&self.cfg, self.stale.clone(), Some(self.era))
             .await
             .with_context(|| format!("respawning upstream {}", self.name))?;
         let conn = Arc::new(conn);
@@ -481,7 +537,69 @@ impl McpRpc for Upstream {
 
     async fn rpc(&self, method: &str, params: Value, deadline: Option<Duration>) -> Result<Value> {
         let conn = self.connection().await?;
-        conn.request(method, params, deadline).await
+        let result = conn.request(method, params, deadline).await?;
+        if self.era == Era::Modern {
+            modern::ensure_complete(&self.name, method, &result)?;
+        }
+        Ok(result)
     }
 }
 
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// An upstream running `script` under `sh`.
+    async fn spawn_script(script: &str) -> Result<Upstream> {
+        let yaml = format!("upstreams:\n  - name: u\n    command: sh\n    args: [\"-c\", {}]\n", serde_json::to_string(script)?);
+        Upstream::spawn(&Config::from_yaml(&yaml).expect("config").upstreams[0]).await
+    }
+
+    /// Reply to each line with the same `id`, chosen by the first matching case.
+    const LOOP: &str = r#"while IFS= read -r line; do
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      case "$line" in
+        *'"method":"server/discover"'*) DISCOVER ;;
+        *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n' "$id" ;;
+        *'"method":"tools/list"'*) case "$line" in
+            *_meta*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"modern","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+            *) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"legacy","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+          esac ;;
+      esac
+    done"#;
+
+    async fn listed_by(discover: &str) -> Vec<String> {
+        let up = spawn_script(&LOOP.replace("DISCOVER", discover)).await.expect("spawn");
+        up.list_tools(0).await.expect("list").into_iter().map(|t| t.name).collect()
+    }
+
+    #[tokio::test]
+    async fn a_discover_result_selects_the_modern_era() {
+        let answer = r#"printf '{"jsonrpc":"2.0","id":%s,"result":{"supportedVersions":["2026-07-28"]}}\n' "$id""#;
+        assert_eq!(listed_by(answer).await, ["modern"]);
+    }
+
+    #[tokio::test]
+    async fn an_error_on_the_probe_falls_back_to_the_handshake() {
+        let answer = r#"printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"not initialized"}}\n' "$id""#;
+        assert_eq!(listed_by(answer).await, ["legacy"]);
+    }
+
+    #[tokio::test]
+    async fn silence_on_the_probe_falls_back_to_the_handshake() {
+        assert_eq!(listed_by(":").await, ["legacy"]);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_dies_on_the_probe_is_restarted_for_the_handshake() {
+        // Dies the first time it sees the probe; the retry must not probe again.
+        let mark = std::env::temp_dir().join(format!("minmcp_probe_{}", std::process::id()));
+        let _ = std::fs::remove_file(&mark);
+        let answer = format!("touch {}; exit 1", mark.display());
+        let names = listed_by(&answer).await;
+        let _ = std::fs::remove_file(&mark);
+        assert_eq!(names, ["legacy"]);
+    }
+}

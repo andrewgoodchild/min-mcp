@@ -74,7 +74,7 @@ fn tool_on(idx: usize, id: &str) -> ToolDef {
         description: "d".into(),
         input_schema: json!({"type": "object"}),
         id: id.to_string(),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     }
 }
 
@@ -326,8 +326,8 @@ fn truncate_respects_char_boundaries() {
 #[test]
 fn source_map_covers_every_tool_and_reverses_exposure() {
     let tools = vec![
-        ToolDef { upstream_idx: 0, name: "GetCharges".into(), description: "list charges".into(), input_schema: json!({"type":"object"}), id: "stripe.GetCharges".into(), read_only: None },
-        ToolDef { upstream_idx: 0, name: "PostCustomers".into(), description: "make a customer".into(), input_schema: json!({"type":"object","properties":{"email":{}}}), id: "stripe.PostCustomers".into(), read_only: None },
+        ToolDef { upstream_idx: 0, name: "GetCharges".into(), description: "list charges".into(), input_schema: json!({"type":"object"}), id: "stripe.GetCharges".into(), read_only: None, extra: Default::default() },
+        ToolDef { upstream_idx: 0, name: "PostCustomers".into(), description: "make a customer".into(), input_schema: json!({"type":"object","properties":{"email":{}}}), id: "stripe.PostCustomers".into(), read_only: None, extra: Default::default() },
     ];
     let mut by_id = std::collections::HashMap::new();
     for (i, t) in tools.iter().enumerate() { by_id.insert(t.id().to_string(), i); }
@@ -650,7 +650,7 @@ fn binding_status_detects_broken_changed_ok() {
         description: "".into(),
         input_schema: json!({"type": "object", "properties": {"email": {}}}),
         id: "stripe.PostCustomers".into(),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     };
     let live = tool_fingerprint(&t.description, &t.input_schema);
     let s = &t.input_schema; // binding_status now checks the resolved schema
@@ -705,7 +705,7 @@ async fn observability_logs_search_and_details_events() {
         description: "get x".into(),
         input_schema: json!({"type": "object"}),
         id: "up.GetX".into(),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     }];
     let mut by_id = std::collections::HashMap::new();
     by_id.insert("up.GetX".to_string(), 0);
@@ -815,6 +815,26 @@ fn minify_never_deletes_user_fields_named_like_schema_keywords() {
 }
 
 #[test]
+fn a_double_encoded_object_is_decoded_not_reported_missing() {
+    let schema = json!({"type": "object", "properties": {
+        "path_params": {"type": "object", "properties": {"owner": {"type": "string"}}, "required": ["owner"]},
+        "tags": {"type": "array"},
+        "note": {"type": "string"},
+    }, "required": ["path_params"]});
+    let mut args = json!({"path_params": "{\"owner\": \"octocat\"}", "tags": "[\"a\"]", "note": "{\"stays\": \"text\"}"});
+    decode_stringified(&schema, &mut args);
+    assert_eq!(args["path_params"]["owner"], "octocat");
+    assert_eq!(args["tags"][0], "a");
+    assert!(args["note"].is_string(), "a string parameter is left alone, even when it looks like JSON");
+    assert!(preflight_error(&schema, &args).is_none());
+
+    let mut wrong_shape = json!({"path_params": "[1]"});
+    decode_stringified(&schema, &mut wrong_shape);
+    assert!(wrong_shape["path_params"].is_string(), "only the declared type is accepted");
+    assert!(preflight_error(&schema, &wrong_shape).is_some());
+}
+
+#[test]
 fn preflight_tolerates_nulls_and_alternative_branches() {
     let schema = json!({"type": "object", "properties": {
         "mode": {"type": "string", "enum": ["a", "b"]},
@@ -877,7 +897,7 @@ async fn unknown_tool_error_suggests_near_miss() {
         description: "create a customer".into(),
         input_schema: json!({"type": "object"}),
         id: "stripe.PostCustomers".into(),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     }];
     let mut by_id = std::collections::HashMap::new();
     by_id.insert("stripe.PostCustomers".to_string(), 0);
@@ -896,8 +916,8 @@ async fn unknown_tool_error_suggests_near_miss() {
 #[test]
 fn write_through_busts_only_the_written_upstreams_cache() {
     let tools = vec![
-        ToolDef { upstream_idx: 0, name: "GetA".into(), description: "a".into(), input_schema: json!({}), id: "a.GetA".into(), read_only: Some(true) },
-        ToolDef { upstream_idx: 1, name: "GetB".into(), description: "b".into(), input_schema: json!({}), id: "b.GetB".into(), read_only: Some(true) },
+        ToolDef { upstream_idx: 0, name: "GetA".into(), description: "a".into(), input_schema: json!({}), id: "a.GetA".into(), read_only: Some(true), extra: Default::default() },
+        ToolDef { upstream_idx: 1, name: "GetB".into(), description: "b".into(), input_schema: json!({}), id: "b.GetB".into(), read_only: Some(true), extra: Default::default() },
     ];
     let mut by_id = std::collections::HashMap::new();
     for (i, t) in tools.iter().enumerate() { by_id.insert(t.id().to_string(), i); }
@@ -930,7 +950,7 @@ fn cache_allowed_requires_ttl_and_read_only_signal() {
         description: "get x".into(),
         input_schema: json!({"type": "object"}),
         id: "up.GetX".into(),
-        read_only: Some(true),
+        read_only: Some(true), extra: Default::default(),
     }];
     let mut by_id = std::collections::HashMap::new();
     by_id.insert("up.GetX".to_string(), 0);
@@ -977,7 +997,7 @@ async fn failed_calls_do_not_feed_the_usage_prior() {
             description: "frob the widget".into(),
             input_schema: schema.clone(),
             id: "up.Alpha".into(),
-            read_only: None,
+            read_only: None, extra: Default::default(),
         },
         ToolDef {
             upstream_idx: 0,
@@ -985,7 +1005,7 @@ async fn failed_calls_do_not_feed_the_usage_prior() {
             description: "frob the widget".into(),
             input_schema: schema.clone(),
             id: "up.Zebra".into(),
-            read_only: None,
+            read_only: None, extra: Default::default(),
         },
     ];
     let corpus: Vec<crate::index::IndexedTool> = tools
@@ -1032,7 +1052,7 @@ fn search_k_zero_means_the_default_not_no_matches() {
         description: "get x".into(),
         input_schema: json!({"type": "object"}),
         id: "up.GetX".into(),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     }];
     let mut s = test_surface(cfg, tools);
     s.index = Index::build(&[crate::index::IndexedTool {
@@ -1053,7 +1073,7 @@ async fn rate_limited_calls_are_refused_per_caller_before_preflight() {
         description: "x".into(),
         input_schema: schema.clone(),
         id: "up.X".into(),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     }];
     let mut s = test_surface(cfg, tools);
     s.patched_schemas.insert("up.X".into(), schema); // preflight resolves locally — no backend
@@ -1088,7 +1108,7 @@ async fn a_refused_call_does_not_spend_the_callers_wider_budget() {
         description: "x".into(),
         input_schema: schema.clone(),
         id: format!("up.{id}"),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     };
     let mut s = test_surface(cfg, vec![mk("X"), mk("Y")]);
     for id in ["up.X", "up.Y"] {
@@ -1125,17 +1145,17 @@ async fn a_hidden_passthrough_tool_is_shaped_like_one_that_does_not_exist() {
         description: "get".into(),
         input_schema: json!({"type": "object"}),
         id: "up.GetSecretReport".into(),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     }];
     let mut s = test_surface(Config::from_yaml(yaml).unwrap(), tools);
     s.build_exposed();
 
-    let hidden = s.call(&anon(), "up_GetSecretReport", json!({})).await.unwrap();
+    let hidden = s.call(&anon(), "GetSecretReport", json!({})).await.unwrap();
     let hidden = result_text(&hidden).to_string();
-    let absent = s.call(&anon(), "up_NoSuchTool", json!({})).await.unwrap();
+    let absent = s.call(&anon(), "NoSuchTool", json!({})).await.unwrap();
     let absent = result_text(&absent).to_string();
-    assert!(hidden.starts_with("unknown tool \"up_GetSecretReport\""), "{hidden}");
-    assert!(absent.starts_with("unknown tool \"up_NoSuchTool\""), "{absent}");
+    assert!(hidden.starts_with("unknown tool \"GetSecretReport\""), "{hidden}");
+    assert!(absent.starts_with("unknown tool \"NoSuchTool\""), "{absent}");
     assert!(!hidden.contains("up.GetSecretReport"), "the canonical id must not leak: {hidden}");
     assert!(!hidden.contains("did you mean"), "nor a near-miss naming it: {hidden}");
 
@@ -1149,19 +1169,44 @@ async fn a_hidden_passthrough_tool_is_shaped_like_one_that_does_not_exist() {
 }
 
 #[test]
+fn passthrough_prefixes_only_names_two_upstreams_share() {
+    let tool = |up: &str, name: &str, idx| ToolDef {
+        upstream_idx: idx, name: name.into(), description: "d".into(), input_schema: json!({"type": "object"}),
+        id: format!("{up}.{name}"), read_only: None, extra: Default::default(),
+    };
+    let tools = vec![tool("a", "search", 0), tool("b", "search", 1), tool("a", "only.here", 0)];
+    let mut s = test_surface(Config::from_yaml("mode: passthrough\nupstreams: []\n").unwrap(), tools);
+    s.build_exposed();
+    let names: Vec<&str> = s.exposed.keys().map(String::as_str).collect();
+    assert_eq!(names, ["a_search", "b_search", "only_here"], "both sides of a collision, and nothing else");
+    assert_eq!(s.exposed["only_here"], "a.only.here");
+    assert_eq!(s.source_map(None)["renamed_collisions"], 0, "a prefix is not a disambiguated collision");
+}
+
+#[test]
+fn passthrough_keeps_a_long_description_whole() {
+    let mut t = tool_on(0, "up.Long");
+    t.description = "x".repeat(4_000);
+    let mut s = test_surface(Config::from_yaml("mode: passthrough\nupstreams: []\n").unwrap(), vec![t]);
+    s.build_exposed();
+    let listing = s.list_tools(&anon());
+    assert_eq!(listing["tools"][0]["description"].as_str().unwrap().len(), 4_000, "native search matches on this text");
+}
+
+#[test]
 fn passthrough_listing_is_filtered_per_caller() {
     let yaml = "mode: passthrough\nupstreams: []\nscopes:\n  rules:\n    - scope: read\n      tools: [\"up.Get*\"]\n    - scope: write\n      tools: [\"up.Post*\"]\n";
     let tools = vec![
-        ToolDef { upstream_idx: 0, name: "GetX".into(), description: "get".into(), input_schema: json!({"type": "object"}), id: "up.GetX".into(), read_only: None },
-        ToolDef { upstream_idx: 0, name: "PostY".into(), description: "post".into(), input_schema: json!({"type": "object"}), id: "up.PostY".into(), read_only: None },
+        ToolDef { upstream_idx: 0, name: "GetX".into(), description: "get".into(), input_schema: json!({"type": "object"}), id: "up.GetX".into(), read_only: None, extra: Default::default() },
+        ToolDef { upstream_idx: 0, name: "PostY".into(), description: "post".into(), input_schema: json!({"type": "object"}), id: "up.PostY".into(), read_only: None, extra: Default::default() },
     ];
     let mut s = test_surface(Config::from_yaml(yaml).unwrap(), tools);
     s.build_exposed();
     let names = |c: &Caller| -> Vec<String> {
         s.list_tools(c)["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
     };
-    assert_eq!(names(&Caller::with_scopes(vec!["read".into()])), vec!["up_GetX"]);
-    assert_eq!(names(&Caller::with_scopes(vec!["write".into()])), vec!["up_PostY"]);
+    assert_eq!(names(&Caller::with_scopes(vec!["read".into()])), vec!["GetX"]);
+    assert_eq!(names(&Caller::with_scopes(vec!["write".into()])), vec!["PostY"]);
     assert!(names(&anon()).is_empty(), "no scope, no tools (rules are default-deny)");
     // one surface, two callers, two different listings — the per-request model
     assert_eq!(s.exposed.len(), 2, "the exposed map itself covers every tool");
@@ -1267,7 +1312,7 @@ fn logged_surface(yaml: &str, name: &str) -> (Surface, std::path::PathBuf) {
         description: "x".into(),
         input_schema: schema.clone(),
         id: "up.X".into(),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     }];
     let mut s = test_surface(Config::from_yaml(yaml).unwrap(), tools);
     s.patched_schemas.insert("up.X".into(), schema);
@@ -1337,7 +1382,7 @@ fn the_access_report_shows_each_scopes_reach_and_names_the_gaps() {
         description: "x".into(),
         input_schema: json!({"type": "object"}),
         id: format!("up.{id}"),
-        read_only: None,
+        read_only: None, extra: Default::default(),
     };
     let tools = || vec![mk("GetA"), mk("PostA"), mk("Orphan")];
 

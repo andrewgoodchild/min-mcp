@@ -133,6 +133,38 @@ retrieval configurations against your real traffic without serving them, logging
 the rank each would have given the tool your agent actually called. Retrieval
 claims can then be checked on your workload, not ours.
 
+## Overlays under native tool search
+
+With clients searching catalogs themselves, the question for repair is whether an
+overlay still raises task success. We tested that on 2026-11-01, with the decision rule
+written down before any episode ran: at least +10 points, a bootstrap CI above zero, and
+neither model dropping.
+
+The setup was min-mcp in `passthrough` over the real, read-only GitHub API (634 tools),
+all deferred behind OpenRouter's server-side tool search, with 16 tasks answered from
+live data and checked without an LLM judge. An agent that couldn't see the tasks wrote
+80 overlays from `minmcp lint` findings and the spec. That gave 3 seeds × 2 models × 2
+arms, or 192 episodes.
+
+| | no overlays | overlays |
+|---|---:|---:|
+| verified success, pooled | 81.2% | 76.0% |
+| Claude Haiku 5.5 | 87.5% | 85.4% |
+| Gemini 3.5 Flash-Lite | 75.0% | 66.7% |
+
+**No clear lift:** −5.2 points, 95% CI [−13.5, +2.1]. On the 6 tasks that reached an
+overlaid tool, success was 23 of 72 in both arms. Token totals differed only because of
+runaway episodes on one task, so we claim no saving.
+
+Read it narrowly. This is one upstream, better documented than the long tail, with
+cheap models, one provider's regex search, and too few tasks to resolve a small effect.
+It doesn't show overlays are useless on a badly broken server. It does mean we can't
+claim that overlays raise task success under native search.
+
+The run also exposed a defect it couldn't work around: `passthrough` then capped results
+at 8,000 bytes, and one task's answer sat at byte 9,077, so it failed in every episode in
+both arms. The cap has since been raised to 64,000 bytes, after this run.
+
 ## The harness catches our own overfits
 
 Three features were built, measured, and *removed* because they lost:

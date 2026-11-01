@@ -12,6 +12,8 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"flaky","version":"0"}}}' ;;
     *'"method":"notifications/initialized"'*) : ;;
+    *'"method":"server/discover"'*)
+      emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"method not found"}}' ;;
     *'"method":"ping"'*) emit '{"jsonrpc":"2.0","id":'"$id"',"result":{}}' ;;
     *'"method":"tools/list"'*)
       emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"flip","description":"Flips a coin.","inputSchema":{"type":"object","properties":{}}}]}}' ;;

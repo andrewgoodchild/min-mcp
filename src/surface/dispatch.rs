@@ -81,6 +81,9 @@ impl Surface {
         } else {
             None
         };
+        if let Some(schema) = &preflight_schema {
+            decode_stringified(schema, &mut arguments);
+        }
         // Per-operation overlay headers, with per-request generators resolved fresh
         // for THIS call. `{{hash}}` = an idempotency key derived from the request
         // (identical args → identical key, so an agent retry is de-duplicated); it's

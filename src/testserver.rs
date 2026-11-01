@@ -51,6 +51,11 @@ impl Reply {
         self.headers.push((k.to_string(), v.to_string()));
         self
     }
+    /// Answer with this status, keeping the body.
+    pub fn with_status(mut self, code: u16) -> Self {
+        self.status = code;
+        self
+    }
     /// Hold this request open, so overlapping requests are observable.
     pub fn after(mut self, ms: u64) -> Self {
         self.delay = std::time::Duration::from_millis(ms);

@@ -6,7 +6,16 @@ Both transports are served by the **official MCP SDK**
 ([`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)): min-mcp's surface is
 wrapped behind rmcp's `ServerHandler`, so protocol conformance — version
 negotiation, sessions, SSE, Host-header/DNS-rebinding defence — tracks the SDK
-rather than a bespoke implementation.
+rather than a bespoke implementation. That includes the stateless 2026-07-28
+revision alongside the earlier handshake-based ones.
+
+Upstream connections are min-mcp's own client, and they speak both too. Each upstream
+gets a `server/discover` probe first: a modern server is then used without a handshake
+or session, with the request headers and `x-mcp-header` parameter mirroring that
+revision requires, and anything else falls back to `initialize`. A stdio server that
+ignores the probe costs a 10-second wait at startup. A modern server that needs input
+mid-call (`input_required`) gets an error result, since a headless proxy has no one to
+ask.
 
 The surface is **shared, not locked**. The catalog, search index, schemas, and
 upstream connections are built once and read by every caller concurrently; the
@@ -526,7 +535,9 @@ so you never mint one by hand. See
 - **The catalog is a startup snapshot.** If an upstream announces
   `notifications/tools/list_changed`, min-mcp flags it in `inspect` as
   `upstreams_stale` and logs a warning; picking up the new tools takes a
-  restart.
+  restart. A 2026-07-28 upstream only sends that notification on a
+  `subscriptions/listen` stream, which min-mcp doesn't open, so a change there
+  goes unnoticed until the restart.
 
 ## `scopes` vs `filters`
 

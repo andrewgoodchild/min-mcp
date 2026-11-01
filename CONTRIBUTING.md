@@ -43,10 +43,11 @@ keys beside it. Suites:
 | `tests/http_e2e.rs` | Streamable HTTP: handshake, session, Origin refusal, per-request bearer identity (401 without, two scopes from one process) |
 | `tests/features_e2e.rs` | composites, `verify`, pagination, JWT scopes, preflight opt-out, a dying upstream, `optional` upstreams, strict config |
 | `tests/cli_contract.rs` | flags, exit codes, the startup banner |
+| `tests/modern_protocol.rs` | MCP 2026-07-28 with no `initialize`, served over stdio and HTTP and proxied upstream |
 | `tests/compression.rs` | the compression claim — this one is a published number, keep it honest |
 
-Tests needing `/bin/sh` or `curl` are `cfg(unix)`-gated, so Windows runs 23 of
-the 33 end-to-end tests — `http_e2e.rs` skips entirely. All three platforms are
+Tests needing `/bin/sh` or `curl` are `cfg(unix)`-gated, so Windows runs 25 of
+the 36 end-to-end tests — `http_e2e.rs` skips entirely. All three platforms are
 **blocking** in CI regardless, because `release.yml` publishes a binary for each
 one and none should ship from a tree nothing checked. If you port a fixture to
 Windows, drop its gate.

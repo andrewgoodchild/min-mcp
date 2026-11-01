@@ -1,6 +1,6 @@
 # min-mcp — fix the MCP servers you don't own, and minify them on the way through
 
-[![CI](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml) ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Language](https://img.shields.io/badge/rust-2021-orange) ![MCP](https://img.shields.io/badge/MCP-2025--06--18-6E56CF)
+[![CI](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml) ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Language](https://img.shields.io/badge/rust-2021-orange) ![MCP](https://img.shields.io/badge/MCP-2026--07--28-6E56CF)
 
 A repair-and-minification proxy for [Model Context Protocol](https://modelcontextprotocol.io)
 servers, written in Rust. You don't own the servers your agents depend on, and you
@@ -32,13 +32,17 @@ descriptions routinely diverge from behavior, and by week two of production you
 hit *"errors the model can't act on… tools silently disappearing… responses
 exceeding size limits."* ([StackOne](https://www.stackone.com/blog/mcp-where-its-been-where-its-going/))
 Forking someone else's server means owning their release cadence forever; prompt
-patches rot silently and can't be tested. Nothing in the platforms addresses this:
-clients can now *find* tools well, but none of them can *fix* one.
+patches rot silently and can't be tested. The platforms only partly address this.
+Clients can *find* tools well, and [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+can rewrite a call's arguments and result, but that lives in one client's config.
+[FastMCP's tool transforms](https://gofastmcp.com/servers/transforms/tool-transformation)
+reshape proxied tools, but in Python code. min-mcp's version is a declarative file,
+pinned to the schema it patched and checked against the live upstream.
 
 **2. The context tax — increasingly handled by your client.** Tool definitions are
 loaded into every request, and a typical [5–10 server stack burns 100,000–200,000
 tokens before the user types a character](https://agentmarketcap.ai/blog/2026/04/08/mcp-context-bloat-enterprise-scale-tool-definitions-agent-context-budget).
-Both major clients now defer loading and search on demand, so if you run a handful
+Most major clients now defer loading and search on demand, so if you run a handful
 of ordinary MCP servers, **your client may already cover this** — see
 [About tool search](docs/about-tool-search.md) for what they do and where the
 limits actually bite. min-mcp still matters at the top end: mounting an API that

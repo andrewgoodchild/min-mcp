@@ -1,6 +1,6 @@
 [package]
 name = "min-mcp"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 # MSRV: `str::floor_char_boundary` (surface/minify.rs) is the newest std API in
 # use; older toolchains now fail with a clear "requires rustc 1.91" instead of a
@@ -29,6 +29,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# The `=?base64?…?=` sentinel on 2026-07-28 request headers.
+base64 = "0.22"
 # `env`: lets `--jwt` fall back to MINMCP_JWT so a caller token never has to
 # sit in argv (visible to `ps` and shell history).
 clap = { version = "4", features = ["derive", "env"] }

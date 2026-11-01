@@ -1145,9 +1145,10 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "min-mcp"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bm25",
  "bytes",
  "clap",

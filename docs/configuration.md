@@ -60,7 +60,8 @@ exactly one of `command`, `url`, or `spec`. All share `name` (the prefix for its
 tool ids, e.g. `stripe.PostCustomers`) and `optional`: with `optional: true` an
 upstream that can't be spawned, connected, or listed at startup is skipped with a
 warning instead of failing the whole proxy, and its tools are simply absent
-until the next restart. Off by default, because a missing upstream is usually a
+until the next restart. If that leaves no tools at all, min-mcp logs an error rather
+than a warning. Off by default, because a missing upstream is usually a
 config error you want to hear about.
 
 ### a) MCP server subprocess

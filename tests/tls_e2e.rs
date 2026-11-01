@@ -176,7 +176,7 @@ fn call_as(url: &str, cert: &str, key: &str) -> String {
         .unwrap_or_else(|| panic!("no session id in: {headers}"));
     let session_header = format!("MCP-Session-Id: {session}");
 
-    let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fixture_GetPing","arguments":{}}}"#;
+    let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"GetPing","arguments":{}}}"#;
     let (out, exit) = post(url, body, &tls, &["-H", &session_header]);
     assert_eq!(exit, 0, "the call should complete: {out}");
     out

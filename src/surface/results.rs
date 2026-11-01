@@ -117,8 +117,27 @@ pub(super) const PROJECTION_NUDGE_CHARS: usize = 2_000;
 /// projection have shrunk the payload (so a projected result is never clipped).
 pub(super) const AGENT_RESULT_BUDGET: usize = 8_000;
 
+/// The same bound for a passthrough tool, which is much looser: it has no `fields`
+/// to shrink a result with, so a tight budget makes everything past it unreachable.
+/// (A task's answer at byte 9,077 failed every episode under the agent budget.) It
+/// still stops a 500 KB response flooding the agent's context.
+pub(super) const PASSTHROUGH_RESULT_BUDGET: usize = 64_000;
+
+const TRUNCATED_USE_FIELDS: &str = "\n…[truncated by min-mcp — request fewer fields to see the rest]";
+const TRUNCATED_NARROW_REQUEST: &str =
+    "\n…[truncated by min-mcp — narrow the request (filters, pagination) to see the rest]";
+
 /// Bound each result text block to the agent budget, char-boundary safe.
 pub(super) fn truncate_result_text(result: &mut Value, max: usize) {
+    truncate_blocks(result, max, TRUNCATED_USE_FIELDS);
+}
+
+/// Bound a passthrough result, with advice a tool without `fields` can follow.
+pub(super) fn truncate_passthrough_text(result: &mut Value) {
+    truncate_blocks(result, PASSTHROUGH_RESULT_BUDGET, TRUNCATED_NARROW_REQUEST);
+}
+
+fn truncate_blocks(result: &mut Value, max: usize, notice: &str) {
     let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) else {
         return;
     };
@@ -127,11 +146,7 @@ pub(super) fn truncate_result_text(result: &mut Value, max: usize) {
             continue;
         };
         if text.len() > max {
-            let cut = budget_truncate(
-                text,
-                max,
-                "\n…[truncated by min-mcp — request fewer fields to see the rest]",
-            );
+            let cut = budget_truncate(text, max, notice);
             if let Some(obj) = b.as_object_mut() {
                 obj.insert("text".into(), Value::String(cut));
             }
