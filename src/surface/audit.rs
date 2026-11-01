@@ -37,11 +37,10 @@ impl Surface {
                         t.name.clone(),
                     ),
                 };
-                let sanitized = sanitize_name(t.id(), 0);
                 let exposed_as = name_of.get(t.id()).copied();
-                // a rename happened if this tool is exposed under a name that
-                // isn't its own straight sanitization (disambiguated collision)
-                if exposed_as.map(|n| n != sanitized).unwrap_or(false) {
+                // a rename happened if this tool is exposed under neither its
+                // own name nor its prefixed one (disambiguated collision)
+                if exposed_as.is_some_and(|n| n != sanitize_name(&t.name, 0) && n != sanitize_name(t.id(), 0)) {
                     collisions += 1;
                 }
                 let live_sha = self.origin_sha.get(t.id()).cloned().unwrap_or_default();

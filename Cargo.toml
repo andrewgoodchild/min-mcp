@@ -29,6 +29,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# The `=?base64?…?=` sentinel on 2026-07-28 request headers.
+base64 = "0.22"
 # `env`: lets `--jwt` fall back to MINMCP_JWT so a caller token never has to
 # sit in argv (visible to `ps` and shell history).
 clap = { version = "4", features = ["derive", "env"] }

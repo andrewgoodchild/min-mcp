@@ -1,8 +1,10 @@
 //! Streamable-HTTP MCP client: proxy a *remote* MCP server (one reachable at a
-//! URL, not spawned as a subprocess). Speaks the 2025-06-18 transport — POST
-//! JSON-RPC to the single MCP endpoint, capture the `Mcp-Session-Id` at
-//! initialize and echo it back, accept either an `application/json` reply or a
-//! `text/event-stream` (SSE) one.
+//! URL, not spawned as a subprocess). POSTs JSON-RPC to the single MCP endpoint
+//! and accepts either an `application/json` reply or a `text/event-stream` (SSE)
+//! one. Dual-era: a `server/discover` probe selects the stateless 2026-07-28
+//! revision (self-describing requests, mirrored headers, no session), and a
+//! server that doesn't recognize it gets the 2025-06-18 handshake (capture the
+//! `Mcp-Session-Id` at initialize and echo it back).
 //!
 //! `&self` throughout: reqwest's client is shared, ids are atomic, and the
 //! only awaited shared state (the OAuth token cache) sits behind its own mutex
@@ -10,6 +12,7 @@
 //! (HTTP 404 on a request carrying our session id) is re-initialized once and
 //! the request retried.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 
@@ -20,6 +23,7 @@ use serde_json::{json, Value};
 
 use crate::config::UpstreamConfig;
 use crate::jsonrpc::response_id;
+use crate::modern::{self, Era, ParamHeader, RpcError};
 use crate::oauth::OAuthClient;
 use crate::secrets::Secrets;
 use crate::sync::lock;
@@ -61,6 +65,10 @@ pub struct HttpUpstream {
     reinit: tokio::sync::Mutex<()>,
     next_id: AtomicI64,
     stale: AtomicBool,
+    /// Speak the modern revision. On for the probe, then by its verdict.
+    modern: AtomicBool,
+    /// Each tool's `x-mcp-header` parameters, recorded as tools are listed.
+    param_headers: Mutex<HashMap<String, Vec<ParamHeader>>>,
 }
 
 impl HttpUpstream {
@@ -94,9 +102,21 @@ impl HttpUpstream {
             reinit: tokio::sync::Mutex::new(()),
             next_id: AtomicI64::new(0),
             stale: AtomicBool::new(false),
+            modern: AtomicBool::new(true),
+            param_headers: Mutex::new(HashMap::new()),
         };
-        up.initialize().await?;
+        let probe = up.request_deadline("server/discover", json!({}), Some(modern::PROBE_TIMEOUT)).await;
+        let era = modern::classify_probe(&up.name, &probe)?;
+        up.modern.store(era == Era::Modern, Ordering::Relaxed);
+        crate::log_debug!("upstream {} speaks the {era:?} protocol", up.name);
+        if era == Era::Legacy {
+            up.initialize().await?;
+        }
         Ok(up)
+    }
+
+    fn is_modern(&self) -> bool {
+        self.modern.load(Ordering::Relaxed)
     }
 
     /// Has this upstream announced a catalog change since startup?
@@ -140,20 +160,39 @@ impl HttpUpstream {
         self.initialize().await
     }
 
-    /// Common POST wiring: auth headers, the negotiated session id, and the
-    /// protocol-version header the spec requires on every non-initialize call.
+    /// Common POST wiring: auth headers, then what the era requires. Legacy:
+    /// the negotiated session id and the protocol-version header on every
+    /// non-initialize call. Modern: the version, and the body's method, name
+    /// and marked parameters mirrored for intermediaries.
     fn post(&self, body: &Value) -> reqwest::RequestBuilder {
         let mut req = self
             .client
             .post(&self.url)
             .header(ACCEPT, "application/json, text/event-stream")
-            .header("MCP-Protocol-Version", PROTOCOL_VERSION)
             .json(body);
         for (k, v) in &self.headers {
             req = req.header(k, v.expose_secret());
         }
-        if let Some(sid) = self.session() {
-            req = req.header("Mcp-Session-Id", sid);
+        if !self.is_modern() {
+            req = req.header("MCP-Protocol-Version", PROTOCOL_VERSION);
+            if let Some(sid) = self.session() {
+                req = req.header("Mcp-Session-Id", sid);
+            }
+            return req;
+        }
+        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = body.get("params").unwrap_or(&Value::Null);
+        req = req.header("MCP-Protocol-Version", modern::MODERN_VERSION).header("Mcp-Method", method);
+        if let Some(name) = modern::request_name(method, params) {
+            req = req.header("Mcp-Name", modern::header_value(name));
+            if method == "tools/call" {
+                if let Some(marked) = lock(&self.param_headers).get(name) {
+                    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+                    for (header, value) in modern::param_values(marked, arguments) {
+                        req = req.header(header, value);
+                    }
+                }
+            }
         }
         req
     }
@@ -181,6 +220,7 @@ impl HttpUpstream {
         // The frame is built ONCE and its id rewritten for the retry: cloning
         // the params (tool arguments can be large) on every call, for a branch
         // taken only on an expired session, is pure waste.
+        let params = if self.is_modern() { modern::with_meta(params) } else { params };
         let mut frame = json!({"jsonrpc": "2.0", "id": 0, "method": method, "params": params});
         let seen = self.session();
         match self.request_once(method, &mut frame, deadline).await {
@@ -221,8 +261,9 @@ impl HttpUpstream {
                 return Err(e).with_context(|| format!("POST {method} to {}", self.url));
             }
         };
-        // capture the session id assigned at initialize
-        if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        // capture the session id assigned at initialize; the modern revision
+        // has none, and a stray header must not be echoed back
+        if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()).filter(|_| !self.is_modern()) {
             *lock(&self.session_id) = Some(sid.to_string());
         }
         let is_sse = resp
@@ -237,6 +278,11 @@ impl HttpUpstream {
             return Err(anyhow::Error::new(SessionExpired));
         }
         if !status.is_success() {
+            // A modern server reports version and header failures as a 4xx with
+            // a JSON-RPC error body, and the probe has to read its code.
+            if let Some(error) = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("error").cloned()) {
+                return Err(self.rpc_error(method, error));
+            }
             bail!("upstream {} returned HTTP {status} on {method}: {}", self.name, text.trim());
         }
         // a catalog-change notification can ride along in an SSE reply
@@ -253,10 +299,14 @@ impl HttpUpstream {
             serde_json::from_str::<Value>(&text)
                 .with_context(|| format!("upstream {} sent non-JSON on {method}", self.name))?
         };
-        if let Some(err) = msg.get("error") {
-            bail!("upstream {} error on {method}: {err}", self.name);
+        if let Some(error) = msg.get("error") {
+            return Err(self.rpc_error(method, error.clone()));
         }
         Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    fn rpc_error(&self, method: &str, error: Value) -> anyhow::Error {
+        anyhow::Error::new(RpcError { upstream: self.name.clone(), method: method.to_string(), error })
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -328,7 +378,14 @@ impl crate::upstream::McpRpc for HttpUpstream {
     }
 
     async fn rpc(&self, method: &str, params: Value, deadline: Option<std::time::Duration>) -> Result<Value> {
-        self.request_deadline(method, params, deadline).await
+        let mut result = self.request_deadline(method, params, deadline).await?;
+        if self.is_modern() {
+            modern::ensure_complete(&self.name, method, &result)?;
+            if method == "tools/list" {
+                lock(&self.param_headers).extend(modern::admit_tools(&self.name, &mut result));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -352,10 +409,19 @@ mod tests {
         HttpUpstream::connect(&cfg.upstreams[0], &Secrets::env_only()).await
     }
 
-    /// A well-behaved server: assigns a session at initialize, 202s the
-    /// notification, and answers everything else from `reply`.
+    /// What a legacy server does with a request that has no session.
+    fn legacy_refusal() -> Reply {
+        Reply::json(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#)
+    }
+
+    /// A well-behaved legacy server: refuses the modern probe, assigns a session
+    /// at initialize, 202s the notification, and answers everything else from
+    /// `reply`.
     fn mcp_server(reply: impl Fn(usize, &Received) -> Reply + Send + Sync + 'static) -> impl Fn(usize, &Received) -> Reply + Send + Sync + 'static {
         move |n, got| {
+            if got.body.contains("server/discover") {
+                return legacy_refusal();
+            }
             if got.body.contains(r#""method":"initialize""#) {
                 return Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#)
                     .with_header("Mcp-Session-Id", "sess-1");
@@ -376,11 +442,13 @@ mod tests {
         let up = connect_to(&srv.url(), "").await.expect("connect");
 
         let seen = srv.seen();
-        assert!(seen[0].body.contains(r#""method":"initialize""#), "handshake first");
-        assert!(seen[1].body.contains("notifications/initialized"), "then the notification");
+        assert!(seen[0].body.contains("server/discover"), "the probe comes first");
+        assert!(seen[1].body.contains(r#""method":"initialize""#), "then the handshake");
+        assert!(!seen[1].body.contains("_meta"), "the handshake is plain legacy");
+        assert!(seen[2].body.contains("notifications/initialized"), "then the notification");
         // The session the server assigned must ride every SUBSEQUENT request —
         // an upstream that forgets it gets 404ed on the next call.
-        assert_eq!(seen[1].header("mcp-session-id"), Some("sess-1"), "notification carries the session");
+        assert_eq!(seen[2].header("mcp-session-id"), Some("sess-1"), "notification carries the session");
 
         up.rpc("tools/list", json!({}), None).await.expect("list");
         let seen = srv.seen();
@@ -420,6 +488,9 @@ mod tests {
         // until restart.
         let sessions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let srv = testserver::spawn(move |_, got| {
+            if got.body.contains("server/discover") {
+                return legacy_refusal();
+            }
             if got.body.contains(r#""method":"initialize""#) {
                 let n = sessions.fetch_add(1, Ordering::SeqCst) + 1;
                 return Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#)
@@ -519,6 +590,9 @@ mod tests {
         hold_ms: u64,
     ) -> (testserver::TestServer, std::sync::Arc<crate::surface::Surface>) {
         let srv = testserver::spawn(move |_, got| {
+            if got.body.contains("server/discover") {
+                return legacy_refusal();
+            }
             if got.body.contains(r#""method":"initialize""#) {
                 return Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#)
                     .with_header("Mcp-Session-Id", "s");
@@ -579,6 +653,156 @@ mod tests {
         let (srv, surface) = echo_surface(0, 60).await;
         let peak = peak_under_load(&srv, surface, 8).await;
         assert!(peak > 2, "uncapped calls should overlap; saw a peak of only {peak}");
+    }
+
+    // --- the 2026-07-28 revision ----------------------------------------------
+
+    const DISCOVER: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"}}"#;
+    const TOOLS: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","ttlMs":0,"cacheScope":"private","tools":[
+        {"name":"query","description":"Run a query.","inputSchema":{"type":"object","properties":{"region":{"type":"string","x-mcp-header":"Region"},"sql":{"type":"string"}}}},
+        {"name":"bad","description":"Invalid annotation.","inputSchema":{"type":"object","properties":{"n":{"type":"number","x-mcp-header":"N"}}}}
+    ]}}"#;
+    const CALL: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","content":[{"type":"text","text":"ok"}],"isError":false}}"#;
+
+    /// A modern-only server: `initialize` is an unknown method, and each reply
+    /// offers a session id a modern client must not take up.
+    fn modern_server() -> impl Fn(usize, &Received) -> Reply + Send + Sync + 'static {
+        |_, got| {
+            let reply = if got.body.contains("server/discover") {
+                Reply::json(DISCOVER)
+            } else if got.body.contains(r#""method":"tools/list""#) {
+                Reply::json(TOOLS)
+            } else if got.body.contains(r#""method":"tools/call""#) {
+                Reply::json(CALL)
+            } else {
+                Reply::status(400)
+            };
+            reply.with_header("Mcp-Session-Id", "ignored")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_modern_only_server_is_spoken_to_without_a_handshake() {
+        let srv = testserver::spawn(modern_server()).await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        assert_eq!(up.list_tools(0).await.expect("list").len(), 1);
+        up.call_tool("query", json!({"region": "us-west1", "sql": "select 1"}), None).await.expect("call");
+
+        let seen = srv.seen();
+        assert!(!seen.iter().any(|g| g.body.contains(r#""method":"initialize""#)), "no handshake");
+        for got in &seen {
+            assert_eq!(got.header("mcp-protocol-version"), Some(modern::MODERN_VERSION));
+            assert_eq!(got.header("mcp-session-id"), None, "the revision has no sessions");
+            assert!(got.body.contains("io.modelcontextprotocol/protocolVersion"), "self-describing: {}", got.body);
+        }
+        let call = seen.last().unwrap();
+        assert_eq!(call.header("mcp-method"), Some("tools/call"));
+        assert_eq!(call.header("mcp-name"), Some("query"));
+        assert_eq!(call.header("mcp-param-region"), Some("us-west1"));
+    }
+
+    #[tokio::test]
+    async fn a_tool_with_an_invalid_header_annotation_is_dropped() {
+        let srv = testserver::spawn(modern_server()).await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        let names: Vec<String> = up.list_tools(0).await.expect("list").into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["query"]);
+    }
+
+    #[tokio::test]
+    async fn a_modern_rejection_in_a_400_body_is_not_a_legacy_server() {
+        // Falling back here would send `initialize` to a server without one.
+        let srv = testserver::spawn(|_, _| {
+            Reply::json(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2027-03-01"],"requested":"2026-07-28"}}}"#)
+                .with_status(400)
+        })
+        .await;
+        let err = format!("{:#}", connect_to(&srv.url(), "").await.err().expect("no shared version"));
+        assert!(err.contains("2027-03-01"), "should name what the server supports: {err}");
+        assert_eq!(srv.seen().len(), 1, "no fallback attempt");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_server_that_400s_the_probe_gets_the_handshake() {
+        let srv = testserver::spawn(|_, got| {
+            if got.body.contains("server/discover") {
+                return Reply::status(400);
+            }
+            if got.body.contains(r#""method":"initialize""#) {
+                return Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#)
+                    .with_header("Mcp-Session-Id", "sess-1");
+            }
+            if got.body.contains("notifications/initialized") {
+                return Reply::status(202);
+            }
+            Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#)
+        })
+        .await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        up.rpc("tools/list", json!({}), None).await.expect("list");
+        let last = srv.seen().pop().unwrap();
+        assert_eq!(last.header("mcp-session-id"), Some("sess-1"));
+        assert_eq!(last.header("mcp-protocol-version"), Some(PROTOCOL_VERSION));
+        assert!(!last.body.contains("_meta"), "legacy traffic is unchanged: {}", last.body);
+    }
+
+    #[tokio::test]
+    async fn a_result_asking_for_input_is_an_error_not_an_empty_success() {
+        let srv = testserver::spawn(|_, got| {
+            if got.body.contains("server/discover") {
+                return Reply::json(DISCOVER);
+            }
+            Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"input_required","inputRequests":{}}}"#)
+        })
+        .await;
+        let up = connect_to(&srv.url(), "").await.expect("connect");
+        let err = up.call_tool("query", json!({}), None).await.unwrap_err().to_string();
+        assert!(err.contains("interactive input"), "{err}");
+    }
+
+    // --- passthrough keeps what the upstream declared ---------------------------
+
+    /// A surface over one upstream serving a fully annotated tool.
+    async fn annotated_surface(mode_and_overlays: &str) -> (testserver::TestServer, crate::surface::Surface) {
+        let srv = testserver::spawn(mcp_server(|_, got| {
+            if got.body.contains(r#""method":"tools/list""#) {
+                return Reply::json(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"get_thing","title":"Get thing","description":"Fetch one thing.","inputSchema":{"type":"object","properties":{}},"outputSchema":{"type":"object","properties":{"id":{"type":"string"}}},"annotations":{"readOnlyHint":true,"openWorldHint":false},"_meta":{"vendor/key":1},"execution":{"taskSupport":"required"}}]}}"#,
+                );
+            }
+            Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"id\":\"t1\"}"}],"structuredContent":{"id":"t1"},"isError":false}}"#)
+        }))
+        .await;
+        let yaml = format!("{mode_and_overlays}upstreams:\n  - name: m\n    url: \"{}\"\n", srv.url());
+        let cfg = crate::config::Config::from_yaml(&yaml).expect("config");
+        let surface = crate::surface::Surface::build(cfg, Secrets::env_only()).await.expect("surface");
+        (srv, surface)
+    }
+
+    #[tokio::test]
+    async fn passthrough_forwards_the_upstreams_definition_under_its_own_name() {
+        let (_srv, s) = annotated_surface("mode: passthrough\n").await;
+        let caller = crate::caller::Caller::default();
+        let listing = s.list_tools(&caller);
+        let tool = &listing["tools"][0];
+        assert_eq!(tool["name"], "get_thing");
+        assert_eq!(tool["title"], "Get thing");
+        assert_eq!(tool["annotations"]["readOnlyHint"], json!(true));
+        assert_eq!(tool["outputSchema"]["properties"]["id"]["type"], "string");
+        assert_eq!(tool["_meta"]["vendor/key"], json!(1));
+        assert!(tool.get("execution").is_none(), "a capability min-mcp cannot honour is not promised");
+
+        let result = s.call(&caller, "get_thing", json!({})).await.expect("call");
+        assert_eq!(result["structuredContent"]["id"], "t1", "the output schema's result survives the proxy");
+    }
+
+    #[tokio::test]
+    async fn a_reshaping_overlay_withdraws_the_output_schema_it_invalidates() {
+        let overlays = "mode: passthrough\noverlays:\n  - tool: m.get_thing\n    response:\n      remove: [id]\n";
+        let (_srv, s) = annotated_surface(overlays).await;
+        let listing = s.list_tools(&crate::caller::Caller::default());
+        assert!(listing["tools"][0].get("outputSchema").is_none(), "{listing}");
+        assert_eq!(listing["tools"][0]["annotations"]["readOnlyHint"], json!(true), "the rest still applies");
     }
 
     #[test]

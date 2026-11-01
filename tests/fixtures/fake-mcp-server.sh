@@ -36,6 +36,11 @@ while IFS= read -r line; do
       : # notification: no reply
       ;;
 
+    *'"method":"server/discover"'*)
+      # a legacy server: the probe falls back to initialize
+      emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"method not found"}}'
+      ;;
+
     *'"method":"ping"'*)
       emit '{"jsonrpc":"2.0","id":'"$id"',"result":{}}'
       ;;

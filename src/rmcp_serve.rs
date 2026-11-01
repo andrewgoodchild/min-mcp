@@ -225,8 +225,13 @@ fn collect_valid<T: serde::de::DeserializeOwned>(listing: &Value, key: &str) -> 
         .unwrap_or_default()
 }
 
-/// One `{name, description, inputSchema}` surface tool → rmcp `Tool`.
+/// One surface tool → rmcp `Tool`, with whatever definition fields it carries.
+/// Fields rmcp's typed model refuses degrade to the core three: an upstream's
+/// malformed `annotations` must not cost the agent the tool.
 fn json_to_tool(v: &Value) -> Option<Tool> {
+    if let Ok(tool) = serde_json::from_value::<Tool>(v.clone()) {
+        return Some(tool);
+    }
     let name = v.get("name").and_then(Value::as_str)?.to_string();
     let description = v.get("description").and_then(Value::as_str).unwrap_or("").to_string();
     let schema = v.get("inputSchema").and_then(Value::as_object).cloned().unwrap_or_default();
@@ -696,6 +701,26 @@ fn plain_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_keeps_its_definition_fields_on_the_wire() {
+        let tool = json_to_tool(&json!({
+            "name": "t", "title": "T", "description": "d", "inputSchema": {"type": "object"},
+            "outputSchema": {"type": "object"}, "annotations": {"readOnlyHint": true}, "_meta": {"vendor/key": 1},
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(&tool).unwrap();
+        assert_eq!(wire["title"], "T");
+        assert_eq!(wire["annotations"]["readOnlyHint"], json!(true));
+        assert_eq!(wire["outputSchema"]["type"], "object");
+        assert_eq!(wire["_meta"]["vendor/key"], json!(1));
+    }
+
+    #[test]
+    fn a_malformed_field_costs_the_field_not_the_tool() {
+        let tool = json_to_tool(&json!({"name": "t", "description": "d", "inputSchema": {}, "annotations": "nonsense"}));
+        assert_eq!(tool.unwrap().name, "t");
+    }
     use jsonwebtoken::{encode, EncodingKey, Header};
 
     const SECRET: &str = "test-secret";

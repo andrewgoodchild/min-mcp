@@ -16,6 +16,7 @@ mod jq;
 mod jsonrpc;
 mod lint;
 mod logging;
+mod modern;
 mod oauth;
 mod project;
 mod rmcp_serve;

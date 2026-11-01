@@ -98,7 +98,11 @@ operations or 17,531.
 > **When not to minify.** Three meta-tools have a floor cost of their own
 > (~424 tokens), so below roughly a dozen upstream tools they cost *more* than
 > simply declaring everything. For that case there's `mode: passthrough`, which
-> federates tools directly with no search step. The startup banner tells you
+> federates tools directly with no search step, and it's also the mode to use behind
+> a client with its own tool search. Each tool keeps its upstream name (a name two
+> upstreams share takes an `upstream_` prefix on both) and its title, annotations,
+> output schema and `_meta`. An overlay that reshapes a tool's result withdraws its
+> output schema, which would no longer be true. The startup banner tells you
 > when you're in that regime rather than leaving you to guess — a minifier that
 > can't say when not to minify isn't measuring anything. See
 > [Configuration](configuration.md).

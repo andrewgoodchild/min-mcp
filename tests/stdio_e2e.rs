@@ -331,7 +331,7 @@ fn passthrough_declares_every_tool_and_drops_meta() {
     let mut s = Server::spawn("tests/fixtures/e2e-passthrough.yaml");
     let names = s.tool_names();
     assert_eq!(names.len(), 3, "mini fixture has exactly 3 ops: {names:?}");
-    assert!(names.iter().all(|n| n.starts_with("fixture_")), "{names:?}");
+    assert!(!names.iter().any(|n| n.starts_with("fixture_")), "a unique name stays unprefixed: {names:?}");
     assert!(!names.iter().any(|n| n == "search_tools"), "no meta tools in passthrough");
 }
 

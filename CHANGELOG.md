@@ -6,6 +6,36 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **Upstreams speak MCP 2026-07-28.** Each upstream is probed with `server/discover`
+  and used statelessly if it answers: no handshake or session, `_meta` on every
+  request, and `Mcp-Method`, `Mcp-Name` and `Mcp-Param-*` headers over HTTP. A server
+  that doesn't falls back to `initialize`, so existing upstreams keep working. Before
+  this, a modern-only upstream failed at startup, and with `optional: true` it was
+  skipped. The agent-facing side already spoke this revision through rmcp; tests now
+  pin that.
+- **An upstream's `input_required` result is an error**, not an empty success.
+- **Spec tools from GET operations declare `readOnlyHint`** in passthrough.
+- **Double-encoded arguments are decoded.** A model that sends an object or array
+  parameter as a JSON string used to get `missing_required_field` for fields it had
+  supplied, and retried the same call. Such a string now becomes the declared type.
+- min-mcp logs an error when skipping `optional` upstreams leaves no tools at all.
+
+### Changed
+
+- **Passthrough keeps tool names.** A tool is declared as `get_thing`, not
+  `upstream_get_thing`; only a name two upstreams share is prefixed, on both sides.
+  This renames tools, so check any client permission rules written against the old
+  names. Tool ids (`upstream.get_thing`), and so scopes, overlays and audit, don't
+  change.
+- **Passthrough keeps tool definitions.** `title`, `annotations`, `outputSchema`,
+  `icons` and `_meta` now reach the client, and descriptions are no longer capped at
+  1,000 characters. An overlay that reshapes a tool's result withdraws its
+  `outputSchema`.
+- Corrected the README and About tool search, which overstated what platforms can't
+  do, and added what a proxy costs.
+
 ## [0.2.3] — 2026-10-31
 
 ### Security
