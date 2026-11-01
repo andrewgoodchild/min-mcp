@@ -1,6 +1,6 @@
 [package]
 name = "min-mcp"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 # MSRV: `str::floor_char_boundary` (surface/minify.rs) is the newest std API in
 # use; older toolchains now fail with a clear "requires rustc 1.91" instead of a

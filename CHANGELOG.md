@@ -6,6 +6,8 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-01
+
 ### Added
 
 - **Upstreams speak MCP 2026-07-28.** Each upstream is probed with `server/discover`
