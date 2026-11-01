@@ -102,7 +102,8 @@ operations or 17,531.
 > a client with its own tool search. Each tool keeps its upstream name (a name two
 > upstreams share takes an `upstream_` prefix on both) and its title, annotations,
 > output schema and `_meta`. An overlay that reshapes a tool's result withdraws its
-> output schema, which would no longer be true. The startup banner tells you
+> output schema, which would no longer be true. Results are capped at 64,000 bytes, since
+> passthrough tools have no `fields` to project with. The startup banner tells you
 > when you're in that regime rather than leaving you to guess — a minifier that
 > can't say when not to minify isn't measuring anything. See
 > [Configuration](configuration.md).

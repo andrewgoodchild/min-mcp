@@ -161,9 +161,9 @@ cheap models, one provider's regex search, and too few tasks to resolve a small 
 It doesn't show overlays are useless on a badly broken server. It does mean we can't
 claim that overlays raise task success under native search.
 
-The run also exposed a defect it couldn't work around: `passthrough` caps results at
-8,000 bytes, and one task's answer sat at byte 9,077, so it failed in every episode in
-both arms.
+The run also exposed a defect it couldn't work around: `passthrough` then capped results
+at 8,000 bytes, and one task's answer sat at byte 9,077, so it failed in every episode in
+both arms. The cap has since been raised to 64,000 bytes, after this run.
 
 ## The harness catches our own overfits
 

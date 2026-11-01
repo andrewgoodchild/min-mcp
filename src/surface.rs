@@ -62,7 +62,7 @@ use ids::sanitize_name;
 use minify::{budget_truncate, minify_schema, minify_schema_hard, prune_below_depth, truncate_in_place};
 use patch::{apply_field_patches, binding_status};
 use preflight::{decode_stringified, preflight_error, structured_field_error_at};
-use results::{apply_response_transform, bad_arg, eval_expect, get_path, json_len, nudge_projection, result_payload, result_text, text_result, transform_result, truncate_result_text, AGENT_RESULT_BUDGET};
+use results::{apply_response_transform, bad_arg, eval_expect, get_path, json_len, nudge_projection, result_payload, result_text, text_result, transform_result, truncate_passthrough_text, truncate_result_text, AGENT_RESULT_BUDGET};
 
 /// Where audit events (NDJSON, one per line) go.
 pub(crate) enum AuditSink {
@@ -718,7 +718,7 @@ impl Surface {
                     ));
                 };
                 let mut r = self.dispatch(caller, &id, args, &[]).await?;
-                truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
+                truncate_passthrough_text(&mut r);
                 Ok(r)
             }
         }

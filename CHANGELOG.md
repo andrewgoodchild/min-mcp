@@ -33,6 +33,9 @@ All notable changes to min-mcp. Format loosely follows
   `icons` and `_meta` now reach the client, and descriptions are no longer capped at
   1,000 characters. An overlay that reshapes a tool's result withdraws its
   `outputSchema`.
+- **Passthrough results are capped at 64,000 bytes, not 8,000**, and the truncation
+  notice no longer recommends `fields`, which passthrough tools don't have. An answer
+  past the old cap was unreachable. `three_tool` keeps its 8,000-byte budget.
 - Corrected the README and About tool search, which overstated what platforms can't
   do, and added what a proxy costs.
 

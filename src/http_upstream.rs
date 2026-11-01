@@ -805,6 +805,35 @@ mod tests {
         assert_eq!(listing["tools"][0]["annotations"]["readOnlyHint"], json!(true), "the rest still applies");
     }
 
+    #[tokio::test]
+    async fn a_passthrough_result_is_bounded_only_where_it_must_be() {
+        // `size` bytes of payload, so one upstream serves both sides of the bound.
+        let srv = testserver::spawn(mcp_server(|_, got| {
+            if got.body.contains(r#""method":"tools/list""#) {
+                return Reply::json(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read","description":"d","inputSchema":{"type":"object","properties":{"size":{"type":"integer"}}}}]}}"#,
+                );
+            }
+            let size = if got.body.contains("9077") { 9_077 } else { 200_000 };
+            let text = "x".repeat(size);
+            Reply::json(format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":"{text}"}}],"isError":false}}}}"#))
+        }))
+        .await;
+        let yaml = format!("mode: passthrough\nupstreams:\n  - name: m\n    url: \"{}\"\n", srv.url());
+        let cfg = crate::config::Config::from_yaml(&yaml).expect("config");
+        let s = crate::surface::Surface::build(cfg, Secrets::env_only()).await.expect("surface");
+        let caller = crate::caller::Caller::default();
+        let text = |v: Value| v["content"][0]["text"].as_str().unwrap().to_string();
+
+        let past_the_old_budget = text(s.call(&caller, "read", json!({"size": 9077})).await.expect("call"));
+        assert_eq!(past_the_old_budget.len(), 9_077, "the agent budget must not apply here");
+
+        let huge = text(s.call(&caller, "read", json!({"size": 200000})).await.expect("call"));
+        assert!(huge.len() < 70_000, "still bounded: {}", huge.len());
+        assert!(huge.contains("narrow the request"), "needs advice a passthrough tool can follow");
+        assert!(!huge.contains("fewer fields"), "passthrough has no `fields`");
+    }
+
     #[test]
     fn parses_response_from_sse_frames() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
