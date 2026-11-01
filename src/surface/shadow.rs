@@ -99,8 +99,8 @@ impl Shadow {
             // retrieval difference. Without this row, every served-vs-challenger
             // delta silently mixes the two.
             ("baseline", IndexOptions::default()),
-            // Plain BM25 — what both platforms serve. Tests whether our four rerank
-            // layers earn their keep on real queries, or just on our fixtures.
+            // Plain BM25 — what both platforms serve. Tests whether our rerank layers
+            // earn their keep on real queries, or just on our fixtures.
             ("plain_bm25", IndexOptions { rerank: false, ..IndexOptions::default() }),
             // The pre-2026-08-11 behaviour: id and summary repeated to fake field
             // weights. Kept as a challenger because it *lost* to flat indexing and we

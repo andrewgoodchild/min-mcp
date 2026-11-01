@@ -1043,6 +1043,52 @@ async fn failed_calls_do_not_feed_the_usage_prior() {
     );
 }
 
+/// Thirty tools that all match, so only the default length can limit the list.
+fn surface_of_thirty(mode: &str) -> Surface {
+    let cfg: Config = Config::from_yaml(&format!("mode: {mode}\nupstreams: []\n")).unwrap();
+    let tools: Vec<ToolDef> = (0..30)
+        .map(|i| ToolDef {
+            upstream_idx: 0,
+            name: format!("GetWidget{i}"),
+            description: "get a widget".into(),
+            input_schema: json!({"type": "object"}),
+            id: format!("up.GetWidget{i}"),
+            read_only: None, extra: Default::default(),
+        })
+        .collect();
+    let mut s = test_surface(cfg, tools);
+    s.index = Index::build(
+        &(0..30)
+            .map(|i| crate::index::IndexedTool {
+                id: format!("up.GetWidget{i}"),
+                description: "get a widget".into(),
+                params: String::new(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    s.build_exposed();
+    s
+}
+
+#[test]
+fn search_returns_twenty_results_by_default() {
+    let s = surface_of_thirty("three_tool");
+    let (_, served) = s.search_text(&Caller::default(), "get a widget", 0);
+    assert_eq!(served.len(), DEFAULT_SEARCH_K);
+    assert_eq!(DEFAULT_SEARCH_K, 20);
+}
+
+/// `stats` counts definitions one at a time, so a huge catalog is never held whole.
+/// The count must still equal the size of the listing it stands in for.
+#[test]
+fn stats_measure_the_listing_without_building_it() {
+    let s = surface_of_thirty("passthrough");
+    let caller = Caller::default();
+    let stats = s.stats(&caller);
+    assert_eq!(stats["est_tokens_minified"], json_len(&s.list_tools(&caller)) / 4);
+    assert_eq!(stats["surface_tools"], 30);
+}
+
 #[test]
 fn search_k_zero_means_the_default_not_no_matches() {
     let cfg: Config = Config::from_yaml("mode: three_tool\nupstreams: []\n").unwrap();

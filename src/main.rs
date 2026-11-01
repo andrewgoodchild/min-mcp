@@ -44,6 +44,9 @@ use config::Config;
 use secrets::Secrets;
 use surface::Surface;
 
+/// Tool definitions above this size can't fit any client's context window.
+const PASSTHROUGH_WARN_TOKENS: u64 = 1_000_000;
+
 #[derive(Parser)]
 #[command(name = "minmcp", version, about = "Minify your MCPs", disable_help_subcommand = true)]
 struct Cli {
@@ -164,7 +167,7 @@ enum Cmd {
         common: Common,
         /// What you are trying to do, e.g. "create a customer".
         query: String,
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "20")]
         k: usize,
     },
     /// Print a tool's full description and input schema (like `--help` for a tool).
@@ -466,6 +469,12 @@ fn print_serve_banner(surface: &Surface, caller: &Caller) {
         "min-mcp: {} upstream tool(s) across {} upstream(s) → {} surface tool(s); ~{} tokens vs {bound}{} raw ({bound}{ratio})",
         s["upstream_tools"], s["upstreams_active"], s["surface_tools"], min, raw
     );
+    if s["mode"] == "passthrough" && min >= PASSTHROUGH_WARN_TOKENS {
+        eprintln!(
+            "min-mcp: NOTE — passthrough declares ~{min} tokens of tools, far more than any \
+             client can load; remove `mode: passthrough` to serve three searchable tools"
+        );
+    }
     if s["mode"] == "three_tool" && exact && min >= raw && raw > 0 {
         eprintln!(
             "min-mcp: NOTE — at this size the minified surface is not smaller than declaring \

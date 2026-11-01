@@ -1,16 +1,17 @@
-# min-mcp — fix the MCP servers you don't own, and minify them on the way through
+# min-mcp — make large OpenAPI specs usable by agents, and add tool search to stacks without it
 
 [![CI](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andrewgoodchild/min-mcp/actions/workflows/ci.yml) ![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Language](https://img.shields.io/badge/rust-2021-orange) ![MCP](https://img.shields.io/badge/MCP-2026--07--28-6E56CF)
 
-A repair-and-minification proxy for [Model Context Protocol](https://modelcontextprotocol.io)
-servers, written in Rust. You don't own the servers your agents depend on, and you
-can't edit them — so today you fork them, or paper over their flaws in every
-agent's prompt. min-mcp patches them *as they pass through*: a versioned,
-drift-checked **overlay** you can prove with `minmcp verify` in CI. On the way
-through it also minifies the surface, so a 17,000-operation API arrives as three
-searchable tools instead of a context bill. And it runs where your agents run:
-behind the gateway you already have, with a caller identity per request, scopes
-and rate limits per caller, and an audit line per call.
+A proxy for [Model Context Protocol](https://modelcontextprotocol.io) servers and
+OpenAPI specs, written in Rust. Deferred loading in modern clients covers a handful
+of ordinary MCP servers. It doesn't cover a large API with no MCP server, or a stack
+with no native tool search. min-mcp handles both: it mounts an OpenAPI spec as MCP
+tools, and a 17,000-operation API arrives as three searchable tools instead of a
+context bill. **Overlays** fix what's wrong on the way through: versioned,
+drift-checked patches that repair tools you can't edit and make a spec more usable,
+proven with `minmcp verify` in CI. And it runs where your agents run: behind the
+gateway you already have, with a caller identity per request, scopes and rate limits
+per caller, and an audit line per call.
 
 ```
                           ┌─ overlay: patch schemas, rewrite errors, reshape responses

@@ -26,8 +26,11 @@ use crate::sync::{lock, read, write};
 use crate::upstream::{ToolDef, Upstream};
 
 const MAX_DETAIL_CHARS: usize = 20_000;
-const DEFAULT_SEARCH_K: usize = 10;
+const DEFAULT_SEARCH_K: usize = 20;
 const MAX_NAME_LEN: usize = 64;
+/// Largest resolved schema worth keeping: a runaway one costs far more to hold than
+/// to resolve again.
+const MAX_CACHED_SCHEMA_BYTES: usize = 64_000;
 
 mod audit;
 mod breaker;
@@ -490,7 +493,7 @@ impl Surface {
             "description": "Search every available tool by task description (e.g. \"create a customer\"). Returns matching tool ids with one-line summaries. Call get_tool_details next for the exact input schema.",
             "inputSchema": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "What you are trying to do."},
-                "k": {"type": "integer", "description": "Max results (default 10)."}
+                "k": {"type": "integer", "description": "Max results (default 20)."}
             }, "required": ["query"]}
         })
     }
@@ -565,7 +568,9 @@ impl Surface {
             return c.clone();
         }
         let v = self.raw_resolved(t);
-        write(&self.resolved_cache).insert(t.id().to_string(), v.clone());
+        if json_len(&v) <= MAX_CACHED_SCHEMA_BYTES {
+            write(&self.resolved_cache).insert(t.id().to_string(), v.clone());
+        }
         v
     }
 
@@ -582,6 +587,13 @@ impl Surface {
     /// The tools/list result `caller` sees.
     pub fn list_tools(&self, caller: &Caller) -> Value {
         let mut defs: Vec<Value> = Vec::new();
+        self.for_each_tool_def(caller, |def| defs.push(def));
+        json!({"tools": defs})
+    }
+
+    /// Each definition `tools/list` declares, one at a time, so a caller that only
+    /// measures them doesn't hold a huge catalog in memory.
+    fn for_each_tool_def(&self, caller: &Caller, mut visit: impl FnMut(Value)) {
         for (name, id) in &self.exposed {
             if let Some(t) = self.visible_def(caller, id) {
                 let mut def = json!({
@@ -595,11 +607,10 @@ impl Surface {
                         obj.remove("outputSchema");
                     }
                 }
-                defs.push(def);
+                visit(def);
             }
         }
-        defs.extend(self.meta_tool_defs());
-        json!({"tools": defs})
+        self.meta_tool_defs().into_iter().for_each(visit);
     }
 
     /// Guidance appended to unknown-tool errors — never names a tool the

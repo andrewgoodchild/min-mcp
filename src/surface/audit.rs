@@ -246,9 +246,12 @@ impl Surface {
                 t.description.len() + schema_len + t.name.len()
             })
             .sum();
-        let minified = self.list_tools(caller);
-        let minified_count = minified["tools"].as_array().map(Vec::len).unwrap_or(0);
-        let min_chars = json_len(&minified);
+        let mut minified_count = 0;
+        let mut min_chars = r#"{"tools":[]}"#.len();
+        self.for_each_tool_def(caller, |def| {
+            min_chars += json_len(&def) + usize::from(minified_count > 0);
+            minified_count += 1;
+        });
         // Upstreams that announced tools/list_changed since startup: their
         // catalog here is a stale snapshot until the proxy restarts.
         let stale: Vec<&str> = self.upstreams.iter().filter(|b| b.stale()).map(Backend::name).collect();

@@ -13,10 +13,12 @@
 //!    approximated with a 12-word stop list and an `ends_with('s')` heuristic.
 //! 2. **Field weighting by repetition** — ids matter more than prose, but the
 //!    crate indexes one flat field, so weight is expressed by repeating text.
-//! 3. **Four rerank layers** over the crate's candidates: verb affinity, exact
-//!    substring, a damped usage prior, and a short-id tiebreak. These operate on
+//! 3. **Three rerank layers** over the crate's candidates: verb affinity, a damped
+//!    usage prior, and a short-id tiebreak for terse queries. These operate on
 //!    *raw* (unstemmed) tokens, because the stemmer maps `create`→`creat` and
 //!    `update`→`updat`, which would never match the affinity table's literals.
+//! 4. **An exact-name tier** above all scoring: a query that spells a tool's name
+//!    returns that tool first, whatever its siblings score.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
@@ -36,10 +38,10 @@ const B: f32 = 0.75;
 const USAGE_DAMP: f64 = 0.15;
 /// Multiplier when a query verb's affinity token appears in the tool id.
 const VERB_BOOST: f64 = 1.3;
-/// Multiplier when the whole normalized query is a substring of the normalized
-/// tool id — "post customers" → PostCustomers. A near-exact name reference
-/// should beat sibling tools that merely share resource words.
-const EXACT_SUBSTRING_BOOST: f64 = 1.5;
+/// Longest query, in words, that gets the short-id tiebreak. A terse query usually
+/// means the canonical operation; a long one has said which variant it wants, and
+/// favouring short ids there costs recall on description-style queries.
+const SHORT_QUERY_WORDS: usize = 8;
 /// Weighted first-line-of-description cap, standing in for the (absent) OpenAPI
 /// summary field, so one giant paragraph can't dominate the index.
 const SUMMARY_CAP: usize = 200;
@@ -61,8 +63,8 @@ const PARAMS_DEPTH: usize = 3;
 /// second retriever implementation to keep in sync — see `surface/shadow.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexOptions {
-    /// Apply the four rerank layers (verb affinity, exact substring, usage prior,
-    /// short-id tiebreak). Off = plain BM25, which is what Codex serves.
+    /// Apply the exact-name tier and the rerank layers (verb affinity, short-id
+    /// tiebreak, usage prior). Off = plain BM25, which is what Codex serves.
     pub rerank: bool,
     /// Index parameter names from the input schema, weighted below the description.
     /// Rejected on a single-API benchmark (it cost 16 points of recall@1 on Stripe,
@@ -106,8 +108,8 @@ const VERB_AFFINITY: &[(&[&str], &[&str])] = &[
     (&["list", "get", "find", "search", "show", "retrieve"], &["list", "get", "find", "search", "show", "retrieve"]),
 ];
 
-/// Lowercase alphanumerics only — the ONE normal form shared by the search
-/// exact-substring boost and the near-miss matcher (they must agree).
+/// Lowercase alphanumerics only — the ONE normal form shared by the exact-name
+/// tier and the near-miss matcher (they must agree).
 pub(crate) fn normalize_id(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
@@ -186,9 +188,9 @@ fn raw_tokens(text: &str) -> Vec<String> {
 /// top-level parameters — the ones a caller actually names — survive the cap.
 ///
 /// Only used when [`IndexOptions::params`] is set. Anthropic's tool search covers
-/// "argument names and argument descriptions" and Codex walks the schema in
-/// `append_schema_search_text`; descriptions are deliberately excluded here because
-/// including them was the variant that lost worst on Stripe.
+/// "argument names and argument descriptions", and Codex indexes an MCP tool's
+/// top-level property names in `build_mcp_search_text`; descriptions are deliberately
+/// excluded here because including them was the variant that lost worst on Stripe.
 pub fn schema_param_text(schema: &serde_json::Value) -> String {
     let mut out = String::new();
     let mut level = vec![schema];
@@ -259,7 +261,6 @@ struct Meta {
     /// deduped raw id tokens, for verb-affinity matching. Only id tokens: a
     /// description containing "create" must not trigger the boost.
     id_token_set: HashSet<String>,
-    norm_id: String,
 }
 
 /// One entry in the search corpus. A struct rather than a tuple because the texts
@@ -276,6 +277,9 @@ pub struct IndexedTool {
 pub struct Index {
     engine: SearchEngine<String, u32, ToolTokenizer>,
     meta: HashMap<String, Meta>,
+    /// Normalized names to ids, with and without the upstream prefix. Several ids
+    /// can share a name across upstreams.
+    exact: HashMap<String, Vec<String>>,
     /// The usage prior — the one piece of the index that changes after build.
     /// An `RwLock`, so concurrent searches read it in parallel; only recording
     /// a successful call takes the write side, and briefly.
@@ -292,16 +296,17 @@ impl Index {
     pub fn build_with(tools: &[IndexedTool], opts: IndexOptions) -> Self {
         let mut docs: Vec<bm25::Document<String>> = Vec::with_capacity(tools.len());
         let mut meta = HashMap::with_capacity(tools.len());
+        let mut exact: HashMap<String, Vec<String>> = HashMap::new();
         for IndexedTool { id: tool_id, description, params } in tools {
             let id_toks = raw_tokens(tool_id);
             meta.insert(
                 tool_id.clone(),
-                Meta {
-                    id_token_count: id_toks.len() as f64,
-                    id_token_set: id_toks.into_iter().collect(),
-                    norm_id: normalize_id(tool_id),
-                },
+                Meta { id_token_count: id_toks.len() as f64, id_token_set: id_toks.into_iter().collect() },
             );
+            exact.entry(normalize_id(tool_id)).or_default().push(tool_id.clone());
+            if let Some((_, name)) = tool_id.split_once('.') {
+                exact.entry(normalize_id(name)).or_default().push(tool_id.clone());
+            }
             let params = if opts.params { params.as_str() } else { "" };
             docs.push(bm25::Document::new(
                 tool_id.clone(),
@@ -328,7 +333,7 @@ impl Index {
             .build()
         };
 
-        Index { engine, meta, usage: RwLock::new(HashMap::new()), opts }
+        Index { engine, meta, exact, usage: RwLock::new(HashMap::new()), opts }
     }
 
     pub fn record_use(&self, tool_id: &str) {
@@ -354,9 +359,23 @@ impl Index {
         want
     }
 
+    /// Move tools the query names exactly to the front. Works from the name map, not
+    /// the hits, so a tool whose name is all stop words is still found. The score is
+    /// the best in the list, so scores stay non-increasing.
+    fn promote_exact(&self, q_norm: &str, scored: &mut Vec<(String, f64)>) {
+        let Some(ids) = self.exact.get(q_norm) else { return };
+        let top = scored.first().map_or(1.0, |hit| hit.1);
+        scored.retain(|hit| !ids.contains(&hit.0));
+        let mut front = ids.clone();
+        front.sort();
+        front.dedup();
+        scored.splice(0..0, front.into_iter().map(|id| (id, top)));
+    }
+
     pub fn search(&self, query: &str, k: usize) -> Vec<(String, f64)> {
-        let desired = Self::desired_id_tokens(&raw_tokens(query));
-        let q_norm = normalize_id(query);
+        let q_tokens = raw_tokens(query);
+        let desired = Self::desired_id_tokens(&q_tokens);
+        let terse = q_tokens.len() <= SHORT_QUERY_WORDS;
 
         // Ask for every match, not the top k: the rerank layers below can promote
         // a candidate the lexical stage ranked outside k, and truncating first
@@ -365,17 +384,8 @@ impl Index {
         let mut scored: Vec<(String, f64)> = Vec::new();
         let usage = read(&self.usage);
         for hit in self.engine.search(query, None) {
-            let score = hit.score as f64;
-            // The crate's IDF is the Robertson form, (N - df + 0.5)/(df + 0.5),
-            // which goes NEGATIVE for a token present in more than half the
-            // corpus — "get" across a REST catalog, say. Multiplying a negative
-            // score by a boost makes it worse, inverting every layer below, so
-            // non-positive matches are dropped exactly as before.
-            if score <= 0.0 {
-                continue;
-            }
             let tool_id = hit.document.id;
-            let mut score = score;
+            let mut score = hit.score as f64;
             if !self.opts.rerank {
                 // plain BM25, which is what both platforms serve. Kept reachable so a
                 // shadow challenger can show whether our layers earn their keep.
@@ -388,13 +398,10 @@ impl Index {
                 if desired.iter().any(|t| m.id_token_set.contains(*t)) {
                     score *= VERB_BOOST;
                 }
-                // near-exact name reference: the whole normalized query appears
-                // inside the normalized id ("post customers" → PostCustomers)
-                if q_norm.len() >= 4 && m.norm_id.contains(&q_norm) {
-                    score *= EXACT_SUBSTRING_BOOST;
-                }
                 // near-ties break toward shorter ids (canonical operations)
-                score *= 1.0 / (1.0 + 0.04 * m.id_token_count);
+                if terse {
+                    score *= 1.0 / (1.0 + 0.04 * m.id_token_count);
+                }
             }
             let uses = *usage.get(&tool_id).unwrap_or(&0) as f64;
             score *= 1.0 + USAGE_DAMP * (1.0 + uses).ln();
@@ -402,6 +409,9 @@ impl Index {
         }
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+        if self.opts.rerank {
+            self.promote_exact(&normalize_id(query), &mut scored);
+        }
         scored.truncate(k);
         scored
     }
@@ -585,9 +595,57 @@ mod tests {
     }
 
     #[test]
-    fn exact_substring_beats_resource_word_siblings() {
+    fn an_exact_name_beats_resource_word_siblings() {
         let idx = fixture();
         assert_eq!(idx.search("PostRefunds", 3)[0].0, "stripe.PostRefunds");
+    }
+
+    /// `GetCharges` used to lose to `GetChargesCharge`: the substring boost rewards
+    /// both, and the longer name carries the query's words twice.
+    #[test]
+    fn an_exact_name_outranks_a_longer_sibling() {
+        let idx = Index::build(&[
+            t("stripe.GetCharges", "List all charges"),
+            t("stripe.GetChargesCharge", "Retrieve the charge from a charges list of charges"),
+        ]);
+        assert_eq!(idx.search("GetCharges", 2)[0].0, "stripe.GetCharges");
+        assert_eq!(idx.search("get charges", 2)[0].0, "stripe.GetCharges");
+        assert_eq!(idx.search("stripe.GetCharges", 2)[0].0, "stripe.GetCharges");
+        let hits = idx.search("GetCharges", 2);
+        assert!(hits[0].1 >= hits[1].1, "scores must stay in rank order: {hits:?}");
+    }
+
+    #[test]
+    fn an_exact_name_shared_across_upstreams_returns_every_owner_once() {
+        let idx = Index::build(&[t("a.search", "Search A"), t("b.search", "Search B")]);
+        let ids: Vec<String> = idx.search("search", 5).into_iter().map(|h| h.0).collect();
+        assert_eq!(ids, ["a.search", "b.search"]);
+    }
+
+    #[test]
+    fn an_exact_name_made_of_stop_words_is_still_found() {
+        let idx = Index::build(&[t("x.do_it", "Run the job"), t("x.other", "Other job")]);
+        assert_eq!(idx.search("do_it", 1)[0].0, "x.do_it");
+    }
+
+    #[test]
+    fn plain_bm25_stays_free_of_the_exact_tier() {
+        let tools = [t("x.do_it", "Run the job")];
+        let idx = Index::build_with(&tools, IndexOptions { rerank: false, ..IndexOptions::default() });
+        assert!(idx.search("do_it", 1).is_empty(), "the shadow baseline must stay plain BM25");
+    }
+
+    /// Without the tiebreak the two score level; `b` is alphabetically later, so it
+    /// only leads when short ids win.
+    #[test]
+    fn the_short_id_tiebreak_applies_to_terse_queries_only() {
+        let idx = Index::build(&[
+            t("x.a_widget_extra_words_here", "widget gadget gizmo sprocket"),
+            t("x.b_widget", "widget gadget gizmo sprocket extra words here"),
+        ]);
+        assert_eq!(idx.search("widget gadget", 2)[0].0, "x.b_widget");
+        let long = "widget gadget gizmo sprocket with some more words in it";
+        assert_eq!(idx.search(long, 2)[0].0, "x.a_widget_extra_words_here");
     }
 
     #[test]

@@ -64,7 +64,10 @@ move when you add more.
 - **Microsoft Graph's 17,531 operations** (a 42 MB spec, ~3.26M raw tokens)
   mount, index, and become searchable in **~1.9s**, via lazy schema
   resolution — one tool's schema is resolved when asked for, not all 17k at
-  load.
+  load. That is three-tool mode. Passthrough has to declare every schema, so it
+  takes a 7.9 GB memory peak and a 1.3 GB listing for about 335M tokens, and
+  warns at startup. A schema is capped at 10,000 JSON nodes, and `$omitted`
+  marks a nested reference left out to fit. Top-level fields always stay.
 
 ## Behaviour preservation (live tasks, real APIs)
 
@@ -115,13 +118,20 @@ a small significant gain on paraphrases (+15 points @1, to 0.15) at the price of
 significant regression on verbatim queries (−21 points @1, p=0.012), plus a model
 download in a proxy that currently boots instantly and offline.
 
-Two search findings shipped as code because they measured:
+Four search findings shipped as code because they measured:
 
 - **Convention-aware tokenization**: the `bm25` crate's tokenizer joins on `_`, so
   every snake_case tool name was one opaque token. Splitting identifiers before
   stemming measured **+15 points recall@1** on a snake_case MCP server (and nothing
   on Stripe, whose camelCase already split — a convention bug is invisible to a
   single-convention benchmark).
+- **An exact-name tier.** 30 of 589 Stripe names ranked second to a longer sibling, so
+  `GetCharges` returned `GetChargesCharge`. A query that spells a name now wins, which
+  took exact-name recall@1 to 1.00 on Stripe and GitHub.
+- **Simpler reranking.** The substring boost gained nothing once the exact tier existed,
+  so it's gone. Verb affinity stays: synthetic queries showed no effect, but on 360 tasks
+  of real agent queries it adds 2.1 points of recall@1. The short-id bias cost recall on
+  long queries and helped short ones, so it now applies up to 8 words.
 - **The usage prior counts successes only.** It previously counted every attempt,
   including calls rejected before reaching the upstream — so a tool could rise in
   search ranking *by failing*, the opposite of what the circuit breaker exists to
@@ -132,6 +142,55 @@ These numbers come from a labelled harness that lives outside this repo; what sh
 retrieval configurations against your real traffic without serving them, logging
 the rank each would have given the tool your agent actually called. Retrieval
 claims can then be checked on your workload, not ours.
+
+## Compared with Codex tool search
+
+Codex's search path (`openai/codex` at `67f0994b`), ported over the same `bm25` crate
+and checked against its own golden search text, ran against the real `search_tools`
+ranking on the Stripe and GitHub catalogs. Each engine was scored at its shipped result
+count, 8 for Codex and 10 for min-mcp. This is search only, with no model in the loop,
+so reformulating a failed query isn't counted. It predates the default of 20 results.
+
+| catalog, queries | n | Codex recall@1 | min-mcp recall@1 | Codex recall@8 | min-mcp recall@10 |
+|---|--:|--:|--:|--:|--:|
+| GitHub verbatim | 40 | 0.875 | 0.975 | 1.00 | 1.00 |
+| GitHub paraphrase | 40 | 0.00 | 0.00 | 0.00 | 0.00 |
+| Stripe verbatim | 33 | 0.848 | 0.970 | 0.939 | 1.00 |
+| Stripe + GitHub in one index, Stripe verbatim | 33 | 0.758 | 0.939 | 0.879 | 1.00 |
+| Stripe + GitHub in one index, GitHub verbatim | 40 | 0.875 | 1.00 | 1.00 | 1.00 |
+| Stripe exact name | 589 | 0.997 | 1.00 | 1.00 | 1.00 |
+| GitHub exact name | 1,216 | 0.976 | 1.00 | 1.00 | 1.00 |
+| Stripe description sentence | 589 | 0.997 | 0.959 | 1.00 | 1.00 |
+| GitHub description sentence | 1,216 | 0.986 | 0.989 | 1.00 | 1.00 |
+
+Before any tuning, the two engines tied on the 80 GitHub queries, whose labels were
+written blind to both. The table shows min-mcp after the ranking changes that
+comparison prompted, so its GitHub rows are no longer held out. The Stripe verbatim set
+is the one min-mcp was tuned on. The filesystem corpus above was not rerun after these
+changes. Codex's order is also unstable: its ties land in random order, and repeating a
+query changed the top 8's membership on 18 of 80 GitHub queries. min-mcp breaks ties by
+id, and its results did not change between runs.
+
+## Search with real agent queries
+
+Hand-written queries miss how agents really search, so this test lets models write their own.
+Two models got a plain task and a search tool, with no tool names shown, on catalogs search was
+never tuned on: Microsoft Graph, NetBox and GitHub's MCP server. Half the tasks are held out, and
+a blind author wrote every task from the catalog alone.
+
+| held-out, 180 tasks, 360 episodes | 10 results | 20 results |
+|---|--:|--:|
+| model names the right tool | 0.875 | **0.908** |
+| Microsoft Graph, 17,911 tools | 0.780 | 0.839 |
+| NetBox, 844 tools, mostly undescribed | 0.864 | 0.898 |
+| GitHub MCP server, 131 tools | 0.976 | 0.984 |
+
+The gain is +3.3 points, 95% CI [+0.8, +6.1]. It wasn't shared evenly: Gemini Flash Lite rose
+from 0.828 to 0.906, while Haiku slipped from 0.922 to 0.911. Other changes tested on the tuning half
+did not earn a place, including indexing parameter names, capping near-identical
+tools, boosting name matches, and longer search guidance. Non-English tasks on a thinly described
+API remain weak: first-query recall on the same 30 NetBox tasks fell from 0.733 in English to
+0.433 in Spanish.
 
 ## Overlays under native tool search
 
