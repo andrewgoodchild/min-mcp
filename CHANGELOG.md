@@ -6,6 +6,8 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-07
+
 ### Fixed
 
 - **Densely cross-linked specs no longer exhaust memory.** Passthrough on Microsoft Graph
