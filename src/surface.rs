@@ -11,7 +11,8 @@
 //! filters the surface is a per-request `Caller`, not a field on the surface.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -32,9 +33,17 @@ const MAX_NAME_LEN: usize = 64;
 /// to resolve again.
 const MAX_CACHED_SCHEMA_BYTES: usize = 64_000;
 
+/// Annotations for a meta-tool that only reads min-mcp's own state. Just the
+/// hint hosts approve on: these definitions ride every model request, so each
+/// extra field is a cost paid on every turn.
+fn read_only_local() -> Value {
+    json!({"readOnlyHint": true})
+}
+
 mod audit;
 mod breaker;
 mod cache;
+mod catalog;
 mod dispatch;
 mod generators;
 mod ids;
@@ -43,6 +52,7 @@ mod patch;
 mod preflight;
 mod ratelimit;
 mod resources;
+pub use resources::UnknownResource;
 mod results;
 mod shadow;
 mod workflow;
@@ -50,6 +60,7 @@ mod workflow;
 mod tests;
 
 pub(crate) use cache::canonical_args;
+use catalog::Catalog;
 
 /// A call's `arguments` as dispatched: an explicit null is treated like
 /// omitted (clients send it for no-arg tools); any OTHER non-object would hand
@@ -80,14 +91,14 @@ pub struct Surface {
     config: Config,
     secrets: Secrets,
     upstreams: Vec<Backend>,
-    tools: Vec<ToolDef>,
-    /// tool_id -> index into `tools` (single source of truth for existence)
-    by_id: HashMap<String, usize>,
-    /// exposed MCP tool name -> tool_id (passthrough mode), over EVERY tool;
-    /// `list_tools` filters it per caller. BTreeMap so list order is
-    /// deterministic without a per-call sort.
-    exposed: BTreeMap<String, String>,
-    index: Index,
+    /// Everything derived from the upstreams' listings, swapped whole when an
+    /// upstream's tools change. See `surface/catalog.rs`.
+    catalog: RwLock<Arc<Catalog>>,
+    /// Held while re-indexing, so one request does it and the rest keep serving.
+    refreshing: tokio::sync::Mutex<()>,
+    /// When each upstream is next due a re-list, from its listing's `ttlMs`;
+    /// `None` = only when it announces a change.
+    recheck_at: Mutex<Vec<Option<Instant>>>,
     /// workflow id -> index into `config.workflows` (composite tools).
     workflow_by_id: HashMap<String, usize>,
     /// Append-only NDJSON audit events (search/details/call/…), if configured.
@@ -96,23 +107,6 @@ pub struct Surface {
     log_chain: Option<Mutex<crate::audit_chain::Chain>>,
     /// Keys each `call` line's `args_mac`; set exactly when `log_chain` is.
     args_key: Option<crate::audit_chain::ArgsKey>,
-    /// tool_id -> fingerprint of the RAW upstream tool (description + input
-    /// schema), captured BEFORE overlay patching. `authored_sha` pins this, so a
-    /// rug-pull that changes only the top-level description is caught as drift —
-    /// not just a schema-shape change.
-    origin_sha: HashMap<String, String>,
-    /// tool_id -> fully-resolved input schema WITH the overlay's field patches
-    /// applied. Only tools that carry a schema-changing overlay are here (so a
-    /// huge un-overlaid spec still resolves lazily); `resolved_schema` prefers it.
-    patched_schemas: HashMap<String, Value>,
-    /// tool_id -> per-operation request headers (overlay `headers:`), with `${…}`
-    /// already resolved but per-request generators (`{{uuid}}`, `{{now}}`) still as
-    /// tokens — resolved fresh on every call in `dispatch`.
-    tool_headers: HashMap<String, Vec<(String, String)>>,
-    /// tool_id -> [(field_path, source)] for `user_supplied` fields: stripped from
-    /// the agent schema and injected from `source` (`env:VAR`, `file:…`, `vault:…`)
-    /// at call time.
-    user_supplied: HashMap<String, Vec<(String, String)>>,
     /// (tool_id, canonical args JSON) -> (inserted-at, raw pre-shaping result),
     /// for read-only tools when `read_cache_ttl_s` > 0. Response shaping and
     /// projection re-run per call on a clone, so a cache hit honors THIS call's
@@ -131,12 +125,9 @@ pub struct Surface {
     /// or a pagination follow-up would wait on a slot its own parent holds.
     upstream_slots: Option<tokio::sync::Semaphore>,
     /// Alternative retrievers scored against real traffic, serving nothing. Empty
-    /// (and free) unless `shadow: true`. See `surface/shadow.rs`.
+    /// (and free) unless `shadow: true`. See `surface/shadow.rs`. Built from the
+    /// startup catalog; a re-index does not rebuild it.
     shadow: shadow::Shadow,
-    /// tool_id -> lazily resolved schema (immutable after load). Default-on
-    /// preflight resolves on every call; without this a spec tool would re-expand
-    /// its `$ref`s each time.
-    resolved_cache: RwLock<HashMap<String, Value>>,
 }
 
 /// What to do about a tool that trips a poisoning rule. Kept out of the
@@ -147,12 +138,8 @@ replace the description with an overlay, or set `poisoning_policy: warn` if they
 impl Surface {
     pub async fn build(config: Config, secrets: Secrets) -> Result<Self> {
         let mut upstreams = Vec::new();
-        let mut tools: Vec<ToolDef> = Vec::new();
-        let mut by_id = HashMap::new();
-        let mut origin_sha: HashMap<String, String> = HashMap::new();
-        let mut patched: HashMap<String, Value> = HashMap::new();
-        let mut tool_headers: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut user_supplied: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut listings: Vec<Vec<ToolDef>> = Vec::new();
+        let mut ttls: Vec<Option<u64>> = Vec::new();
         let mut skipped = 0usize;
         for ucfg in &config.upstreams {
             // A fully filtered-out upstream is never spawned/loaded — so an
@@ -164,7 +151,7 @@ impl Surface {
             // skipped upstreams would misalign it); stamped onto each ToolDef so
             // dispatch routes back to the right backend.
             let backend_idx = upstreams.len();
-            let connected: Result<(Backend, Vec<ToolDef>)> = async {
+            let connected: Result<(Backend, Vec<ToolDef>, Option<u64>)> = async {
                 let up = if ucfg.is_spec() {
                     Backend::Spec(SpecBackend::new(ucfg, &secrets).await?)
                 } else if ucfg.is_http() {
@@ -172,11 +159,11 @@ impl Surface {
                 } else {
                     Backend::Mcp(Upstream::spawn(ucfg).await?)
                 };
-                let listed = up.list_tools(backend_idx).await?;
-                Ok((up, listed))
+                let (listed, ttl) = up.list_tools_ttl(backend_idx).await?;
+                Ok((up, listed, ttl))
             }
             .await;
-            let (up, listed) = match connected {
+            let (up, listed, ttl) = match connected {
                 Ok(v) => v,
                 // `optional: true` — degrade instead of refusing to start: the
                 // rest of the surface serves, this upstream's tools are absent,
@@ -192,89 +179,12 @@ impl Surface {
                 }
                 Err(e) => return Err(e),
             };
-            for mut t in listed {
-                // static include/exclude: a filtered tool never enters the
-                // surface — not listed, searchable, or callable, for any caller.
-                if !config.passes_filter(&ucfg.name, t.id()) {
-                    continue;
-                }
-                // Fingerprint the RAW upstream tool (description + schema) BEFORE
-                // any overlay patches it — this is what drift/rug-pull detection
-                // compares against.
-                origin_sha.insert(t.id().to_string(), tool_fingerprint(&t.description, &t.input_schema));
-                // overlays patch the tool at load time (law 1: data, not code)
-                if let Some(o) = config.overlay_for(t.id()) {
-                    if let Some(d) = &o.description {
-                        t.description = d.clone();
-                    }
-                    // Field patches need each field's real location, which for a
-                    // spec tool sits behind a `$ref` in the shallow schema — so
-                    // resolve THIS tool (only overlaid tools pay the cost) and patch
-                    // the resolved schema, stored for `resolved_schema` to serve.
-                    if !o.fields.is_empty() {
-                        let mut schema =
-                            up.resolved_schema(&t.name).unwrap_or_else(|| t.input_schema.clone());
-                        apply_field_patches(&mut schema, &o.fields);
-                        patched.insert(t.id().to_string(), schema);
-                        // Record user-supplied fields for call-time injection (they
-                        // were just stripped from the agent schema above).
-                        let us: Vec<(String, String)> = o
-                            .fields
-                            .iter()
-                            .filter_map(|(path, patch)| {
-                                patch.spec().user_supplied.clone().map(|s| (path.clone(), s))
-                            })
-                            .collect();
-                        if !us.is_empty() {
-                            user_supplied.insert(t.id().to_string(), us);
-                        }
-                    }
-                    // Per-tool headers: resolve `${…}` now (fail loud, keeps secrets
-                    // out of config); leave {{...}} generators for per-call resolution.
-                    if !o.headers.is_empty() {
-                        let mut hs = Vec::with_capacity(o.headers.len());
-                        for (k, v) in &o.headers {
-                            hs.push((k.clone(), secrets.expand(v).await?));
-                        }
-                        tool_headers.insert(t.id().to_string(), hs);
-                    }
-                }
-                by_id.insert(t.id().to_string(), tools.len());
-                tools.push(t);
-            }
             upstreams.push(up);
+            listings.push(listed);
+            ttls.push(ttl);
         }
-        // Index upstream tools AND composite workflows (both searchable/callable).
-        // Overlay `aliases` are appended to a tool's indexed text so a poorly-named
-        // tool is findable by an outcome phrase, without changing its id.
-        let mut corpus: Vec<crate::index::IndexedTool> = tools
-            .iter()
-            .map(|t| {
-                let aliases =
-                    config.overlay_for(t.id()).map(|o| o.aliases.join(" ")).unwrap_or_default();
-                let text = if aliases.is_empty() {
-                    t.description.clone()
-                } else {
-                    format!("{} {}", t.description, aliases)
-                };
-                crate::index::IndexedTool {
-                    id: t.id().to_string(),
-                    description: text,
-                    // Harvested unconditionally but only *indexed* by variants that
-                    // opt in (IndexOptions::params) — the shipped index ignores it.
-                    params: crate::index::schema_param_text(&t.input_schema),
-                }
-            })
-            .collect();
-        for wf in &config.workflows {
-            corpus.push(crate::index::IndexedTool {
-                id: wf.id.clone(),
-                description: wf.description.clone(),
-                params: String::new(), // composites declare no input schema
-            });
-        }
-        let index = Index::build(&corpus);
-        let shadow = shadow::Shadow::new(&corpus, config.shadow);
+        let catalog = Catalog::assemble(&config, &secrets, &upstreams, listings).await?;
+        let shadow = shadow::Shadow::new(&catalog::corpus(&config, &catalog.tools), config.shadow);
         let workflow_by_id: HashMap<String, usize> =
             config.workflows.iter().enumerate().map(|(i, w)| (w.id.clone(), i)).collect();
 
@@ -310,40 +220,46 @@ impl Surface {
         let config_max_concurrent = config.max_concurrent_calls;
         // Degrading is the point of `optional`, but a proxy with nothing behind
         // it looks healthy to every client while serving no tools.
-        if skipped > 0 && tools.is_empty() {
+        if skipped > 0 && catalog.tools.is_empty() {
             crate::log_error!("every upstream failed and was skipped as optional: serving an EMPTY tool catalog");
         }
-        let mut surface = Surface {
+        let n_upstreams = upstreams.len();
+        let surface = Surface {
             shadow,
             config,
             secrets,
             upstreams,
-            tools,
-            by_id,
-            exposed: BTreeMap::new(),
-            index,
+            catalog: RwLock::new(Arc::new(catalog)),
+            refreshing: tokio::sync::Mutex::new(()),
+            recheck_at: Mutex::new(vec![None; n_upstreams]),
             workflow_by_id,
             log,
             log_chain,
             args_key,
-            origin_sha,
-            patched_schemas: patched,
-            tool_headers,
-            user_supplied,
             read_cache: Mutex::new(HashMap::new()),
             resource_origin: Mutex::new(HashMap::new()),
             breakers: Mutex::new(HashMap::new()),
             limits: ratelimit::Buckets::default(),
             upstream_slots: (config_max_concurrent > 0)
                 .then(|| tokio::sync::Semaphore::new(config_max_concurrent)),
-            resolved_cache: RwLock::new(HashMap::new()),
         };
-        surface.build_exposed();
+        for (idx, ttl) in ttls.into_iter().enumerate() {
+            surface.schedule_recheck(idx, ttl);
+        }
+        surface.vet(&surface.cat())?;
+        Ok(surface)
+    }
+
+    /// The checks a catalog must pass to be served: overlay bindings against the
+    /// live upstream schema, and tool poisoning. Problems that only warn are
+    /// logged here; an Err refuses the catalog (at startup the proxy, on a
+    /// re-index the new tools).
+    fn vet(&self, cat: &Catalog) -> Result<()> {
         // Binding registry: check overlays against the live upstream schema. A
         // broken STRONG binding refuses to start (fail closed); a broken WEAK
         // one is logged and its broken parts are skipped (fail open).
         use crate::config::BindingStrength;
-        let broken = surface.broken_bindings();
+        let broken = self.broken_bindings_in(cat);
         let fmt = |set: &[&(String, Vec<String>, BindingStrength)]| {
             set.iter().map(|(t, why, _)| format!("  {t}: {}", why.join("; "))).collect::<Vec<_>>().join("\n")
         };
@@ -360,15 +276,15 @@ impl Surface {
         // decides whether to serve them. Cheap enough to run every start —
         // the rules read name and description, and resolve no schemas.
         use crate::config::PoisoningPolicy;
-        if surface.config.poisoning_policy != PoisoningPolicy::Off {
-            let poisoned = surface.poisoned_tools();
+        if self.config.poisoning_policy != PoisoningPolicy::Off {
+            let poisoned = Self::poisoned_in(cat);
             if !poisoned.is_empty() {
                 let detail = poisoned
                     .iter()
                     .map(|(t, rules)| format!("  {t}: {}", rules.join(", ")))
                     .collect::<Vec<_>>()
                     .join("\n");
-                match surface.config.poisoning_policy {
+                match self.config.poisoning_policy {
                     PoisoningPolicy::Strict => anyhow::bail!(
                         "{} tool(s) tripped a tool-poisoning rule (poisoning_policy: strict):\n{detail}\n{POISONING_HINT}",
                         poisoned.len()
@@ -381,7 +297,7 @@ impl Surface {
                 }
             }
         }
-        Ok(surface)
+        Ok(())
     }
 
     /// A slot for one upstream call, when `max_concurrent_calls` is enabled.
@@ -442,41 +358,6 @@ impl Surface {
         true
     }
 
-    /// Passthrough mode declares EVERY tool by (sanitized) name; visibility is
-    /// applied per caller at list/call time. Three-tool mode declares none —
-    /// the agent reaches them via the meta-tools. A tool keeps its upstream name,
-    /// which is what host permission rules are written against; only a name two
-    /// upstreams share takes the `upstream_` prefix, on both sides, so the
-    /// outcome doesn't depend on upstream order.
-    fn build_exposed(&mut self) {
-        let ids: Vec<(String, String)> = match self.config.mode {
-            Mode::Passthrough => self.tools.iter().map(|t| (t.id().to_string(), sanitize_name(&t.name, 0))).collect(),
-            Mode::ThreeTool => vec![],
-        };
-        let mut uses: HashMap<&str, usize> = HashMap::new();
-        for (_, bare) in &ids {
-            *uses.entry(bare).or_default() += 1;
-        }
-        for (id, bare) in &ids {
-            let mut name = if uses[bare.as_str()] == 1 { bare.clone() } else { sanitize_name(id, 0) };
-            if self.exposed.contains_key(&name) {
-                // Reserve room for a "_N" suffix up front so the disambiguated
-                // name is strictly shorter than the 64-char cap — otherwise a
-                // re-truncated name could reproduce the colliding string and
-                // loop forever.
-                let base = sanitize_name(id, 4);
-                let mut n = 2;
-                loop {
-                    name = format!("{base}_{n}");
-                    if !self.exposed.contains_key(&name) {
-                        break;
-                    }
-                    n += 1;
-                }
-            }
-            self.exposed.insert(name, id.clone());
-        }
-    }
 
     /// Has an overlay changed what this tool returns? Its upstream `outputSchema`
     /// then describes a shape the result no longer has, and clients validate
@@ -490,6 +371,9 @@ impl Surface {
     fn meta_search(&self) -> Value {
         json!({
             "name": "search_tools",
+            // Reads min-mcp's own index: no side effects, nothing outside it.
+            // Hosts may then auto-approve it.
+            "annotations": read_only_local(),
             "description": "Search every available tool by task description (e.g. \"create a customer\"). Returns matching tool ids with one-line summaries. Call get_tool_details next for the exact input schema.",
             "inputSchema": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "What you are trying to do."},
@@ -501,6 +385,7 @@ impl Surface {
     fn meta_details(&self) -> Value {
         json!({
             "name": "get_tool_details",
+            "annotations": read_only_local(),
             "description": "Get the full description and input schema for one tool id.",
             "inputSchema": {"type": "object", "properties": {
                 "tool_id": {"type": "string", "description": "The tool id to fetch, as returned by search_tools (e.g. \"stripe.PostCustomers\")."}
@@ -531,17 +416,11 @@ impl Surface {
         }
     }
 
-    fn def_for(&self, tool_id: &str) -> Option<&ToolDef> {
-        self.by_id.get(tool_id).map(|&i| &self.tools[i])
+    fn def_for(&self, tool_id: &str) -> Option<Arc<ToolDef>> {
+        self.cat().def(tool_id).cloned()
     }
 
-    /// The tool def, only if `caller` is allowed to see it.
-    fn visible_def(&self, caller: &Caller, tool_id: &str) -> Option<&ToolDef> {
-        self.def_for(tool_id).filter(|_| self.allowed(caller, tool_id))
-    }
-
-    /// The composite's index, only if `caller` is allowed to see it — the
-    /// workflow twin of [`Surface::visible_def`].
+    /// The composite's index, only if `caller` is allowed to see it.
     fn visible_workflow(&self, caller: &Caller, id: &str) -> Option<&usize> {
         self.workflow_by_id.get(id).filter(|_| self.allowed(caller, id))
     }
@@ -550,9 +429,9 @@ impl Surface {
     /// spec backend (whose executor wraps responses in `{status, body, …}`)?
     /// MCP/HTTP upstream results are never envelopes, whatever their shape.
     fn tool_from_spec(&self, tool_id: &str) -> bool {
-        self.by_id
-            .get(tool_id)
-            .map(|&i| self.tools[i].upstream_idx)
+        self.cat()
+            .def(tool_id)
+            .map(|t| t.upstream_idx)
             .is_some_and(|u| matches!(self.upstreams.get(u), Some(Backend::Spec(_))))
     }
 
@@ -560,16 +439,20 @@ impl Surface {
     /// schema wins (resolved + patched at load); otherwise resolve lazily, once,
     /// and memoize (schemas are immutable after load; default-on preflight hits
     /// this per call).
-    fn resolved_schema(&self, t: &ToolDef) -> Value {
-        if let Some(p) = self.patched_schemas.get(t.id()) {
+    ///
+    /// Takes the catalog `t` came from: re-reading it here could pair one
+    /// catalog's tool with another's cache across a re-index, and store the old
+    /// schema under the new catalog.
+    fn resolved_schema(&self, cat: &Catalog, t: &ToolDef) -> Value {
+        if let Some(p) = cat.patched_schemas.get(t.id()) {
             return p.clone();
         }
-        if let Some(c) = read(&self.resolved_cache).get(t.id()) {
+        if let Some(c) = read(&cat.resolved_cache).get(t.id()) {
             return c.clone();
         }
         let v = self.raw_resolved(t);
         if json_len(&v) <= MAX_CACHED_SCHEMA_BYTES {
-            write(&self.resolved_cache).insert(t.id().to_string(), v.clone());
+            write(&cat.resolved_cache).insert(t.id().to_string(), v.clone());
         }
         v
     }
@@ -584,6 +467,11 @@ impl Surface {
             .unwrap_or_else(|| t.input_schema.clone())
     }
 
+    /// Does `tools/list` declare upstream tools by name?
+    pub fn is_passthrough(&self) -> bool {
+        self.config.mode == Mode::Passthrough
+    }
+
     /// The tools/list result `caller` sees.
     pub fn list_tools(&self, caller: &Caller) -> Value {
         let mut defs: Vec<Value> = Vec::new();
@@ -594,12 +482,13 @@ impl Surface {
     /// Each definition `tools/list` declares, one at a time, so a caller that only
     /// measures them doesn't hold a huge catalog in memory.
     fn for_each_tool_def(&self, caller: &Caller, mut visit: impl FnMut(Value)) {
-        for (name, id) in &self.exposed {
-            if let Some(t) = self.visible_def(caller, id) {
+        let cat = self.cat();
+        for (name, id) in &cat.exposed {
+            if let Some(t) = cat.def(id).filter(|_| self.allowed(caller, id)) {
                 let mut def = json!({
                     "name": name,
                     "description": t.description,
-                    "inputSchema": self.resolved_schema(t), // resolve $refs on demand
+                    "inputSchema": self.resolved_schema(&cat, t), // resolve $refs on demand
                 });
                 if let Some(obj) = def.as_object_mut() {
                     obj.extend(t.extra.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -683,7 +572,7 @@ impl Surface {
                     // Eligible = the id is in the searchable surface. A composite
                     // called directly, or a typo, must not count against a retriever
                     // that was never given the chance to rank it.
-                    let eligible = self.by_id.contains_key(&id) || self.workflow_by_id.contains_key(&id);
+                    let eligible = self.cat().by_id.contains_key(&id) || self.workflow_by_id.contains_key(&id);
                     for o in self.shadow.observe_call(&id, eligible) {
                         self.log_event(
                             caller,
@@ -716,8 +605,9 @@ impl Surface {
                 // the canonical id and its neighbours for tools tools/list
                 // deliberately withholds. A hidden tool must be shaped exactly
                 // like one that does not exist.
-                let Some(id) = self.exposed.get(name).filter(|id| self.allowed(caller, id)).cloned() else {
-                    let visible_names = self
+                let cat = self.cat();
+                let Some(id) = cat.exposed.get(name).filter(|id| self.allowed(caller, id)).cloned() else {
+                    let visible_names = cat
                         .exposed
                         .iter()
                         .filter(|(_, id)| self.allowed(caller, id))
@@ -729,7 +619,17 @@ impl Surface {
                     ));
                 };
                 let mut r = self.dispatch(caller, &id, args, &[]).await?;
+                // A tool that declares an `outputSchema` MUST return conforming
+                // `structuredContent`, and strict clients error without it, so
+                // the budget bounds only its text. Without a schema the
+                // structured copy is optional, and an oversized one goes.
+                let declared = cat.def(&id).is_some_and(|t| t.extra.contains_key("outputSchema"))
+                    && !self.reshapes_result(&id);
+                let structured = if declared { r.as_object_mut().and_then(|o| o.remove("structuredContent")) } else { None };
                 truncate_passthrough_text(&mut r);
+                if let (Some(sc), Some(o)) = (structured, r.as_object_mut()) {
+                    o.insert("structuredContent".into(), sc);
+                }
                 Ok(r)
             }
         }
@@ -743,7 +643,7 @@ impl Surface {
         let k = if k == 0 { DEFAULT_SEARCH_K } else { k };
         // over-fetch so scope filtering can't starve the result list
         // (saturating: k is client-controlled, must not overflow)
-        let hits = self.index.search(query, k.saturating_mul(3));
+        let hits = self.cat().index.search(query, k.saturating_mul(3));
         let mut lines: Vec<String> = Vec::new();
         let mut served: Vec<String> = Vec::new();
         for (id, _) in hits {
@@ -784,14 +684,15 @@ impl Surface {
             }))
             .unwrap_or_default();
         }
-        let Some(t) = self.visible_def(caller, tool_id) else {
+        let cat = self.cat();
+        let Some(t) = cat.def(tool_id).filter(|_| self.allowed(caller, tool_id)) else {
             return format!(
                 "unknown tool_id {tool_id:?} —{} {}",
                 self.suggest_near_misses(caller, tool_id),
                 self.recovery()
             );
         };
-        let schema = self.resolved_schema(t); // resolve $refs on demand
+        let schema = self.resolved_schema(&cat, t); // resolve $refs on demand
         // One envelope renderer for every stage; only the note and pretty/compact
         // choice vary (indentation is pure token overhead once over budget).
         let render = |schema: &Value, note: Option<&str>, pretty: bool| {
@@ -856,7 +757,8 @@ impl Surface {
     /// dot-for-underscore slip should never dead-end). Empty string when nothing
     /// is plausibly close.
     fn suggest_near_misses(&self, caller: &Caller, wrong: &str) -> String {
-        let candidates = self
+        let cat = self.cat();
+        let candidates = cat
             .by_id
             .keys()
             .chain(self.workflow_by_id.keys())

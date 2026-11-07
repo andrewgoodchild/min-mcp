@@ -187,6 +187,7 @@ impl Executor {
         crate::crypto::install_provider();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
+            .redirect(crate::redirect::same_origin())
             .build()
             .context("building HTTP client for spec upstream")?;
         Ok(Executor {
@@ -298,10 +299,14 @@ impl Executor {
                     crate::upstream::TIMEOUT_GUIDANCE
                 )}));
             }
-            Err(e) => return Ok(json!({"error": format!("transport error: {e}")})),
+            // `{:#}` keeps the cause, e.g. why a redirect was refused.
+            Err(e) => return Ok(json!({"error": format!("transport error: {:#}", anyhow::Error::from(e))})),
         };
         let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
+        let text = match crate::http_upstream::read_capped(resp, crate::http_upstream::MAX_RESPONSE_BYTES).await {
+            Ok(t) => t,
+            Err(e) => return Ok(json!({"error": format!("upstream response unreadable: {e:#}"), "status": status})),
+        };
         let (body_out, truncated) = format_body(&text, self.result_format);
         Ok(json!({"status": status, "body": body_out, "truncated": truncated}))
     }

@@ -105,7 +105,12 @@ client-credentials):
       client_id: my-client
       client_secret: "${OAUTH_SECRET}"
       scope: "read write"     # optional, space-delimited
+      resource: ""            # optional; defaults to the upstream url, "" sends none
 ```
+
+Every token request carries RFC 8707 `resource`, the audience the token is for,
+as MCP requires. It defaults to the upstream's `url`. Set `resource: ""` for a
+token server that rejects the parameter, such as Azure AD's v2 endpoint.
 
 ### c) OpenAPI spec
 

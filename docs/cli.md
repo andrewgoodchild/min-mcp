@@ -29,7 +29,7 @@ minmcp serve --config myconfig.yaml --http 0.0.0.0:8080 --allow-remote   # only 
 ### `inspect`
 Print surface statistics (tool counts, modes, upstreams) without serving — a quick
 sanity check on a config. `upstreams_stale` lists upstreams that announced a
-catalog change since startup (restart to pick it up); `visible_after_scopes` is
+catalog change the next request will re-index; `visible_after_scopes` is
 for the process caller (`--jwt` / `--scopes`).
 
 ```sh

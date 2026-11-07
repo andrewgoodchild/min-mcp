@@ -50,12 +50,12 @@ minification before wiring anything up:
   "visible_after_scopes": 120,
   "surface_tools": 3,
   "est_tokens_raw": 17350,
-  "est_tokens_minified": 424,
+  "est_tokens_minified": 442,
   "est_raw_exact": false
 }
 ```
 
-**120 upstream tools → 3 surface tools; ~17,350 tokens of definitions → 424.**
+**120 upstream tools → 3 surface tools; ~17,350 tokens of definitions → 442.**
 (`est_raw_exact: false` means the raw figure is a lower bound — spec upstreams
 store unresolved `$ref` stubs until a schema is asked for, so the real "before"
 number is larger.)
@@ -68,7 +68,7 @@ stdout:
 ```
 
 ```
-min-mcp: 120 upstream tool(s) across 1 upstream(s) → 3 surface tool(s); ~424 tokens vs ≥17350 raw (≥41×)
+min-mcp: 120 upstream tool(s) across 1 upstream(s) → 3 surface tool(s); ~442 tokens vs ≥17350 raw (≥39×)
 ```
 
 That's the whole product in one line. `Ctrl-C` to stop.
@@ -213,7 +213,7 @@ stderr, secret references, and an upstream that may be down. It runs offline:
 
 ```
 WARN optional upstream "reports" unavailable and skipped: spawning upstream reports: … No such file or directory
-min-mcp: 4 upstream tool(s) across 1 upstream(s) → 3 surface tool(s); ~424 tokens vs 497 raw (1.2×)
+min-mcp: 4 upstream tool(s) across 1 upstream(s) → 3 surface tool(s); ~442 tokens vs 497 raw (1.1×)
 min-mcp: Streamable HTTP (rmcp) listening on http://127.0.0.1:8080/
 ```
 

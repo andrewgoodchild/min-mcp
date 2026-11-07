@@ -330,6 +330,7 @@ impl Introspector {
         // every request, so a hung endpoint would stall the whole proxy.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .redirect(crate::redirect::same_origin())
             .build()
             .context("building the introspection HTTP client")?;
         Ok(Introspector {

@@ -138,6 +138,13 @@ pub(super) fn truncate_passthrough_text(result: &mut Value) {
 }
 
 fn truncate_blocks(result: &mut Value, max: usize, notice: &str) {
+    // A structured copy over budget can't be cut and stay valid JSON, so it is
+    // dropped; the truncated text block, with its notice, stands in for it.
+    if result.get("structuredContent").is_some_and(|sc| json_len(sc) > max) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.remove("structuredContent");
+        }
+    }
     let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) else {
         return;
     };
@@ -220,6 +227,18 @@ pub(super) fn apply_response_transform(
 /// isn't JSON (or a body that isn't JSON, e.g. TOON) is left untouched. This is
 /// the shared unwrap used by overlay field-drop and caller field-projection.
 pub(super) fn transform_result(result: &mut Value, from_spec: bool, mut f: impl FnMut(&mut Value)) {
+    // `structuredContent` is the same payload in machine form. Shaping only the
+    // text would let a field an overlay strips (a secret) reach the client there.
+    // The spec requires an object, so a transform that yields anything else
+    // drops it; the text block still carries the shaped result.
+    if let Some(sc) = result.get_mut("structuredContent") {
+        f(sc);
+        if !sc.is_object() {
+            if let Some(obj) = result.as_object_mut() {
+                obj.remove("structuredContent");
+            }
+        }
+    }
     let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) else {
         return;
     };

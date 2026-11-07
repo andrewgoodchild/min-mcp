@@ -59,10 +59,19 @@ fn stdio_serves_a_client_that_never_initializes() {
 
     let list = &replies[1]["result"];
     assert_eq!(list["resultType"], "complete");
-    assert!(list["ttlMs"].is_u64(), "list results are cacheable: {list}");
-    assert!(list["cacheScope"].is_string(), "{list}");
+    // A zero lifetime would make a client refetch before every use; scopes
+    // make the list differ per caller, so it must not be shared.
+    assert!(list["ttlMs"].as_u64().is_some_and(|t| t > 0), "list results are cacheable: {list}");
+    assert_eq!(list["cacheScope"], "private", "{list}");
     let names: Vec<&str> = list["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["search_tools", "get_tool_details", "call_tool"]);
+    // Lookups are read-only so a host can approve them without asking; a
+    // call can do anything, so it claims nothing.
+    let tools = list["tools"].as_array().unwrap();
+    for t in &tools[..2] {
+        assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
+    }
+    assert!(tools[2].get("annotations").is_none(), "{}", tools[2]);
 
     let text = replies[2]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("big.widgets/create"), "{text}");

@@ -24,6 +24,12 @@ const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const HEADER_MISMATCH: i64 = -32020;
 const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
 
+/// Errors about the min-mcp-to-upstream hop itself. Relayed to an agent's
+/// client they would claim ITS session is incompatible, which it isn't.
+pub fn is_negotiation_error(code: i64) -> bool {
+    matches!(code, UNSUPPORTED_PROTOCOL_VERSION | HEADER_MISMATCH | MISSING_REQUIRED_CLIENT_CAPABILITY)
+}
+
 const BASE64_PREFIX: &str = "=?base64?";
 const BASE64_SUFFIX: &str = "?=";
 

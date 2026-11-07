@@ -23,8 +23,8 @@ use serde_json::{json, Value};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
     GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, ServerCapabilities, ServerConfig, Tool,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, ServerCapabilities, ServerConfig, Tool, CacheScope,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::io::stdio;
@@ -101,6 +101,13 @@ impl ServerHandler for MinMcpServer {
         let mut info = ServerConfig::default();
         info.capabilities =
             ServerCapabilities::builder().enable_tools().enable_resources().enable_prompts().build();
+        // Only a passthrough listing changes when an upstream's tools do; the
+        // three meta-tools are fixed, and what changes behind them is searched.
+        if self.surface.is_passthrough() {
+            if let Some(t) = info.capabilities.tools.as_mut() {
+                t.list_changed = Some(true);
+            }
+        }
         info.server_info = Implementation::new("min-mcp", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(
             "Minified MCP surface. Use search_tools to find a tool, get_tool_details for its \
@@ -120,7 +127,7 @@ impl ServerHandler for MinMcpServer {
         // Per-entry tolerant, like list_tools below: one malformed upstream
         // entry (missing `name`, wrong-typed field) must drop THAT entry, not
         // fail the whole merged listing (min-mcp's own resource included).
-        Ok(ListResourcesResult::with_all_items(collect_valid(&v, "resources")))
+        Ok(ListResourcesResult::with_all_items(collect_valid(&v, "resources")).with_ttl_ms(LIST_TTL_MS).with_cache_scope(CacheScope::Private))
     }
 
     async fn read_resource(
@@ -133,7 +140,7 @@ impl ServerHandler for MinMcpServer {
             .surface
             .read_resource(&caller, &request.uri)
             .await
-            .map_err(|e| ErrorData::resource_not_found(format!("{e:#}"), None))?;
+            .map_err(|e| read_error(&e, &request.uri, context.protocol_version()))?;
         let result: ReadResourceResult = serde_json::from_value(v)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(result.into())
@@ -146,7 +153,7 @@ impl ServerHandler for MinMcpServer {
     ) -> Result<ListPromptsResult, ErrorData> {
         let caller = self.caller(&context)?;
         let v = self.surface.list_prompts(&caller).await;
-        Ok(ListPromptsResult::with_all_items(collect_valid(&v, "prompts")))
+        Ok(ListPromptsResult::with_all_items(collect_valid(&v, "prompts")).with_ttl_ms(LIST_TTL_MS).with_cache_scope(CacheScope::Private))
     }
 
     async fn get_prompt(
@@ -172,6 +179,7 @@ impl ServerHandler for MinMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let caller = self.caller(&context)?;
+        self.surface.refresh_if_due().await;
         let listing = self.surface.list_tools(&caller);
         let tools = listing
             .get("tools")
@@ -179,7 +187,7 @@ impl ServerHandler for MinMcpServer {
             .map(|arr| arr.iter().filter_map(json_to_tool).collect())
             .unwrap_or_default();
         // Single-page: the surface returns the whole (already minified) catalog.
-        Ok(ListToolsResult::with_all_items(tools))
+        Ok(ListToolsResult::with_all_items(tools).with_ttl_ms(LIST_TTL_MS).with_cache_scope(CacheScope::Private))
     }
 
     async fn call_tool(
@@ -188,6 +196,12 @@ impl ServerHandler for MinMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let caller = self.caller(&context)?;
+        // An upstream's tools changed: re-index before serving. In passthrough
+        // the listing this client holds is now out of date, so say so; other
+        // clients see the change when their cached list expires (`ttlMs`).
+        if self.surface.refresh_if_due().await && self.surface.is_passthrough() {
+            let _ = context.peer.notify_tool_list_changed().await;
+        }
         let name = request.name.to_string();
         let args = request.arguments.map(Value::Object).unwrap_or_else(|| json!({}));
         // The surface returns every tool-level outcome — client-side argument
@@ -236,6 +250,42 @@ fn json_to_tool(v: &Value) -> Option<Tool> {
     let description = v.get("description").and_then(Value::as_str).unwrap_or("").to_string();
     let schema = v.get("inputSchema").and_then(Value::as_object).cloned().unwrap_or_default();
     Some(Tool::new(name, description, Arc::new(schema)))
+}
+
+/// How long a client may reuse a list result (MCP 2026-07-28
+/// `ttlMs`). Unset, a client may refetch before every use. A
+/// minute bounds how stale a passthrough catalog can be after an upstream
+/// changes. Lists are `private`: scopes make them differ per caller.
+const LIST_TTL_MS: u64 = 60_000;
+
+/// The error for a failed `resources/read`. "Not found" is -32602 from
+/// 2026-07-28 and -32002 before it, whether min-mcp or the upstream decided
+/// it. An upstream's other errors pass through with their code, except those
+/// about min-mcp's own session with it; everything else is internal.
+fn read_error(e: &anyhow::Error, uri: &str, version: Option<ProtocolVersion>) -> ErrorData {
+    let msg = format!("{e:#}");
+    let not_found = |data: Option<Value>| match &version {
+        Some(v) if *v >= ProtocolVersion::V_2026_07_28 => ErrorData::invalid_params(msg.clone(), data),
+        _ => ErrorData::resource_not_found(msg.clone(), data),
+    };
+    if e.downcast_ref::<crate::surface::UnknownResource>().is_some() {
+        return not_found(Some(json!({"uri": uri})));
+    }
+    if let Some(rpc) = e.downcast_ref::<crate::modern::RpcError>() {
+        let data = rpc.error.get("data").cloned();
+        match rpc.error.get("code").and_then(Value::as_i64) {
+            // A legacy upstream's not-found, for a client on either revision.
+            Some(-32002) => return not_found(data),
+            Some(c) if crate::modern::is_negotiation_error(c) => {}
+            Some(c) => {
+                if let Ok(code) = i32::try_from(c) {
+                    return ErrorData::new(rmcp::model::ErrorCode(code), msg, data);
+                }
+            }
+            None => {}
+        }
+    }
+    ErrorData::internal_error(msg, None)
 }
 
 /// A surface tool result `{content:[...], isError, structuredContent?}` → rmcp
@@ -287,13 +337,62 @@ pub struct HttpIdentity {
     pub subject_claim: String,
     pub trusted: Option<TrustedHeaders>,
     pub allow_anonymous: bool,
+    /// RFC 9728 metadata, when `auth.protected_resource` is set.
+    pub metadata: Option<Arc<ResourceMetadata>>,
+}
+
+/// The RFC 9728 document, rendered once, and where it is served.
+pub struct ResourceMetadata {
+    /// The JSON body.
+    doc: String,
+    /// Its URL, named in every 401 challenge so a client can find it.
+    url: String,
+    /// Paths answered: the RFC's path-inserted form, and the bare root form
+    /// that clients fall back to.
+    paths: Vec<String>,
+}
+
+const WELL_KNOWN: &str = "/.well-known/oauth-protected-resource";
+
+impl ResourceMetadata {
+    pub fn new(pr: &crate::config::ProtectedResource) -> Self {
+        let mut doc = json!({
+            "resource": pr.resource,
+            "authorization_servers": pr.authorization_servers,
+            "bearer_methods_supported": ["header"],
+        });
+        if !pr.scopes_supported.is_empty() {
+            doc["scopes_supported"] = json!(pr.scopes_supported);
+        }
+        // Validated at config load: an http(s) URL.
+        let (origin, raw_path) = match reqwest::Url::parse(&pr.resource) {
+            Ok(u) => (u.origin().ascii_serialization(), u.path().to_string()),
+            Err(_) => (String::new(), String::new()),
+        };
+        let path = raw_path.trim_end_matches('/');
+        let inserted = format!("{WELL_KNOWN}{path}");
+        let mut paths = vec![inserted.clone()];
+        // A client deriving the path from `resource` literally keeps its
+        // trailing slash.
+        if raw_path.len() > 1 && raw_path.ends_with('/') {
+            paths.push(format!("{WELL_KNOWN}{raw_path}"));
+        }
+        if !path.is_empty() {
+            paths.push(WELL_KNOWN.to_string());
+        }
+        ResourceMetadata { doc: doc.to_string(), url: format!("{origin}{inserted}"), paths }
+    }
+
+    fn serves(&self, path: &str) -> bool {
+        self.paths.iter().any(|p| p == path)
+    }
 }
 
 /// Why a request was refused, rendered as a 401.
 #[derive(Debug)]
 struct Refusal {
     /// The `WWW-Authenticate` challenge.
-    challenge: &'static str,
+    challenge: String,
     reason: String,
 }
 
@@ -309,12 +408,42 @@ impl HttpIdentity {
         HttpIdentity {
             verifier,
             introspector,
-            checks: ClaimChecks { audience: a.audience.clone(), issuer: a.issuer.clone() },
+            // A published resource is the audience its tokens must name (MCP
+            // forbids accepting tokens minted for another service).
+            checks: ClaimChecks {
+                audience: a.audience.clone().or_else(|| a.protected_resource.as_ref().map(|p| p.resource.clone())),
+                issuer: a.issuer.clone(),
+            },
             scope_claim: a.scope_claim.clone(),
             subject_claim: a.subject_claim.clone(),
             trusted: a.trusted_headers.clone(),
             allow_anonymous: a.allow_anonymous,
+            metadata: a.protected_resource.as_ref().map(|pr| Arc::new(ResourceMetadata::new(pr))),
         }
+    }
+
+    /// A `WWW-Authenticate` value: `Bearer`, the error if any, and where the
+    /// resource metadata lives, so a client can start the OAuth flow from it.
+    fn challenge(&self, error: Option<&str>) -> String {
+        let mut parts = Vec::new();
+        if let Some(e) = error {
+            parts.push(format!("error=\"{e}\""));
+        }
+        if let Some(m) = &self.metadata {
+            parts.push(format!("resource_metadata=\"{}\"", m.url));
+        }
+        if parts.is_empty() {
+            "Bearer".to_string()
+        } else {
+            format!("Bearer {}", parts.join(", "))
+        }
+    }
+
+    /// The metadata document, if this request asks for it. Served before
+    /// authentication: a client reads it to learn how to authenticate.
+    fn metadata_for(&self, method: &hyper::Method, path: &str) -> Option<&str> {
+        let m = self.metadata.as_ref()?;
+        (method == hyper::Method::GET && m.serves(path)).then_some(m.doc.as_str())
     }
 
     /// Is any identity source configured? Without one every request is the
@@ -346,7 +475,7 @@ impl HttpIdentity {
                 Ok(c) => c,
                 Err(e) => {
                     return Err(Refusal {
-                        challenge: "Bearer error=\"invalid_token\"",
+                        challenge: self.challenge(Some("invalid_token")),
                         reason: format!("invalid bearer token: {e:#}"),
                     })
                 }
@@ -359,13 +488,13 @@ impl HttpIdentity {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(Refusal {
-                            challenge: "Bearer error=\"invalid_token\"",
+                            challenge: self.challenge(Some("invalid_token")),
                             reason: "bearer token has been revoked".to_string(),
                         })
                     }
                     Err(e) => {
                         return Err(Refusal {
-                            challenge: "Bearer error=\"temporarily_unavailable\"",
+                            challenge: self.challenge(Some("temporarily_unavailable")),
                             reason: format!("could not verify token status: {e:#}"),
                         })
                     }
@@ -398,7 +527,7 @@ impl HttpIdentity {
             return Ok(process.clone());
         }
         Err(Refusal {
-            challenge: "Bearer",
+            challenge: self.challenge(None),
             reason: "unauthorized: this server requires an Authorization: Bearer token (or identity \
                      headers from the configured gateway)"
                 .to_string(),
@@ -604,11 +733,14 @@ pub async fn serve_http(
             let process_caller = process_caller.clone();
             let origin = origin.clone();
             async move {
+                if let Some(doc) = identity.metadata_for(req.method(), req.uri().path()) {
+                    return Ok(json_response(doc));
+                }
                 let caller = match identity.authenticate(req.headers(), &process_caller).await {
                     Ok(c) => c,
                     Err(r) => {
                         crate::log_info!("refused an HTTP request: {}", r.reason);
-                        return Ok(plain_response(hyper::StatusCode::UNAUTHORIZED, Some(r.challenge), &r.reason));
+                        return Ok(plain_response(hyper::StatusCode::UNAUTHORIZED, Some(&r.challenge), &r.reason));
                     }
                 };
                 // Never overrides a subject the request supplied; `rate_key`
@@ -681,10 +813,21 @@ fn client_fingerprint(conn: &rustls::ServerConnection) -> Option<String> {
     Some(format!("cert:{hex}"))
 }
 
+/// A 200 JSON response, same body shape as [`plain_response`].
+fn json_response(
+    doc: &str,
+) -> hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>> {
+    let body = http_body_util::BodyExt::boxed(http_body_util::Full::new(bytes::Bytes::from(doc.to_string())));
+    let mut res = hyper::Response::new(body);
+    res.headers_mut()
+        .insert(hyper::header::CONTENT_TYPE, hyper::header::HeaderValue::from_static("application/json"));
+    res
+}
+
 /// A plain-text response in the same body shape rmcp's service returns.
 fn plain_response(
     status: hyper::StatusCode,
-    www_authenticate: Option<&'static str>,
+    www_authenticate: Option<&str>,
     body: &str,
 ) -> hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>> {
     let body = http_body_util::BodyExt::boxed(http_body_util::Full::new(bytes::Bytes::from(body.to_string())));
@@ -717,6 +860,31 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_resource_gets_the_code_the_clients_revision_expects() {
+        let unknown = anyhow::Error::from(crate::surface::UnknownResource("x://y".into()));
+        assert_eq!(read_error(&unknown, "x://y", Some(ProtocolVersion::V_2026_07_28)).code.0, -32602);
+        assert_eq!(read_error(&unknown, "x://y", Some(ProtocolVersion::V_2025_11_25)).code.0, -32002);
+        assert_eq!(read_error(&unknown, "x://y", None).code.0, -32002);
+        let upstream = anyhow::Error::from(crate::modern::RpcError {
+            upstream: "u".into(),
+            method: "resources/read".into(),
+            error: json!({"code": -32603, "message": "disk on fire"}),
+        });
+        assert_eq!(read_error(&upstream, "x://y", None).code.0, -32603, "the upstream's code passes through");
+        let rpc = |code: i64| {
+            anyhow::Error::from(crate::modern::RpcError {
+                upstream: "u".into(),
+                method: "resources/read".into(),
+                error: json!({"code": code, "message": "m"}),
+            })
+        };
+        assert_eq!(read_error(&rpc(-32002), "x://y", Some(ProtocolVersion::V_2026_07_28)).code.0, -32602, "an upstream's not-found speaks the client's revision");
+        assert_eq!(read_error(&rpc(-32002), "x://y", None).code.0, -32002);
+        assert_eq!(read_error(&rpc(-32022), "x://y", None).code.0, -32603, "the upstream hop's negotiation is not the client's problem");
+        assert_eq!(read_error(&anyhow::anyhow!("transport"), "x://y", None).code.0, -32603);
+    }
+
+    #[test]
     fn a_malformed_field_costs_the_field_not_the_tool() {
         let tool = json_to_tool(&json!({"name": "t", "description": "d", "inputSchema": {}, "annotations": "nonsense"}));
         assert_eq!(tool.unwrap().name, "t");
@@ -738,6 +906,7 @@ mod tests {
             subject_claim: "sub".into(),
             trusted: trusted.then(|| TrustedHeaders { scopes: "X-Scopes".into(), subject: Some("X-User".into()) }),
             allow_anonymous,
+            metadata: None,
         }
     }
 
@@ -747,6 +916,54 @@ mod tests {
             h.insert(*k, hyper::header::HeaderValue::from_str(v).unwrap());
         }
         h
+    }
+
+    fn published(resource: &str) -> crate::config::ProtectedResource {
+        crate::config::ProtectedResource {
+            resource: resource.into(),
+            authorization_servers: vec!["https://idp.example.com".into()],
+            scopes_supported: vec!["store.read".into()],
+        }
+    }
+
+    #[test]
+    fn resource_metadata_lives_at_the_rfc_9728_path() {
+        let m = ResourceMetadata::new(&published("https://mcp.example.com/mcp/"));
+        assert_eq!(m.url, "https://mcp.example.com/.well-known/oauth-protected-resource/mcp");
+        assert!(m.serves("/.well-known/oauth-protected-resource/mcp"));
+        assert!(m.serves("/.well-known/oauth-protected-resource"), "the root form clients fall back to");
+        assert!(m.serves("/.well-known/oauth-protected-resource/mcp/"), "and the literal trailing-slash form");
+        assert!(!m.serves("/mcp"));
+        let doc: Value = serde_json::from_str(&m.doc).unwrap();
+        assert_eq!(doc["resource"], "https://mcp.example.com/mcp/");
+        assert_eq!(doc["authorization_servers"], json!(["https://idp.example.com"]));
+        assert_eq!(doc["scopes_supported"], json!(["store.read"]));
+
+        let root = ResourceMetadata::new(&published("https://mcp.example.com"));
+        assert_eq!(root.url, "https://mcp.example.com/.well-known/oauth-protected-resource");
+    }
+
+    #[tokio::test]
+    async fn a_published_resource_is_named_in_challenges_and_is_the_audience() {
+        let auth: crate::config::Auth = serde_yaml::from_str(
+            "jwt_secret: test-secret\nprotected_resource:\n  resource: https://mcp.example.com/mcp\n  authorization_servers: [https://idp.example.com]\n",
+        )
+        .unwrap();
+        let id = HttpIdentity::from_auth(&auth, Some(Arc::new(JwtVerifier::Hs256(SECRET.as_bytes().to_vec()))), None);
+        let process = Arc::new(Caller::default());
+        let want = r#"resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp""#;
+
+        let r = id.authenticate(&headers(&[]), &process).await.unwrap_err();
+        assert_eq!(r.challenge, format!("Bearer {want}"));
+        assert!(id.metadata_for(&hyper::Method::GET, "/.well-known/oauth-protected-resource/mcp").is_some());
+        assert!(id.metadata_for(&hyper::Method::POST, "/.well-known/oauth-protected-resource/mcp").is_none());
+
+        // A token for another service is refused; one for this resource is not.
+        let other = mint(json!({"exp": 4_000_000_000u64, "aud": "https://other.example.com"}));
+        let r = id.authenticate(&headers(&[("authorization", &format!("Bearer {other}"))]), &process).await.unwrap_err();
+        assert!(r.challenge.starts_with("Bearer error=\"invalid_token\", ") && r.challenge.ends_with(want), "{}", r.challenge);
+        let ours = mint(json!({"exp": 4_000_000_000u64, "aud": "https://mcp.example.com/mcp"}));
+        id.authenticate(&headers(&[("authorization", &format!("Bearer {ours}"))]), &process).await.expect("our audience");
     }
 
     #[tokio::test]

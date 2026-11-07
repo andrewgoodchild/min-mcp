@@ -16,8 +16,8 @@ No network, no credentials, no model:
 ```
 | spec                        | tools    | raw tokens | minified | compression |
 |-----------------------------|----------|-----------:|---------:|------------:|
-| acme-store (bundled, 4 ops) | 4 → 3    |        498 |      424 |          1× |
-| bigapi (bundled, 120 ops)   | 120 → 3  |     17,350 |      424 |         41× |
+| acme-store (bundled, 4 ops) | 4 → 3    |        498 |      442 |          1× |
+| bigapi (bundled, 120 ops)   | 120 → 3  |     17,350 |      442 |         39× |
 ```
 
 The same assertions run in CI as `tests/compression.rs`, so the headline can't
@@ -53,13 +53,14 @@ GITHUB_PERSONAL_ACCESS_TOKEN=ghp_… ./target/release/minmcp inspect --config gh
 
 **85 tools → 3; ~20,822 tokens of definitions → ~424 (49×)** — measured
 2026-08-09. That is one server; the interesting part is that the 424 doesn't
-move when you add more.
+move when you add more. It is ~442 (47×) since the read-only hint on
+`search_tools` and `get_tool_details`.
 
 ## Scale
 
 - **A naive 2-server stack** (Stripe 587 + GitHub 1,216 = 1,803 tools) is
   **~687K tokens of tool definitions — it doesn't fit a context window at all.**
-  min-mcp collapses it to a flat **~424 tokens (~1,600×)**, constant however
+  min-mcp collapses it to a flat **~442 tokens (~1,550×)**, constant however
   many upstreams you add.
 - **Microsoft Graph's 17,531 operations** (a 42 MB spec, ~3.26M raw tokens)
   mount, index, and become searchable in **~1.9s**, via lazy schema

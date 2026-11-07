@@ -165,7 +165,7 @@ Everything below runs from the repo root. See it work on the bundled
 
 ```sh
 ./target/release/minmcp inspect --config bench/bigapi.yaml
-# 120 upstream tools → 3 surface tools; ~17,350 tokens of definitions → ~424
+# 120 upstream tools → 3 surface tools; ~17,350 tokens of definitions → ~442
 ```
 
 Explore that surface without an agent — the CLI mirrors the three tools:
@@ -192,7 +192,7 @@ enabled (needs Docker and a GitHub token):
 ```sh
 GITHUB_PERSONAL_ACCESS_TOKEN=ghp_... \
   ./target/release/minmcp inspect --config examples/github-mcp-server.yaml
-# 85 upstream tools → 3 surface tools; ~20,822 tokens → ~424  (49×)
+# 85 upstream tools → 3 surface tools; ~20,822 tokens → ~442  (47×)
 ```
 
 Then point it at your own upstreams — MCP servers you already run, or a spec:
@@ -227,9 +227,9 @@ structured errors taking a weak agent 0%→100%, a composite cutting a task 6.8�
 is measured too; see [Measurements](docs/measurements.md)):
 
 - **85 tools → 3** proxying GitHub's official MCP server: ~20,822 tokens of
-  definitions → **~424** (49×). Add more upstreams and the 424 does not move.
+  definitions → **~442** (47×). Add more upstreams and the 442 does not move.
 - **A Stripe + GitHub stack (1,803 tools) is ~687K tokens** — it does not fit a
-  context window; min-mcp serves it in ~424.
+  context window; min-mcp serves it in ~442.
 - **Behaviour preserved:** proxying a 587-tool Stripe server reproduced its
   task-success set *exactly* at **58× fewer tokens**, verified against live API
   state with no LLM judges.

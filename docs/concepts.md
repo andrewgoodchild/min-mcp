@@ -98,7 +98,7 @@ Three declarations, whatever the upstreams hold — one server or twenty, 4
 operations or 17,531.
 
 > **When not to minify.** Three meta-tools have a floor cost of their own
-> (~424 tokens), so below roughly a dozen upstream tools they cost *more* than
+> (~442 tokens), so below roughly a dozen upstream tools they cost *more* than
 > simply declaring everything. For that case there's `mode: passthrough`, which
 > federates tools directly with no search step, and it's also the mode to use behind
 > a client with its own tool search. Each tool keeps its upstream name (a name two

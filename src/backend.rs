@@ -55,11 +55,13 @@ impl Reach {
 impl Backend {
     /// `idx` is this backend's position in the Surface's backend list, stamped
     /// onto each ToolDef so dispatch can route back here.
-    pub async fn list_tools(&self, idx: usize) -> Result<Vec<ToolDef>> {
+    /// The listing and its freshness hint (`ttlMs`), for re-indexing. A spec
+    /// is loaded once and never changes, so it has none.
+    pub async fn list_tools_ttl(&self, idx: usize) -> Result<(Vec<ToolDef>, Option<u64>)> {
         match self {
-            Backend::Mcp(u) => u.list_tools(idx).await,
-            Backend::Http(h) => h.list_tools(idx).await,
-            Backend::Spec(s) => Ok(s.list_tools(idx)),
+            Backend::Mcp(u) => u.list_tools_ttl(idx).await,
+            Backend::Http(h) => h.list_tools_ttl(idx).await,
+            Backend::Spec(s) => Ok((s.list_tools(idx), None)),
         }
     }
 
@@ -115,12 +117,21 @@ impl Backend {
         }
     }
 
-    /// Has the upstream announced that its tool catalog changed since this
-    /// proxy snapshotted it at startup? Surfaced by `inspect`.
+    /// Has the upstream announced that its tool catalog changed since min-mcp
+    /// last listed it? Surfaced by `inspect`; cleared by a re-index.
     pub fn stale(&self) -> bool {
         match self {
             Backend::Mcp(u) => u.stale(),
             Backend::Http(h) => h.stale(),
+            Backend::Spec(_) => false,
+        }
+    }
+
+    /// Read and clear [`Self::stale`].
+    pub fn take_stale(&self) -> bool {
+        match self {
+            Backend::Mcp(u) => u.take_stale(),
+            Backend::Http(h) => h.take_stale(),
             Backend::Spec(_) => false,
         }
     }
