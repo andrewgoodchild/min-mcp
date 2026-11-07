@@ -7,6 +7,19 @@
 
 use super::*;
 
+/// A URI no visible upstream lists. Typed so the protocol layer can answer
+/// with the not-found code the client's revision expects.
+#[derive(Debug)]
+pub struct UnknownResource(pub String);
+
+impl std::fmt::Display for UnknownResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown resource uri {:?} — list resources first", self.0)
+    }
+}
+
+impl std::error::Error for UnknownResource {}
+
 /// Our own MCP resource: the source map, over the protocol.
 const SOURCE_MAP_URI: &str = "minmcp://tools";
 
@@ -18,7 +31,7 @@ impl Surface {
     /// scope on and stays visible.
     pub(super) fn upstream_visible(&self, caller: &Caller, idx: usize) -> bool {
         let mut has_tools = false;
-        for t in self.tools.iter().filter(|t| t.upstream_idx == idx) {
+        for t in self.cat().tools.iter().filter(|t| t.upstream_idx == idx) {
             has_tools = true;
             if self.allowed(caller, t.id()) {
                 return true;
@@ -84,13 +97,13 @@ impl Surface {
             None => {
                 let _ = self.list_resources(caller).await; // refresh the routing table
                 let Some(i) = lock(&self.resource_origin).get(uri).copied() else {
-                    anyhow::bail!("unknown resource uri {uri:?} — list resources first");
+                    return Err(UnknownResource(uri.to_string()).into());
                 };
                 i
             }
         };
         if !self.upstream_visible(caller, idx) {
-            anyhow::bail!("unknown resource uri {uri:?}"); // invisible, not forbidden
+            return Err(UnknownResource(uri.to_string()).into()); // invisible, not forbidden
         }
         self.upstreams[idx].read_resource(uri).await
     }

@@ -8,10 +8,9 @@
 //! behind one another and a slow call never blocks a fast one.
 //!
 //! **Self-healing.** A child that exits is respawned on the next call (with a
-//! crash-loop guard), re-initialized, and the call proceeds. The tool catalog
-//! is a startup snapshot: if the new instance announces a different catalog
-//! (`notifications/tools/list_changed`), the upstream is flagged stale in
-//! `inspect` and a restart is advised.
+//! crash-loop guard), re-initialized, and the call proceeds. If it announces a
+//! different catalog (`notifications/tools/list_changed`), the upstream is
+//! flagged stale and the surface re-indexes it on the next request.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -38,6 +37,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(TRANSPORT_CEILING_S);
 /// this window of starting is a crash loop: callers get an error until the
 /// window passes, instead of a fork storm.
 const MIN_RESPAWN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a cancellation notice may wait on the child's stdin.
+const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Typed marker for an overlay `timeout_s` deadline expiring — dispatch
 /// downcasts it into an agent-facing isError instead of a protocol error.
@@ -99,19 +101,30 @@ pub trait McpRpc {
         self.rpc("tools/call", json!({"name": name, "arguments": arguments}), deadline).await
     }
 
+    #[cfg(test)]
     async fn list_tools(&self, upstream_idx: usize) -> Result<Vec<ToolDef>> {
+        Ok(self.list_tools_ttl(upstream_idx).await?.0)
+    }
+
+    /// The listing, and how long the upstream says it stays fresh: the first
+    /// page's `ttlMs` (MCP 2026-07-28), `None` when it sends none.
+    async fn list_tools_ttl(&self, upstream_idx: usize) -> Result<(Vec<ToolDef>, Option<u64>)> {
         let mut tools = Vec::new();
+        let mut ttl = None;
         let mut cursor: Option<String> = None;
-        for _ in 0..LIST_MAX_PAGES {
+        for page in 0..LIST_MAX_PAGES {
             let result = self.rpc("tools/list", cursor_params(&cursor), None).await?;
+            if page == 0 {
+                ttl = result.get("ttlMs").and_then(Value::as_u64);
+            }
             let next = push_tools_page(&result, self.rpc_name(), upstream_idx, &mut tools);
             // a non-advancing cursor would refetch the same page forever
             if next.is_none() || next == cursor {
-                return Ok(tools);
+                return Ok((tools, ttl));
             }
             cursor = next;
         }
-        Ok(tools)
+        Ok((tools, ttl))
     }
 
     /// Best-effort passthrough listing: an upstream without the capability (or
@@ -148,7 +161,14 @@ pub trait McpRpc {
 /// Protocol version min-mcp announces in the legacy `initialize` handshake. (The
 /// agent-facing server side negotiates versions via rmcp; modern upstreams get
 /// [`modern::MODERN_VERSION`].)
-pub const PROTOCOL_VERSION: &str = "2025-06-18";
+/// The server answers with the version it will speak, which may be older.
+pub const PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// The version a legacy `initialize` result settled on: the server's choice,
+/// or ours if it named none.
+pub fn negotiated_version(result: &Value) -> String {
+    result.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION).to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolDef {
@@ -221,8 +241,8 @@ struct Shared {
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, Value>>>>,
     /// Set by the reader on EOF/error; `Upstream::connection` respawns.
     dead: AtomicBool,
-    /// Set when the upstream announces `tools/list_changed` (catalog snapshot
-    /// is now stale). Shared with the owning `Upstream` across respawns.
+    /// Set when the upstream announces `tools/list_changed`; cleared when the
+    /// surface re-lists it. Shared with the owning `Upstream` across respawns.
     stale: Arc<AtomicBool>,
 }
 
@@ -331,6 +351,19 @@ impl Conn {
         Self::send_line(&self.shared, &json!({"jsonrpc": "2.0", "method": method, "params": params})).await
     }
 
+    /// Tell the upstream to stop work on a request we gave up on, as MCP requires
+    /// of stdio clients. Without it the upstream finishes the call anyway, so a
+    /// retried write runs twice. Best effort and bounded: a child too wedged to
+    /// read its stdin must not hold the caller past its own deadline. Never for
+    /// the probe or `initialize`, which the spec says must not be cancelled.
+    async fn cancel(&self, id: i64, method: &str) {
+        if matches!(method, "initialize" | "server/discover") {
+            return;
+        }
+        let params = json!({"requestId": id, "reason": "min-mcp: request timed out"});
+        let _ = timeout(CANCEL_WRITE_TIMEOUT, self.notify("notifications/cancelled", params)).await;
+    }
+
     /// Send a request and await ITS response. The write completes before the
     /// deadline starts, deliberately: cancelling a stdio write mid-frame would
     /// leave a partial line in the pipe. On expiry the pending slot is dropped,
@@ -375,6 +408,7 @@ impl Conn {
             Ok(r) => r,
             Err(_) => {
                 lock(&self.shared.pending).remove(&id);
+                self.cancel(id, method).await;
                 Err(match deadline {
                     Some(d) => anyhow::Error::new(TimeoutElapsed { secs: d.as_secs() }),
                     None => anyhow!("upstream {} timed out on {method}", self.shared.name),
@@ -414,8 +448,7 @@ async fn read_loop(mut lines: Lines<BufReader<ChildStdout>>, shared: Arc<Shared>
                 None if method == "notifications/tools/list_changed" => {
                     shared.stale.store(true, Ordering::Relaxed);
                     crate::log_warn!(
-                        "upstream {} announced tools/list_changed; the catalog is a startup snapshot — \
-                         restart minmcp to pick up the new tools (flagged in `inspect` as upstreams_stale)",
+                        "upstream {} announced tools/list_changed; re-indexing it on the next request",
                         shared.name
                     );
                 }
@@ -487,6 +520,12 @@ impl Upstream {
     /// Has this upstream announced a catalog change since startup?
     pub fn stale(&self) -> bool {
         self.stale.load(Ordering::Relaxed)
+    }
+
+    /// Read and clear the stale flag: a refresh is about to re-list, and a
+    /// notification arriving during it sets the flag again.
+    pub fn take_stale(&self) -> bool {
+        self.stale.swap(false, Ordering::Relaxed)
     }
 
     /// The current connection, if it is still running.
@@ -573,6 +612,31 @@ mod tests {
     async fn listed_by(discover: &str) -> Vec<String> {
         let up = spawn_script(&LOOP.replace("DISCOVER", discover)).await.expect("spawn");
         up.list_tools(0).await.expect("list").into_iter().map(|t| t.name).collect()
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_call_is_cancelled_upstream() {
+        // The upstream never answers tools/call and records what it is told.
+        let mark = std::env::temp_dir().join(format!("minmcp_cancel_{}", std::process::id()));
+        let _ = std::fs::remove_file(&mark);
+        let script = LOOP.replace("DISCOVER", ":").replace(
+            "      esac\n    done",
+            &format!("        *'\"method\":\"notifications/cancelled\"'*) printf '%s\\n' \"$line\" >> {} ;;\n      esac\n    done", mark.display()),
+        );
+        let up = spawn_script(&script).await.expect("spawn");
+        let err = up.rpc("tools/call", json!({"name": "slow"}), Some(Duration::from_millis(300))).await.unwrap_err();
+        assert!(err.downcast_ref::<TimeoutElapsed>().is_some(), "{err:#}");
+        let mut seen = String::new();
+        for _ in 0..50 {
+            seen = std::fs::read_to_string(&mark).unwrap_or_default();
+            if !seen.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_file(&mark);
+        assert!(seen.contains(r#""requestId""#), "the upstream must be told to stop: {seen:?}");
+        assert!(!seen.contains("server/discover"), "the silent probe is never cancelled: {seen:?}");
     }
 
     #[tokio::test]

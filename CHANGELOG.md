@@ -6,6 +6,67 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Security
+
+- **Overlay redaction and `fields` now reach `structuredContent`.** An MCP result carries its
+  payload twice, as text and as `structuredContent`, and only the text was shaped. A field an
+  overlay `remove`d, such as a secret, still reached any client that reads the structured copy,
+  and the result budget didn't bound it. Both copies are now shaped the same way. A structured
+  copy over budget, or one a transform turns into a non-object, is dropped, and the text block
+  carries the result. A passthrough tool that declares an `outputSchema` keeps its structured
+  copy whatever its size, because MCP requires it and strict clients reject a result without it.
+- **Credentials no longer follow a redirect to another host.** reqwest strips `Authorization`
+  on a cross-host redirect but forwards every other header, and on a 307 or 308 the body too.
+  A configured `X-Api-Key: ${secret}`, or an OAuth or introspection client secret, could reach
+  a third party through an open redirect. Upstream, OAuth and introspection clients now follow
+  redirects only within their starting origin, or from `http` to `https` on the same host, and
+  report a refused redirect by naming both origins. **This can break an upstream that
+  legitimately redirects off its origin**, such as a download that 302s to a CDN or a
+  pre-signed storage URL; there is no opt-out yet.
+- **Upstream HTTP responses are capped at 32 MiB.** min-mcp buffered whatever an upstream sent,
+  so a misbehaving one could exhaust its memory. Larger responses are refused.
+- **`serve --http` warns when bearer tokens are verified without an audience check.** A token
+  minted for another service was accepted, which MCP forbids. Set `auth.audience` or
+  `auth.protected_resource`.
+
+### Added
+
+- **Upstreams whose tools change are re-indexed without a restart.** The catalog used to be a
+  startup snapshot: a `tools/list_changed` was only logged, with advice to restart. Now the next
+  request re-lists that upstream, rebuilds search and the passthrough listing, and swaps them in
+  whole, so a request in flight finishes on the catalog it started with. A 2026-07-28 upstream,
+  which announces changes only to subscribers, is re-checked when its listing's `ttlMs` runs out,
+  at most every 10 seconds. The startup checks still apply, to each changed upstream on its own: a
+  strong overlay binding that breaks, or a tool that trips `poisoning_policy: strict`, refuses
+  that upstream's new tools and keeps its last good ones serving, with an error logged and a retry
+  in 30 seconds, instead of stopping the proxy. In passthrough the client
+  whose request re-indexed gets `notifications/tools/list_changed`, and min-mcp now advertises
+  `tools.listChanged`; other clients see the change when their cached list expires.
+- **OAuth protected-resource metadata (RFC 9728).** With `auth.protected_resource`, min-mcp
+  serves `/.well-known/oauth-protected-resource` without a token and names it in every 401, so a
+  standard MCP client can find the authorization server on its own. MCP requires this of an
+  OAuth-protected server. Tokens must then carry the resource as their audience.
+- **A timed-out call to a stdio upstream is cancelled** with `notifications/cancelled`, as MCP
+  requires, so the upstream stops work instead of finishing a call min-mcp already gave up on.
+
+### Changed
+
+- **OAuth token requests now name their resource (RFC 8707),** as MCP requires. `resource`
+  defaults to the upstream's `url`; `oauth.resource` overrides it. **A token server that rejects
+  the parameter will now fail on upgrade**, Azure AD's v2 endpoint among them; set
+  `oauth.resource: ""` to omit it.
+- **The legacy handshake offers MCP 2025-11-25,** up from 2025-06-18, and HTTP upstreams then
+  receive the version the server chose in `MCP-Protocol-Version`, not the one min-mcp offered.
+- **An unknown resource is error -32602 for MCP 2026-07-28 clients,** as that revision requires,
+  and -32002 for older ones, whether min-mcp or the upstream found it missing. An upstream's other
+  error codes now pass through, except its version and capability negotiation errors with
+  min-mcp, and other failures are internal errors rather than "not found".
+- **Lists may be cached for a minute.** Tool, prompt and resource lists carry `ttlMs: 60000` and
+  `cacheScope: private`, so clients stop refetching them before every use.
+- **`search_tools` and `get_tool_details` are marked `readOnlyHint`,** so hosts can approve them
+  without asking. The three-tool surface grows from about 424 to 442 tokens.
+- **rmcp 3.9.0,** up from 3.8.0.
+
 ## [0.4.0] — 2026-11-07
 
 ### Fixed

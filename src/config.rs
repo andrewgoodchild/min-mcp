@@ -122,6 +122,11 @@ pub struct OAuthConfig {
     /// Optional space-delimited scopes to request.
     #[serde(default)]
     pub scope: Option<String>,
+    /// The RFC 8707 `resource` sent with every token request, which MCP
+    /// requires. Defaults to the upstream's `url`; `""` sends none, for a token
+    /// server that rejects it.
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 impl UpstreamConfig {
@@ -817,6 +822,27 @@ pub struct Auth {
     /// scoping gets bypassed.
     #[serde(default)]
     pub allow_anonymous: bool,
+    /// HTTP only. Publish OAuth protected-resource metadata (RFC 9728), which
+    /// MCP requires of an OAuth-protected server, so a standard client can find
+    /// the authorization server on its own. Needs a JWT verifier. See
+    /// [`ProtectedResource`].
+    #[serde(default)]
+    pub protected_resource: Option<ProtectedResource>,
+}
+
+/// What `/.well-known/oauth-protected-resource` says about this server.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedResource {
+    /// This server's canonical URL as clients reach it, e.g.
+    /// `https://mcp.example.com/mcp`. Also the audience tokens must carry,
+    /// unless `auth.audience` says otherwise.
+    pub resource: String,
+    /// Issuer URLs of the authorization servers that mint tokens for it.
+    pub authorization_servers: Vec<String>,
+    /// Scopes worth requesting, advertised to clients.
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
 }
 
 /// Transport-level hardening for the HTTP listener: TLS, and caps bounding what
@@ -970,6 +996,7 @@ impl Default for Auth {
             trusted_headers: None,
             introspection: None,
             allow_anonymous: false,
+            protected_resource: None,
         }
     }
 }
@@ -1245,6 +1272,22 @@ impl Config {
                 "auth.allow_anonymous is set but no caller identity is configured (a JWT verifier \
                  or trusted_headers) — without one every request is already the process identity"
             );
+        }
+        if let Some(pr) = &self.auth.protected_resource {
+            if !self.auth.has_verifier() {
+                anyhow::bail!(
+                    "auth.protected_resource needs a JWT verifier (jwks_url, jwt_public_key or \
+                     jwt_secret): it tells clients to bring tokens min-mcp could not check"
+                );
+            }
+            let url = reqwest::Url::parse(&pr.resource)
+                .with_context(|| format!("auth.protected_resource.resource {:?} is not a URL", pr.resource))?;
+            if url.fragment().is_some() || !matches!(url.scheme(), "https" | "http") {
+                anyhow::bail!("auth.protected_resource.resource must be an http(s) URL without a fragment");
+            }
+            if pr.authorization_servers.is_empty() {
+                anyhow::bail!("auth.protected_resource.authorization_servers must name at least one issuer");
+            }
         }
         let mut seen = HashSet::new();
         for o in &self.overlays {
@@ -1560,6 +1603,14 @@ overlays:
         assert_eq!(c.secrets.cache_ttl_s, 300);
         assert_eq!(c.auth.subject_claim, "email");
         assert!(c.auth.allow_anonymous && c.auth.has_verifier());
+        for (yaml, want) in [
+            ("protected_resource: {resource: https://h/mcp, authorization_servers: [https://idp]}", "needs a JWT verifier"),
+            ("jwt_secret: s\n  protected_resource: {resource: not-a-url, authorization_servers: [https://idp]}", "not a URL"),
+            ("jwt_secret: s\n  protected_resource: {resource: https://h/mcp, authorization_servers: []}", "at least one issuer"),
+        ] {
+            let err = Config::from_yaml(&format!("upstreams: []\nauth:\n  {yaml}\n")).unwrap_err();
+            assert!(format!("{err:#}").contains(want), "{err:#}");
+        }
         let anon = Config::from_yaml("upstreams: []\nauth:\n  allow_anonymous: true\n").unwrap_err();
         assert!(format!("{anon:#}").contains("allow_anonymous"), "{anon:#}");
         // both vault logins → rejected; both key sources on an upstream → rejected

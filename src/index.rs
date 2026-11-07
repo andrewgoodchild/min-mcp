@@ -336,6 +336,12 @@ impl Index {
         Index { engine, meta, exact, usage: RwLock::new(HashMap::new()), opts }
     }
 
+    /// Carry another index's usage prior over, so re-indexing an upstream
+    /// doesn't forget which tools agents have been using.
+    pub fn inherit_usage(&self, from: &Index) {
+        *write(&self.usage) = read(&from.usage).clone();
+    }
+
     pub fn record_use(&self, tool_id: &str) {
         *write(&self.usage).entry(tool_id.to_string()).or_default() += 1;
     }

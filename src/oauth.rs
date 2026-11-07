@@ -21,6 +21,8 @@ pub struct OAuthClient {
     /// `${…}`-resolved; a secret, so never in Debug output.
     client_secret: SecretString,
     scope: Option<String>,
+    /// RFC 8707 audience; `None` when configured off.
+    resource: Option<String>,
     /// The current token and when it stops being usable. A std lock: reads are
     /// the common case and must not queue behind an in-flight fetch.
     cached: Mutex<Option<(SecretString, Instant)>>,
@@ -30,13 +32,15 @@ pub struct OAuthClient {
 }
 
 impl OAuthClient {
-    pub async fn new(cfg: &OAuthConfig, secrets: &Secrets) -> Result<Self> {
+    /// `upstream_url` is the default `resource`: the MCP server the token is for.
+    pub async fn new(cfg: &OAuthConfig, upstream_url: &str, secrets: &Secrets) -> Result<Self> {
         // Bound the token fetch: bearer() is awaited before every HTTP-upstream
         // request, so a hung token endpoint would stall min-mcp indefinitely
         // (reqwest has no default timeout). Token endpoints respond fast.
         crate::crypto::install_provider();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(crate::redirect::same_origin())
             .build()
             .context("building OAuth HTTP client")?;
         Ok(OAuthClient {
@@ -45,6 +49,11 @@ impl OAuthClient {
             client_id: cfg.client_id.clone(),
             client_secret: SecretString::from(secrets.expand(&cfg.client_secret).await?),
             scope: cfg.scope.clone(),
+            resource: match cfg.resource.as_deref() {
+                Some("") => None,
+                Some(r) => Some(r.to_string()),
+                None => Some(upstream_url.to_string()),
+            },
             cached: Mutex::new(None),
             fetching: tokio::sync::Mutex::new(()),
         })
@@ -74,6 +83,9 @@ impl OAuthClient {
         ];
         if let Some(scope) = &self.scope {
             form.push(("scope", scope.as_str()));
+        }
+        if let Some(resource) = &self.resource {
+            form.push(("resource", resource.as_str()));
         }
         let resp = self
             .client
@@ -135,11 +147,12 @@ mod tests {
             client_id: "id-1".into(),
             client_secret: "shh".into(),
             scope: Some("read write".into()),
+            resource: None,
         }
     }
 
     async fn client(url: String) -> OAuthClient {
-        OAuthClient::new(&cfg(url), &Secrets::env_only()).await.expect("build client")
+        OAuthClient::new(&cfg(url), "https://mcp.example.com/mcp", &Secrets::env_only()).await.expect("build client")
     }
 
     #[tokio::test]
@@ -153,6 +166,26 @@ mod tests {
         let body = &srv.seen()[0].body;
         for field in ["grant_type=client_credentials", "client_id=id-1", "client_secret=shh", "scope=read"] {
             assert!(body.contains(field), "form missing {field}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_token_request_names_the_resource_it_is_for() {
+        // MCP requires RFC 8707 `resource`; it defaults to the upstream's URL.
+        let srv = testserver::spawn(|_, _| Reply::json(r#"{"access_token":"t"}"#)).await;
+        client(srv.url()).await.bearer().await.unwrap();
+        assert!(srv.seen()[0].body.contains("resource=https%3A%2F%2Fmcp.example.com%2Fmcp"), "{}", srv.seen()[0].body);
+
+        // An explicit value wins, and "" sends none, for servers that reject it.
+        for (set, want) in [("https://api.example.com", Some("resource=https%3A%2F%2Fapi.example.com")), ("", None)] {
+            let srv = testserver::spawn(|_, _| Reply::json(r#"{"access_token":"t"}"#)).await;
+            let c = OAuthConfig { resource: Some(set.into()), ..cfg(srv.url()) };
+            OAuthClient::new(&c, "https://mcp.example.com/mcp", &Secrets::env_only()).await.unwrap().bearer().await.unwrap();
+            let body = &srv.seen()[0].body;
+            match want {
+                Some(w) => assert!(body.contains(w), "{body}"),
+                None => assert!(!body.contains("resource="), "{body}"),
+            }
         }
     }
 

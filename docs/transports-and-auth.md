@@ -105,6 +105,8 @@ Signature and `exp` are always checked. `audience` and `issuer` are off unless
 set — an internal gateway with no audience discipline still works — but where
 one issuer mints tokens for several services, set both so a token for another
 service doesn't grant scopes here.
+MCP requires the audience check, so `serve --http` warns at startup when a
+verifier is configured without `audience` or `protected_resource`.
 
 A JWKS set is **live**. It is fetched at startup (30s timeout, a failure is a
 startup error) and refreshed by the verifier itself: when a token names a `kid`
@@ -169,6 +171,28 @@ MINMCP_JWT="$CALLER_JWT" minmcp serve --config myconfig.yaml
 
 For local dev without JWTs, `--scopes billing.read,billing.write` sets a process
 identity directly.
+
+#### Letting standard MCP clients find your authorization server
+
+A client that connects to min-mcp directly, with no gateway minting its token,
+learns where to log in from OAuth protected-resource metadata (RFC 9728), which
+MCP requires of an OAuth-protected server. Publish it with:
+
+```yaml
+auth:
+  jwks_url: https://auth.example.com/.well-known/jwks.json
+  protected_resource:
+    resource: https://mcp.example.com/mcp            # this server, as clients reach it
+    authorization_servers: [https://auth.example.com]
+    scopes_supported: [billing.read, billing.write]  # optional
+```
+
+min-mcp then serves the document, without a token, at
+`/.well-known/oauth-protected-resource/mcp` (and at the root form clients fall
+back to). Every 401 names it in `WWW-Authenticate: Bearer resource_metadata="…"`.
+Tokens must carry `resource` as their audience unless `audience` says otherwise.
+A verifier is required. min-mcp checks tokens but does not issue them, so the
+login flow itself is between the client and your authorization server.
 
 ### 3b. Behind a gateway that already authenticated the caller
 
@@ -518,7 +542,10 @@ upstreams:
 ```
 
 The token is refreshed shortly before expiry (single-flight under concurrency),
-so you never mint one by hand. See
+so you never mint one by hand. Each token request names the upstream's `url` as
+its RFC 8707 `resource`; set `oauth.resource` to override it, or `""` to omit it.
+Redirects from the token endpoint are followed only within its own origin, so the
+client secret never goes anywhere else. See
 [`examples/oauth-upstream.yaml`](../examples/oauth-upstream.yaml).
 
 ## Upstream health
@@ -532,12 +559,18 @@ so you never mint one by hand. See
   once and the request retried.
 - **`optional: true`** on an upstream skips it with a warning when it can't
   start, instead of failing the whole proxy.
-- **The catalog is a startup snapshot.** If an upstream announces
-  `notifications/tools/list_changed`, min-mcp flags it in `inspect` as
-  `upstreams_stale` and logs a warning; picking up the new tools takes a
-  restart. A 2026-07-28 upstream only sends that notification on a
-  `subscriptions/listen` stream, which min-mcp doesn't open, so a change there
-  goes unnoticed until the restart.
+- **An upstream whose tools change is re-indexed while min-mcp runs.** The
+  signal is `notifications/tools/list_changed`, or for a 2026-07-28 upstream,
+  which announces changes only to subscribers, the `ttlMs` on its last listing
+  (re-checked at most every 10 seconds). The next request re-lists that upstream
+  alone, rebuilds search and the passthrough listing, and runs the startup checks
+  on the result, one changed upstream at a time. If a strong overlay binding
+  breaks or `poisoning_policy: strict` trips, that upstream's new tools are
+  refused and its last good ones keep serving, with an error in the log and a
+  retry in 30 seconds. A passthrough client is sent `notifications/tools/list_changed`
+  by the request that re-indexed; others see the change when their cached list
+  expires, within a minute. A request in flight finishes on the catalog it
+  started with. Shadow mode keeps scoring against the startup catalog.
 
 ## `scopes` vs `filters`
 
@@ -549,6 +582,14 @@ so you never mint one by hand. See
 
 ## Security notes
 
+- Clients that carry a credential (spec and MCP-over-HTTP upstreams, OAuth token
+  fetches, token introspection) follow a redirect only within the origin they
+  started at, or from `http` to `https` on the same host. Anything else fails with
+  an error naming both origins, so a configured key or client secret never reaches
+  another host. An upstream that legitimately redirects elsewhere, such as a
+  download served from a CDN, fails the same way. The Vault client is not covered:
+  it uses its own HTTP client, so point `secrets.vault` at the active node rather
+  than at a standby that redirects.
 - Agent-supplied path params on spec upstreams are strictly segment-encoded, so a
   value like `../` can't escape its endpoint.
 - HTTP serving is loopback-only unless every request must authenticate,

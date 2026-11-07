@@ -19,12 +19,13 @@ impl Surface {
         // Invert exposed (name -> id) so each tool can show the MCP name it is
         // declared under in the current mode (null in three_tool: reached via
         // call_tool by id, not declared by name).
+        let cat = self.cat();
         let mut name_of: HashMap<&str, &str> = HashMap::new();
-        for (name, id) in &self.exposed {
+        for (name, id) in &cat.exposed {
             name_of.insert(id.as_str(), name.as_str());
         }
         let mut collisions = 0usize;
-        let tools: Vec<Value> = self
+        let tools: Vec<Value> = cat
             .tools
             .iter()
             .filter(|t| caller.is_none_or(|c| self.allowed(c, t.id())))
@@ -43,7 +44,7 @@ impl Surface {
                 if exposed_as.is_some_and(|n| n != sanitize_name(&t.name, 0) && n != sanitize_name(t.id(), 0)) {
                     collisions += 1;
                 }
-                let live_sha = self.origin_sha.get(t.id()).cloned().unwrap_or_default();
+                let live_sha = cat.origin_sha.get(t.id()).cloned().unwrap_or_default();
                 let resolved = self.raw_resolved(t);
                 let overlay = self.config.overlay_for(t.id()).map(|o| {
                     let (status, reasons) = binding_status(o, Some(&resolved), &live_sha);
@@ -75,7 +76,7 @@ impl Surface {
             .iter()
             // scoped view: never leak ids of tools the caller can't see
             .filter(|_| !visible_only)
-            .filter(|o| self.def_for(&o.tool).is_none())
+            .filter(|o| cat.def(&o.tool).is_none())
             .map(|o| {
                 let (status, reasons) = binding_status(o, None, "");
                 json!({"tool": o.tool, "status": status, "reasons": reasons})
@@ -84,7 +85,7 @@ impl Surface {
         json!({
             "mode": self.config.mode,
             "tool_count": tools.len(),
-            "exposed_by_name": self.exposed.len(),
+            "exposed_by_name": cat.exposed.len(),
             "renamed_collisions": collisions,
             "overlaid": self.config.overlays.len(),
             "orphan_overlays": orphan_overlays,
@@ -92,15 +93,15 @@ impl Surface {
         })
     }
 
-    /// Bindings (overlays) broken against the live upstream schema, each with
-    /// its effective strength (strong = fail closed, weak = fail open). Drives
-    /// startup enforcement and `minmcp map`.
-    pub fn broken_bindings(&self) -> Vec<(String, Vec<String>, crate::config::BindingStrength)> {
+    /// Bindings (overlays) broken against the live upstream schema in `cat`,
+    /// each with its effective strength (strong = fail closed, weak = fail
+    /// open). Takes the catalog so a re-indexed one is vetted before it serves.
+    pub(super) fn broken_bindings_in(&self, cat: &Catalog) -> Vec<(String, Vec<String>, crate::config::BindingStrength)> {
         let policy = self.config.binding_policy;
         let mut out = Vec::new();
         for o in &self.config.overlays {
-            let resolved = self.def_for(&o.tool).map(|d| self.raw_resolved(d));
-            let live = self.origin_sha.get(o.tool.as_str()).cloned().unwrap_or_default();
+            let resolved = cat.def(&o.tool).map(|d| self.raw_resolved(d));
+            let live = cat.origin_sha.get(o.tool.as_str()).cloned().unwrap_or_default();
             let (status, reasons) = binding_status(o, resolved.as_ref(), &live);
             if status == "broken" {
                 out.push((o.tool.clone(), reasons, o.strength(policy)));
@@ -115,8 +116,8 @@ impl Surface {
     /// Unlike [`Self::lint_report`] this resolves no schemas — the poisoning
     /// rules read the name and description only — so it is cheap enough to run
     /// on every start, including for a 1,200-tool spec.
-    pub fn poisoned_tools(&self) -> Vec<(String, Vec<&'static str>)> {
-        self.tools
+    pub(super) fn poisoned_in(cat: &Catalog) -> Vec<(String, Vec<&'static str>)> {
+        cat.tools
             .iter()
             .filter_map(|t| {
                 let fired = crate::lint::poisoning(&t.name, &t.description);
@@ -135,14 +136,15 @@ impl Surface {
         let mut counts: BTreeMap<&'static str, usize> =
             crate::lint::RULES.iter().map(|(id, _)| (*id, 0)).collect();
         let mut flagged: Vec<Value> = Vec::new();
-        let total = self.tools.len();
+        let cat = self.cat();
+        let total = cat.tools.len();
         let mut clean = 0usize;
 
         // Cross-tool pass: tools sharing a normalized summary are confusable — the
         // agent can't disambiguate them (acute on a federated surface). Group by
         // key, then any group of >1 is flagged.
         let mut by_desc: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, t) in self.tools.iter().enumerate() {
+        for (i, t) in cat.tools.iter().enumerate() {
             if let Some(k) = crate::lint::confusable_key(&t.description) {
                 // Two REST ops sharing a summary but differing by HTTP method
                 // (GET vs POST vs DELETE on the same resource) are disambiguated by
@@ -158,8 +160,8 @@ impl Surface {
         let confusable: std::collections::HashSet<usize> =
             by_desc.values().filter(|v| v.len() > 1).flatten().copied().collect();
 
-        for (i, t) in self.tools.iter().enumerate() {
-            let schema = self.resolved_schema(t);
+        for (i, t) in cat.tools.iter().enumerate() {
+            let schema = self.resolved_schema(&cat, t);
             let origin = self.upstreams.get(t.upstream_idx).map(|b| b.origin(&t.name)).unwrap_or_default();
             let mut fired = crate::lint::lint(&t.name, &t.description, &schema, crate::lint::is_mutating(&origin));
             if confusable.contains(&i) {
@@ -226,14 +228,15 @@ impl Surface {
 
     /// Stats for `minmcp inspect`, scoped to `caller` where visibility matters.
     pub fn stats(&self, caller: &Caller) -> Value {
-        let upstream_defs: usize = self.tools.len();
+        let cat = self.cat();
+        let upstream_defs: usize = cat.tools.len();
         // Spec upstreams store cheap UNRESOLVED $ref stubs at load, which badly
         // understate the raw baseline. Small surfaces resolve exactly (that's
         // where the passthrough-vs-minified comparison matters); big ones keep
         // the stub sum as an explicit LOWER BOUND, flagged `est_raw_exact`.
         const EXACT_RESOLVE_CAP: usize = 32;
-        let exact = self.tools.len() <= EXACT_RESOLVE_CAP;
-        let raw_chars: usize = self
+        let exact = cat.tools.len() <= EXACT_RESOLVE_CAP;
+        let raw_chars: usize = cat
             .tools
             .iter()
             .map(|t| {
@@ -252,8 +255,8 @@ impl Surface {
             min_chars += json_len(&def) + usize::from(minified_count > 0);
             minified_count += 1;
         });
-        // Upstreams that announced tools/list_changed since startup: their
-        // catalog here is a stale snapshot until the proxy restarts.
+        // Upstreams that announced tools/list_changed and are waiting for the
+        // next request to re-index them.
         let stale: Vec<&str> = self.upstreams.iter().filter(|b| b.stale()).map(Backend::name).collect();
         json!({
             // serialized like the config key (`three_tool`), not the Rust
@@ -264,7 +267,7 @@ impl Surface {
             "upstreams_active": self.upstreams.len(),
             "upstreams_stale": stale,
             "upstream_tools": upstream_defs,
-            "visible_after_scopes": self.tools.iter().filter(|t| self.allowed(caller, t.id())).count(),
+            "visible_after_scopes": cat.tools.iter().filter(|t| self.allowed(caller, t.id())).count(),
             "surface_tools": minified_count,
             "est_tokens_raw": raw_chars / 4,
             "est_tokens_minified": min_chars / 4,
@@ -285,8 +288,9 @@ impl Surface {
     pub fn access_report(&self, process: &Caller, sample: usize) -> Value {
         let cfg = &self.config;
         let rules = &cfg.scopes.rules;
+        let cat = self.cat();
         let grants = |scopes: &[String]| -> (Vec<&str>, Vec<&str>) {
-            let tools = self.tools.iter().map(ToolDef::id).filter(|id| cfg.allowed(id, scopes)).collect();
+            let tools = cat.tools.iter().map(|t| t.id()).filter(|id| cfg.allowed(id, scopes)).collect();
             let wfs = cfg.workflows.iter().map(|w| w.id.as_str()).filter(|id| cfg.allowed(id, scopes)).collect();
             (tools, wfs)
         };
@@ -316,7 +320,7 @@ impl Surface {
             (Vec::new(), Vec::new())
         } else {
             (
-                self.tools.iter().map(ToolDef::id).filter(|id| !granted(id)).collect(),
+                cat.tools.iter().map(|t| t.id()).filter(|id| !granted(id)).collect(),
                 cfg.workflows.iter().map(|w| w.id.as_str()).filter(|id| !granted(id)).collect(),
             )
         };
@@ -352,7 +356,7 @@ impl Surface {
         if rules.is_empty() {
             warnings.push(format!(
                 "no scope rules: every caller can call every tool ({} tools, {} composites)",
-                self.tools.len(),
+                cat.tools.len(),
                 cfg.workflows.len()
             ));
         } else if cfg.scopes.report_only_active() {

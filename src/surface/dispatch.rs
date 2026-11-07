@@ -28,7 +28,11 @@ impl Surface {
         fields: &[String],
     ) -> Result<(Value, Reach)> {
         let started = Instant::now();
-        let Some(t) = self.def_for(tool_id).filter(|_| self.may_call(caller, tool_id)) else {
+        // One catalog for the whole call: the definition, its schema, headers
+        // and injected fields must all come from the same one, or a re-index
+        // landing mid-call could pair a tool with another version's overlay.
+        let cat = self.cat();
+        let Some(t) = cat.def(tool_id).cloned().filter(|_| self.may_call(caller, tool_id)) else {
             return not_sent(text_result(
                 format!(
                     "unknown tool_id {tool_id:?} —{} {}",
@@ -77,7 +81,7 @@ impl Surface {
         // Resolve the patched schema up front (owned) for pre-flight. Only when
         // preflight is enabled (skips the clone otherwise).
         let preflight_schema = if preflight_on {
-            Some(self.resolved_schema(t))
+            Some(self.resolved_schema(&cat, &t))
         } else {
             None
         };
@@ -88,7 +92,7 @@ impl Surface {
         // for THIS call. `{{hash}}` = an idempotency key derived from the request
         // (identical args → identical key, so an agent retry is de-duplicated); it's
         // only worth serializing+hashing the request when a header actually uses it.
-        let extra_headers: Vec<(String, String)> = match self.tool_headers.get(tool_id) {
+        let extra_headers: Vec<(String, String)> = match cat.tool_headers.get(tool_id) {
             Some(hs) => {
                 let args_hash = if hs.iter().any(|(_, v)| v.contains("{{hash}}")) {
                     // canonical (key-order-insensitive), matching the cache key:
@@ -106,7 +110,7 @@ impl Surface {
         // or fabricate (it was stripped from the schema; source is env/file/vault).
         // Runs before pre-flight so the injected value satisfies the schema; an
         // unresolvable source is a clear local error, never a fabricated success.
-        if let Some(us) = self.user_supplied.get(tool_id) {
+        if let Some(us) = cat.user_supplied.get(tool_id) {
             for (path, source) in us {
                 match self.secrets.resolve_source(source).await {
                     Some(v) => crate::project::set(&mut arguments, path, Value::String(v)),
@@ -242,7 +246,7 @@ impl Surface {
         // The usage prior counts SUCCESSES, not attempts: a tool must never rise
         // in search ranking by failing.
         if !is_error {
-            self.index.record_use(tool_id);
+            cat.index.record_use(tool_id);
         }
         if !from_cache {
             // Feed the breaker the PRIMARY call's outcome (cache hits never count).
@@ -537,7 +541,10 @@ impl Surface {
         let schema = matched
             .iter()
             .any(|h| h.field.is_some())
-            .then(|| self.visible_def(caller, tool_id).map(|t| self.resolved_schema(t)))
+            .then(|| {
+                let cat = self.cat();
+                cat.def(tool_id).filter(|_| self.allowed(caller, tool_id)).map(|t| self.resolved_schema(&cat, t))
+            })
             .flatten();
         if let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) {
             for h in matched {

@@ -196,6 +196,40 @@ fn http_requires_a_bearer_and_scopes_each_request_by_it() {
 }
 
 #[test]
+fn http_publishes_protected_resource_metadata_without_a_token() {
+    // RFC 9728, which MCP requires of an OAuth-protected server: the metadata
+    // is readable before authenticating, and every 401 points at it.
+    let s = Server::start_with("tests/fixtures/e2e-protected-resource.yaml");
+    let get = |path: &str| {
+        let out = Command::new("curl")
+            .args(["-s", "-w", "\n%{http_code}", "--max-time", "20", &format!("http://{}{path}", s.addr)])
+            .output()
+            .expect("curl");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let doc = get("/.well-known/oauth-protected-resource/mcp");
+    assert!(doc.trim_end().ends_with("200"), "metadata must not need a token: {doc}");
+    assert!(doc.contains(r#""resource":"https://mcp.example.com/mcp""#), "{doc}");
+    assert!(doc.contains(r#""authorization_servers":["https://idp.example.com"]"#), "{doc}");
+    assert!(get("/.well-known/oauth-protected-resource").trim_end().ends_with("200"), "the root form too");
+
+    let out = Command::new("curl")
+        .args([
+            "-s", "-D", "-", "-o", "/dev/null", "--max-time", "20",
+            "-H", "Content-Type: application/json",
+            "-H", "Accept: application/json, text/event-stream",
+            "-d", INIT, &format!("http://{}/", s.addr),
+        ])
+        .output()
+        .expect("curl");
+    let anon = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        anon.contains(r#"resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp""#),
+        "the 401 must point at the metadata: {anon}"
+    );
+}
+
+#[test]
 fn http_rejects_a_foreign_origin() {
     // DNS-rebinding defence: the transport validates Origin. A browser-style
     // cross-origin POST must not be served.

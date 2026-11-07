@@ -19,6 +19,7 @@ mod logging;
 mod modern;
 mod oauth;
 mod project;
+mod redirect;
 mod rmcp_serve;
 mod secrets;
 mod spec;
@@ -263,6 +264,12 @@ async fn build(common: &Common) -> Result<Built> {
         (Some(i), true) => Some(Arc::new(crate::auth::Introspector::new(i, &secrets).await?)),
         _ => None,
     };
+    if common.http.is_some() && verifier.is_some() && cfg.auth.audience.is_none() && cfg.auth.protected_resource.is_none() {
+        crate::log_warn!(
+            "bearer tokens are verified without an audience check, so a token minted for another \
+             service is accepted; MCP requires one. Set auth.audience or auth.protected_resource"
+        );
+    }
     let identity = rmcp_serve::HttpIdentity::from_auth(&cfg.auth, verifier, introspector);
     let http = cfg.http.clone();
     // Rate limits key on the caller's subject, falling back to what the

@@ -56,7 +56,8 @@ impl Surface {
             return;
         }
         // O(cache entries) via the existing id index — no per-write set build.
-        let (by_id, tools) = (&self.by_id, &self.tools);
+        let cat = self.cat();
+        let (by_id, tools) = (&cat.by_id, &cat.tools);
         cache.retain(|(id, _), _| by_id.get(id).is_none_or(|&i| tools[i].upstream_idx != idx));
     }
 

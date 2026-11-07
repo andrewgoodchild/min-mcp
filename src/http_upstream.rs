@@ -27,13 +27,36 @@ use crate::modern::{self, Era, ParamHeader, RpcError};
 use crate::oauth::OAuthClient;
 use crate::secrets::Secrets;
 use crate::sync::lock;
-use crate::upstream::{TimeoutElapsed, PROTOCOL_VERSION};
+use crate::upstream::{negotiated_version, TimeoutElapsed, PROTOCOL_VERSION};
 
 /// Per-request ceiling, matching the stdio client's REQUEST_TIMEOUT. Without it
 /// a slow or stream-holding remote MCP server would stall a call forever:
 /// reqwest has no default timeout, and reading an SSE reply drains the whole
 /// body — which a server keeping the stream open never ends.
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The most min-mcp reads of one upstream HTTP response. Without a bound a
+/// misbehaving or hostile upstream can make the proxy buffer any amount; what
+/// reaches the agent is capped far lower anyway (8 KB, 64 KB in passthrough),
+/// but projection and overlays need the whole body, so this is generous.
+pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Read a response body as text, refusing past `max` bytes: early, by the
+/// declared length, or as the stream crosses it.
+pub async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<String> {
+    let too_big = || anyhow!("response exceeds the {} MiB limit", max / (1024 * 1024));
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        return Err(too_big());
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() + chunk.len() > max {
+            return Err(too_big());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
 
 /// Marker: the server no longer knows our session (404 with a session id set).
 #[derive(Debug)]
@@ -60,6 +83,9 @@ pub struct HttpUpstream {
     /// OAuth client-credentials, if this upstream is OAuth-protected.
     oauth: Option<OAuthClient>,
     session_id: Mutex<Option<String>>,
+    /// The legacy protocol version `initialize` settled on, sent as
+    /// `MCP-Protocol-Version` on every later request.
+    version: Mutex<String>,
     /// Held across a re-handshake so exactly one caller re-initializes; the
     /// others find the new session and reuse it.
     reinit: tokio::sync::Mutex<()>,
@@ -83,12 +109,13 @@ impl HttpUpstream {
             headers.push((k.clone(), SecretString::from(secrets.expand(v).await?)));
         }
         let oauth = match &cfg.oauth {
-            Some(o) => Some(OAuthClient::new(o, secrets).await?),
+            Some(o) => Some(OAuthClient::new(o, &url, secrets).await?),
             None => None,
         };
         crate::crypto::install_provider();
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            .redirect(crate::redirect::same_origin())
             .build()
             .context("building HTTP client for upstream")?;
         let up = HttpUpstream {
@@ -99,6 +126,7 @@ impl HttpUpstream {
             headers,
             oauth,
             session_id: Mutex::new(None),
+            version: Mutex::new(PROTOCOL_VERSION.to_string()),
             reinit: tokio::sync::Mutex::new(()),
             next_id: AtomicI64::new(0),
             stale: AtomicBool::new(false),
@@ -124,6 +152,11 @@ impl HttpUpstream {
         self.stale.load(Ordering::Relaxed)
     }
 
+    /// Read and clear the stale flag, as [`crate::upstream::Upstream::take_stale`].
+    pub fn take_stale(&self) -> bool {
+        self.stale.swap(false, Ordering::Relaxed)
+    }
+
     /// The session id the server last gave us.
     fn session(&self) -> Option<String> {
         lock(&self.session_id).clone()
@@ -132,6 +165,7 @@ impl HttpUpstream {
     /// The MCP handshake — at connect, and again when the server forgets us.
     async fn initialize(&self) -> Result<()> {
         *lock(&self.session_id) = None;
+        *lock(&self.version) = PROTOCOL_VERSION.to_string();
         let mut frame = json!({
             "jsonrpc": "2.0", "id": 0, "method": "initialize",
             "params": {
@@ -140,9 +174,13 @@ impl HttpUpstream {
                 "clientInfo": {"name": "min-mcp", "version": env!("CARGO_PKG_VERSION")},
             }
         });
-        self.request_once("initialize", &mut frame, None)
+        let result = self
+            .request_once("initialize", &mut frame, None)
             .await
             .with_context(|| format!("initializing http upstream {}", self.name))?;
+        // The spec requires the NEGOTIATED version on every later request; a
+        // server that chose an older revision may refuse ours.
+        *lock(&self.version) = negotiated_version(&result);
         self.notify("notifications/initialized", json!({})).await
     }
 
@@ -174,7 +212,7 @@ impl HttpUpstream {
             req = req.header(k, v.expose_secret());
         }
         if !self.is_modern() {
-            req = req.header("MCP-Protocol-Version", PROTOCOL_VERSION);
+            req = req.header("MCP-Protocol-Version", lock(&self.version).as_str());
             if let Some(sid) = self.session() {
                 req = req.header("Mcp-Session-Id", sid);
             }
@@ -273,7 +311,9 @@ impl HttpUpstream {
             .map(|ct| ct.contains("text/event-stream"))
             .unwrap_or(false);
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = read_capped(resp, MAX_RESPONSE_BYTES)
+            .await
+            .with_context(|| format!("reading upstream {}'s reply to {method}", self.name))?;
         if status == reqwest::StatusCode::NOT_FOUND && had_session && method != "initialize" {
             return Err(anyhow::Error::new(SessionExpired));
         }
@@ -289,7 +329,7 @@ impl HttpUpstream {
         if is_sse && text.contains("notifications/tools/list_changed") {
             self.stale.store(true, Ordering::Relaxed);
             crate::log_warn!(
-                "upstream {} announced tools/list_changed; the catalog is a startup snapshot — restart to pick it up",
+                "upstream {} announced tools/list_changed; re-indexing it on the next request",
                 self.name
             );
         }
@@ -454,9 +494,35 @@ mod tests {
         let seen = srv.seen();
         let last = seen.last().unwrap();
         assert_eq!(last.header("mcp-session-id"), Some("sess-1"));
-        // The spec requires the protocol version on every non-initialize call.
-        assert_eq!(last.header("mcp-protocol-version"), Some(PROTOCOL_VERSION));
+        // The spec requires the NEGOTIATED version on every non-initialize call:
+        // we offered 2025-11-25 and this server chose 2025-06-18.
+        assert!(seen[1].body.contains(PROTOCOL_VERSION), "we offer our newest legacy version");
+        assert_eq!(last.header("mcp-protocol-version"), Some("2025-06-18"));
         assert_eq!(last.header("accept"), Some("application/json, text/event-stream"));
+    }
+
+    #[tokio::test]
+    async fn a_response_past_the_limit_is_refused_not_buffered() {
+        let srv = testserver::spawn(|_, _| Reply::text("x".repeat(4096))).await;
+        crate::crypto::install_provider();
+        let get = || async { reqwest::get(srv.url()).await.unwrap() };
+        assert_eq!(read_capped(get().await, 4096).await.unwrap().len(), 4096);
+        let err = read_capped(get().await, 4095).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn configured_headers_never_follow_a_redirect_to_another_host() {
+        // reqwest strips Authorization on a cross-host hop but not X-Api-Key.
+        let elsewhere = testserver::spawn(|_, _| Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)).await;
+        let target = elsewhere.url();
+        let srv = testserver::spawn(move |_, _| Reply::status(307).with_header("location", &target)).await;
+        let err = connect_to(&srv.url(), "    headers:\n      X-Api-Key: \"secret-key\"\n")
+            .await
+            .err()
+            .expect("a redirect off the origin must fail the connection");
+        assert!(format!("{err:#}").contains("refused redirect"), "{err:#}");
+        assert_eq!(elsewhere.hits(), 0, "the other host must never see the key");
     }
 
     #[tokio::test]
@@ -551,8 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_list_changed_notification_marks_the_upstream_stale() {
-        // The catalog is a startup snapshot, so the honest thing is to flag it
-        // rather than silently serve a stale surface.
+        // The flag is what tells the surface to re-index this upstream.
         let srv = testserver::spawn(mcp_server(|_, _| {
             Reply::sse(
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n                 event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
@@ -742,7 +807,7 @@ mod tests {
         up.rpc("tools/list", json!({}), None).await.expect("list");
         let last = srv.seen().pop().unwrap();
         assert_eq!(last.header("mcp-session-id"), Some("sess-1"));
-        assert_eq!(last.header("mcp-protocol-version"), Some(PROTOCOL_VERSION));
+        assert_eq!(last.header("mcp-protocol-version"), Some("2025-06-18"), "the version the server chose");
         assert!(!last.body.contains("_meta"), "legacy traffic is unchanged: {}", last.body);
     }
 
@@ -803,6 +868,39 @@ mod tests {
         let listing = s.list_tools(&crate::caller::Caller::default());
         assert!(listing["tools"][0].get("outputSchema").is_none(), "{listing}");
         assert_eq!(listing["tools"][0]["annotations"]["readOnlyHint"], json!(true), "the rest still applies");
+
+        // The removed field must be gone from BOTH copies of the result.
+        let result = s.call(&crate::caller::Caller::default(), "get_thing", json!({})).await.expect("call");
+        assert!(!result.to_string().contains("t1"), "a removed field leaked: {result}");
+    }
+
+    #[tokio::test]
+    async fn a_declared_output_schema_keeps_its_structured_result_over_budget() {
+        // MCP: a tool with an outputSchema MUST return structuredContent, and
+        // strict clients reject a result without it. Without a schema it's optional.
+        let big = "x".repeat(70_000);
+        for (schema, kept) in [(r#","outputSchema":{"type":"object"}"#, true), ("", false)] {
+            let list = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{{"name":"dump","description":"d","inputSchema":{{"type":"object"}}{schema}}}]}}}}"#
+            );
+            let body = json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "content": [{"type": "text", "text": big}], "structuredContent": {"blob": big}, "isError": false}})
+            .to_string();
+            let srv = testserver::spawn(mcp_server(move |_, got| {
+                if got.body.contains(r#""method":"tools/list""#) {
+                    return Reply::json(list.clone());
+                }
+                Reply::json(body.clone())
+            }))
+            .await;
+            let yaml = format!("mode: passthrough\nupstreams:\n  - name: m\n    url: \"{}\"\n", srv.url());
+            let s = crate::surface::Surface::build(crate::config::Config::from_yaml(&yaml).unwrap(), Secrets::env_only())
+                .await
+                .expect("surface");
+            let r = s.call(&crate::caller::Caller::default(), "dump", json!({})).await.expect("call");
+            assert_eq!(r.get("structuredContent").is_some(), kept, "outputSchema declared: {kept}");
+            assert!(r["content"][0]["text"].as_str().unwrap().len() < 70_000, "the text is still bounded");
+        }
     }
 
     #[tokio::test]
