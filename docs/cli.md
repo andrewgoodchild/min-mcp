@@ -102,10 +102,13 @@ before `serve --http` takes traffic, and after any change to `scopes:` or
 - `identity` — how a request is identified (bearer, gateway headers, none),
   what happens to one without identity, and whether revocation is checked.
 - `rate_limits`, `audit` — what is on, and whether the log is tamper-evident.
+- `authorizer` — whether an external authorizer is configured, where, and
+  whether it enforces (`report_only` and `fail_open` both mean it does not,
+  fully).
 - `warnings` — each way the deployment is more open than it may look: no scope
   rules, report-only scopes or limits, no caller identity, `allow_anonymous`
   granting tools, limits that key on the connection, no audit log, an unsigned
-  one.
+  one, an authorizer that is report-only or fail-open.
 
 ```sh
 minmcp access --config examples/enterprise.yaml

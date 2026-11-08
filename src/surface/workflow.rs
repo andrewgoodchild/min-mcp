@@ -7,19 +7,21 @@ impl Surface {
     /// prior step outputs, calls its tool, and extracts named outputs. One
     /// upstream chain, one round-trip for the agent. A failed step aborts, and
     /// the failure says which earlier steps already took effect (see
-    /// [`workflow_failure`]).
+    /// [`workflow_failure`]). The client's request `_meta` rides on every
+    /// step: each is a call made on its behalf.
     pub(super) async fn execute_workflow(
         &self,
         caller: &Caller,
         wf: &crate::config::Workflow,
         inputs: Value,
+        meta: Option<&Map<String, Value>>,
     ) -> Result<Value> {
         let mut outs: HashMap<String, Value> = HashMap::new();
         for (i, step) in wf.steps.iter().enumerate() {
             let args = resolve_input(&step.input, &inputs, &outs);
             // A transport-level Err is folded into the same failure report: by
             // then earlier steps may have written, and the agent must hear which.
-            let (error, reach) = match self.dispatch_reach(caller, &step.tool, args, &[]).await {
+            let (error, reach) = match self.dispatch_reach(caller, &step.tool, args, &[], meta).await {
                 Ok((r, _)) if !r.get("isError").and_then(Value::as_bool).unwrap_or(false) => {
                     let payload = result_payload(&r, self.tool_from_spec(&step.tool));
                     for (name, path) in &step.output {

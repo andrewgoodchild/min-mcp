@@ -751,7 +751,7 @@ mod tests {
         let srv = testserver::spawn(modern_server()).await;
         let up = connect_to(&srv.url(), "").await.expect("connect");
         assert_eq!(up.list_tools(0).await.expect("list").len(), 1);
-        up.call_tool("query", json!({"region": "us-west1", "sql": "select 1"}), None).await.expect("call");
+        up.call_tool("query", json!({"region": "us-west1", "sql": "select 1"}), None, None).await.expect("call");
 
         let seen = srv.seen();
         assert!(!seen.iter().any(|g| g.body.contains(r#""method":"initialize""#)), "no handshake");
@@ -821,7 +821,7 @@ mod tests {
         })
         .await;
         let up = connect_to(&srv.url(), "").await.expect("connect");
-        let err = up.call_tool("query", json!({}), None).await.unwrap_err().to_string();
+        let err = up.call_tool("query", json!({}), None, None).await.unwrap_err().to_string();
         assert!(err.contains("interactive input"), "{err}");
     }
 

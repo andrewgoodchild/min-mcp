@@ -965,6 +965,46 @@ fn default_introspection_ttl() -> u64 {
     60
 }
 
+/// An external authorizer consulted before every upstream call: the gate for
+/// the argument-level policy min-mcp deliberately does not implement itself.
+/// One `POST` per call carries the caller, the tool, the arguments as the
+/// caller sent them, and the client's forwarded `_meta`; the answer is allow or
+/// deny with a reason. Envoy `ext_authz` in shape: any 2xx allows unless the
+/// body says `{"allow": false}`, any 4xx denies, and a 5xx or no answer is an
+/// outage that `fail_open` decides. See `authz.rs`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizerConfig {
+    /// Where to `POST`. An http(s) URL; redirects are followed only on its origin.
+    pub url: String,
+    /// Static request headers (`${…}` references resolved): how min-mcp
+    /// authenticates to the authorizer.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// How long one decision may take (default 1000). It is in front of every
+    /// call, so past this the authorizer is treated as unreachable.
+    #[serde(default = "default_authorizer_timeout_ms")]
+    pub timeout_ms: u64,
+    /// What to do when the authorizer cannot answer. **False by default:**
+    /// refuse the call. An authorizer that is bypassed when down is advisory,
+    /// not a control — whoever can reach it can also make it unreachable.
+    #[serde(default)]
+    pub fail_open: bool,
+    /// Ask, log what it would deny (`authz_would_deny`), refuse nothing. The
+    /// rollout step before enforcement.
+    #[serde(default)]
+    pub report_only: bool,
+    /// Send the call's arguments (default true). Off, the authorizer sees who
+    /// is calling what, but not with what — for a policy about tools, when the
+    /// arguments carry customer data it should not hold.
+    #[serde(default = "default_true")]
+    pub include_arguments: bool,
+}
+
+fn default_authorizer_timeout_ms() -> u64 {
+    1000
+}
+
 /// Identity headers set by a trusted fronting gateway (see `Auth::trusted_headers`).
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -1050,6 +1090,10 @@ pub struct Config {
     pub filters: Filters,
     #[serde(default)]
     pub auth: Auth,
+    /// An external authorizer asked before every upstream call. See
+    /// [`AuthorizerConfig`].
+    #[serde(default)]
+    pub authorizer: Option<AuthorizerConfig>,
     /// Transport hardening for `serve --http`. See [`HttpConfig`].
     #[serde(default)]
     pub http: HttpConfig,
@@ -1287,6 +1331,15 @@ impl Config {
             }
             if pr.authorization_servers.is_empty() {
                 anyhow::bail!("auth.protected_resource.authorization_servers must name at least one issuer");
+            }
+        }
+        if let Some(a) = &self.authorizer {
+            let url = reqwest::Url::parse(&a.url).with_context(|| format!("authorizer.url {:?} is not a URL", a.url))?;
+            if !matches!(url.scheme(), "https" | "http") {
+                anyhow::bail!("authorizer.url must be an http(s) URL");
+            }
+            if a.timeout_ms == 0 {
+                anyhow::bail!("authorizer.timeout_ms must be greater than 0");
             }
         }
         let mut seen = HashSet::new();

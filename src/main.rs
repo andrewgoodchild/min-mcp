@@ -5,6 +5,7 @@
 
 mod auth;
 mod audit_chain;
+mod authz;
 mod backend;
 mod caller;
 mod config;
@@ -289,6 +290,7 @@ async fn build(common: &Common) -> Result<Built> {
     for (on, what, event) in [
         (cfg.scopes.report_only_active(), "scopes are", "would_deny"),
         (cfg.rate_limits.report_only_active(), "rate limits are", "would_rate_limit"),
+        (cfg.authorizer.as_ref().is_some_and(|a| a.report_only), "the authorizer is", "authz_would_deny"),
     ] {
         if !on {
             continue;

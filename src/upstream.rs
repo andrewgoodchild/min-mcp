@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::oneshot;
@@ -97,8 +97,21 @@ pub trait McpRpc {
     /// transport's own 120s ceiling still applies underneath).
     async fn rpc(&self, method: &str, params: Value, deadline: Option<Duration>) -> Result<Value>;
 
-    async fn call_tool(&self, name: &str, arguments: Value, deadline: Option<Duration>) -> Result<Value> {
-        self.rpc("tools/call", json!({"name": name, "arguments": arguments}), deadline).await
+    /// `meta` is the client's request `_meta` as [`modern::forward_meta`] left
+    /// it. It rides beside the arguments, never inside them: the upstream must
+    /// see exactly the arguments the agent sent.
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+        meta: Option<&Map<String, Value>>,
+        deadline: Option<Duration>,
+    ) -> Result<Value> {
+        let mut params = json!({"name": name, "arguments": arguments});
+        if let Some(m) = meta {
+            params["_meta"] = Value::Object(m.clone());
+        }
+        self.rpc("tools/call", params, deadline).await
     }
 
     #[cfg(test)]

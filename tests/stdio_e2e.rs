@@ -343,6 +343,31 @@ fn passthrough_declares_every_tool_and_drops_meta() {
 // namespacing, and the refusal paths are exercised rather than assumed.
 
 #[test]
+fn a_clients_request_meta_reaches_the_upstream_through_call_tool() {
+    // The client attaches `_meta` to ITS call of `call_tool`; the upstream must
+    // see it beside the inner tool's arguments, which stay exactly as sent. The
+    // fixture's `whoami` reports a forwarded `traceparent`.
+    let mut s = Server::spawn("tests/fixtures/e2e-fake.yaml");
+    let with_meta = s.request(
+        "tools/call",
+        json!({
+            "name": "call_tool",
+            "arguments": {"tool_id": "fake.whoami", "arguments": {}},
+            "_meta": {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "progressToken": 1}
+        }),
+    );
+    let text = with_meta["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("forwarded"), "the upstream must see the client's _meta: {text}");
+
+    let without = s.request(
+        "tools/call",
+        json!({"name": "call_tool", "arguments": {"tool_id": "fake.whoami", "arguments": {}}}),
+    );
+    let text = without["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(!text.contains("forwarded"), "nothing attached, nothing forwarded: {text}");
+}
+
+#[test]
 fn an_upstreams_resources_are_merged_with_our_own_and_readable() {
     let mut s = Server::spawn("tests/fixtures/e2e-fake.yaml");
     let listing = s.request("resources/list", json!({}));

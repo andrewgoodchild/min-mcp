@@ -261,6 +261,74 @@ Off by default: an unauthenticated path next to an authenticated one is how
 scoping gets bypassed, and it also disables the identity-based exemption from
 the loopback-only bind rule.
 
+## External authorizer (`authorizer:`)
+
+Scopes decide which tools a caller can see. Whether this caller may make *this*
+call, with *these* arguments, is policy — a warrant verifier, OPA, Cedar, a
+service of your own — and min-mcp is deliberately not a policy engine. What it
+is, is the gate: it holds the caller it authenticated, the resolved tool, the
+arguments the agent sent, and every step a composite runs, none of which a
+gateway in front of it can see. So it asks.
+
+```yaml
+authorizer:
+  url: https://authz.internal:9090/v1/authorize
+  headers: { Authorization: "Bearer ${AUTHZ_TOKEN}" }   # `${…}` references
+  timeout_ms: 1000
+  fail_open: false
+  report_only: false
+  include_arguments: true
+```
+
+One `POST` per upstream call, with a JSON body:
+
+```json
+{
+  "caller": {"subject": "alice", "scopes": ["billing.read"]},
+  "tool": {"id": "stripe.PostCustomers", "upstream": "stripe", "name": "PostCustomers", "read_only": false},
+  "arguments": {"body": {"email": "a@example.com"}},
+  "meta": {"traceparent": "00-…"}
+}
+```
+
+`arguments` are the arguments **as the caller sent them**, before overlay
+`defaults` and injected `user_supplied` values, so a secret never leaves the
+proxy; `include_arguments: false` omits them altogether. `meta` is the client's
+forwarded request `_meta`, when it sent one — where a trace context or a
+capability token such as a warrant rides.
+
+The answer follows Envoy `ext_authz`, so an authorizer written for a gateway
+works unchanged:
+
+| response | meaning |
+|---|---|
+| any 2xx | allowed — unless the body is JSON with `"allow": false`, which denies |
+| any 4xx | denied; the reason is the body's `reason` / `message` / `error` / `detail` / `code`, else the text |
+| 5xx, timeout, no connection, redirect off the origin | the authorizer is **unavailable** |
+
+A denial returns `AUTHZ_DENIED: <tool> — <reason>` to the agent as an isError
+result and writes an `authz_denied` audit event; the upstream is never called.
+Unavailable is not a denial: by default the call is refused with
+`AUTHZ_UNAVAILABLE` (`authz_unavailable`, `served: false`), because an
+authorizer that is bypassed when down is advisory, and whoever can reach it can
+also make it unreachable. `fail_open: true` serves the call unchecked instead
+and says so (`served: true`). Every served call's `call` line carries `authz`:
+`allow`, or the decision that was *not* enforced — `would_deny` under
+`report_only`, `unavailable` under `fail_open`.
+
+**Where it sits.** After visibility and rate limits: a tool the caller cannot
+see is never described to the authorizer, and a flood never reaches it. Before
+the read cache: a cached answer is still authorized on every call. Before
+defaults and injected values. Once per upstream call: a composite's steps are
+each authorized as the tools they call, and a pagination follow-up is the same
+call. `minmcp verify` and `minmcp call` go through it too.
+
+**What it is not.** There is no decision cache: the authorizer's latency is on
+every call's path, so keep it local (a sidecar, the same host). It does not see
+the response. `report_only: true` asks and logs `authz_would_deny` but refuses
+nothing — the rollout step. `minmcp access` reports whether an authorizer is
+configured and whether it enforces, and warns on `report_only` and `fail_open`.
+
 ## TLS on the listener
 
 `serve --http` speaks plaintext by default, which is right for loopback and for
@@ -514,6 +582,20 @@ min-mcp proxies three kinds of upstream (full config in
 | MCP server subprocess | `command:` | child `env:` (literal; also inherits min-mcp's env) |
 | Remote MCP server (HTTP) | `url:` | `headers:` (`${…}` references) or `oauth:` |
 | OpenAPI spec | `spec:` | `auth_env:` (an env var's name) or `api_key:` (a `${…}` reference) |
+
+### Request metadata crosses the proxy
+
+A client's `tools/call` may carry `_meta` beside its arguments — W3C trace
+context, a vendor envelope. min-mcp forwards it on the upstream call made on the
+client's behalf: from the client's `call_tool` to the inner tool in `three_tool`
+mode, as is in passthrough, on every page auto-pagination fetches and every step
+a composite runs. MCP upstreams only; an OpenAPI spec has no `_meta` to receive
+it. Two kinds of key stay behind because they name the client's hop, not the
+upstream's: `progressToken` (min-mcp relays no progress notifications) and the
+`io.modelcontextprotocol/` context keys (a 2026-07-28 upstream gets min-mcp's
+own). Arguments are never touched. The read cache is keyed on arguments alone,
+so a tool whose answer depends on request metadata should not be marked
+cacheable.
 
 ### Header auth for remote upstreams
 
