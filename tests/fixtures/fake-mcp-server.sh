@@ -75,7 +75,12 @@ while IFS= read -r line; do
           esac
           ;;
         *'"name":"whoami"'*)
-          emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"{\"user\":\"tester\",\"plan\":\"pro\",\"secret\":\"shh\"}"}],"isError":false}}'
+          # with a client's `_meta` forwarded beside the arguments, say so: the
+          # end-to-end proof that request metadata crosses the proxy (stdio_e2e)
+          case "$line" in
+            *'"_meta":{'*'"traceparent":"'*) emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"{\"user\":\"tester\",\"plan\":\"pro\",\"secret\":\"shh\",\"trace\":\"forwarded\"}"}],"isError":false}}' ;;
+            *) emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"{\"user\":\"tester\",\"plan\":\"pro\",\"secret\":\"shh\"}"}],"isError":false}}' ;;
+          esac
           ;;
         *)
           emit '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"unknown tool"}}'

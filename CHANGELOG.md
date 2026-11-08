@@ -6,6 +6,30 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **`authorizer:` — an external policy engine asked before every upstream call.** One `POST`
+  per call carries the caller, the tool, the arguments as the caller sent them, and the
+  client's forwarded `_meta`. Envoy `ext_authz` in shape: a 2xx allows (unless the body says
+  `"allow": false`), a 4xx denies with the body as the reason, and a 5xx or no answer is an
+  outage, refused by default (`fail_open`). Asked after scopes and rate limits and before the
+  read cache, so a cached read is still authorized; once per composite step, never per
+  pagination page. `report_only` logs `authz_would_deny` without refusing. Decisions appear as
+  `authz` on each `call` line and as `authz_denied` / `authz_unavailable` events, and
+  `minmcp access` reports the authorizer and warns when it does not enforce. min-mcp is the
+  gate, not the policy engine: argument-level rules stay in OPA, Cedar, a warrant verifier,
+  or a service of your own.
+
+### Fixed
+
+- **A client's request `_meta` now reaches the upstream.** The `_meta` a client attaches to
+  its `tools/call` (trace context, a vendor envelope) was dropped at the proxy. It is now
+  forwarded on the upstream call made on the client's behalf, including every auto-pagination
+  page and every composite step, for MCP upstreams. `progressToken` and the
+  `io.modelcontextprotocol/` keys stay behind, since they describe the client's hop; a
+  2026-07-28 upstream still gets min-mcp's own context keys, which win on a shared key.
+  Arguments are never touched.
+
 ## [0.5.0] — 2026-11-08
 
 ### Security

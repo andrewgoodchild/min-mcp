@@ -40,6 +40,7 @@ fn test_surface(cfg: Config, tools: Vec<ToolDef>) -> Surface {
         resource_origin: Mutex::new(std::collections::HashMap::new()),
         breakers: Mutex::new(std::collections::HashMap::new()),
         limits: super::ratelimit::Buckets::default(),
+        authorizer: None,
         upstream_slots: None,
     }
 }
@@ -1558,6 +1559,427 @@ fn tool_json(name: &str, description: &str) -> String {
 async fn surface_over(srv: &crate::testserver::TestServer, extra: &str) -> Surface {
     let yaml = format!("{extra}upstreams:\n  - name: up\n    url: \"{}\"\n", srv.url());
     Surface::build(Config::from_yaml(&yaml).unwrap(), Secrets::env_only()).await.expect("surface")
+}
+
+// --- request `_meta`: what a client attaches to its call crosses the proxy ---
+
+/// A legacy HTTP MCP server that records what it is sent. `list_items` pages
+/// once (a cursor on the first call, none on the second); everything else
+/// answers with a user.
+async fn recording_server() -> crate::testserver::TestServer {
+    use crate::testserver::Reply;
+    let tools = [
+        tool_json("whoami", "Return the current user."),
+        json!({
+            "name": "list_items", "description": "List items, paginated.",
+            "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": true}
+        })
+        .to_string(),
+    ]
+    .join(",");
+    crate::testserver::spawn(move |_, got| {
+        if got.body.contains("server/discover") {
+            return Reply::json(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#);
+        }
+        if got.body.contains(r#""method":"initialize""#) {
+            return Reply::json(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#)
+                .with_header("Mcp-Session-Id", "s");
+        }
+        if got.body.contains("notifications/") {
+            return Reply::status(202);
+        }
+        if got.body.contains(r#""method":"tools/list""#) {
+            return Reply::json(format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{tools}]}}}}"#));
+        }
+        let text = if !got.body.contains(r#""name":"list_items""#) {
+            r#"{\"user\":\"tester\"}"#
+        } else if got.body.contains(r#""cursor":"c2""#) {
+            r#"{\"data\":[{\"id\":\"i3\"}],\"next_cursor\":null}"#
+        } else {
+            r#"{\"data\":[{\"id\":\"i1\"}],\"next_cursor\":\"c2\"}"#
+        };
+        Reply::json(format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":"{text}"}}],"isError":false}}}}"#
+        ))
+    })
+    .await
+}
+
+/// The `params` of every `tools/call` the server has received, in order.
+fn calls_seen(srv: &crate::testserver::TestServer) -> Vec<Value> {
+    srv.seen()
+        .into_iter()
+        .filter(|r| r.body.contains(r#""method":"tools/call""#))
+        .map(|r| serde_json::from_str::<Value>(&r.body).expect("a JSON-RPC frame")["params"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_clients_request_meta_crosses_to_the_upstream_call_minus_what_names_its_hop() {
+    let srv = recording_server().await;
+    let s = surface_over(&srv, "").await;
+    let client = json!({
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "ai.example/tenant": "acme",
+        "progressToken": 7,
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    });
+    let fwd = crate::modern::forward_meta(client.as_object().unwrap());
+    let r = s
+        .call_with_meta(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}}), fwd.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let calls = calls_seen(&srv);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let meta = &calls[0]["_meta"];
+    assert_eq!(meta["traceparent"], "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    assert_eq!(meta["ai.example/tenant"], "acme");
+    assert!(meta.get("progressToken").is_none(), "a progress token names the client's hop: {meta}");
+    assert!(meta.get("io.modelcontextprotocol/protocolVersion").is_none(), "{meta}");
+    assert_eq!(calls[0]["arguments"], json!({}), "arguments are never touched");
+    assert_eq!(calls[0]["name"], "whoami");
+
+    // Nothing attached, nothing sent: a legacy upstream sees no `_meta` at all.
+    s.call(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}})).await.unwrap();
+    let calls = calls_seen(&srv);
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].get("_meta").is_none(), "{:?}", calls[1]);
+}
+
+#[tokio::test]
+async fn forwarded_meta_rides_on_every_page_and_every_composite_step() {
+    let srv = recording_server().await;
+    let extra = "\
+overlays:
+  - tool: up.list_items
+    paginate: { items: data, cursor: next_cursor, into: cursor, max_pages: 5 }
+workflows:
+  - id: up.both
+    description: \"List, then who.\"
+    steps:
+      - id: list
+        tool: up.list_items
+        input: {}
+      - id: who
+        tool: up.whoami
+        input: {}
+";
+    let s = surface_over(&srv, extra).await;
+    let client = json!({"ai.example/tenant": "acme"});
+    let fwd = crate::modern::forward_meta(client.as_object().unwrap());
+    let r = s
+        .call_with_meta(&anon(), "call_tool", json!({"tool_id": "up.both", "arguments": {}}), fwd.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let calls = calls_seen(&srv);
+    assert_eq!(calls.len(), 3, "two pages, then the second step: {calls:?}");
+    for c in &calls {
+        assert_eq!(c["_meta"]["ai.example/tenant"], "acme", "{c}");
+    }
+    assert_eq!(calls[1]["arguments"]["cursor"], "c2", "the second call is the follow-up page");
+    assert_eq!(calls[2]["name"], "whoami", "the third is the composite's second step");
+}
+
+// --- external authorizer: one POST per call, allow or deny --------------------
+
+/// An authorizer that answers each request with whatever `reply` returns for
+/// its parsed body.
+async fn authz_server(
+    reply: impl Fn(&Value) -> crate::testserver::Reply + Send + Sync + 'static,
+) -> crate::testserver::TestServer {
+    crate::testserver::spawn(move |_, got| {
+        let body: Value = serde_json::from_str(&got.body).unwrap_or(Value::Null);
+        reply(&body)
+    })
+    .await
+}
+
+/// A surface over `up` whose authorizer is at `authz_url`. `authz_extra` is
+/// more `authorizer:` keys (indented two spaces); `top` is more top-level YAML.
+async fn authorized_surface(
+    up: &crate::testserver::TestServer,
+    authz_url: &str,
+    authz_extra: &str,
+    top: &str,
+) -> Surface {
+    surface_over(up, &format!("authorizer:\n  url: \"{authz_url}\"\n{authz_extra}{top}")).await
+}
+
+/// Point the surface's audit log at a fresh file and return its path.
+fn capture_log(s: &mut Surface, name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("minmcp_{name}_{}.ndjson", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+    s.log = Some(AuditSink::File(Mutex::new(file)));
+    path
+}
+
+fn allow_all(_: &Value) -> crate::testserver::Reply {
+    crate::testserver::Reply::json(r#"{"allow": true}"#)
+}
+
+#[tokio::test]
+async fn an_allowed_call_reaches_the_upstream_and_the_authorizer_saw_what_was_asked() {
+    let up = recording_server().await;
+    let az = authz_server(allow_all).await;
+    let mut s = authorized_surface(&up, &az.url(), "", "").await;
+    let log = capture_log(&mut s, "authz_allow");
+    let caller = Caller::new(vec!["billing.read".into()], Some("alice".into()));
+    let client = json!({"ai.example/tenant": "acme"});
+    let fwd = crate::modern::forward_meta(client.as_object().unwrap());
+    let r = s
+        .call_with_meta(
+            &caller,
+            "call_tool",
+            json!({"tool_id": "up.list_items", "arguments": {"cursor": "c2"}}),
+            fwd.as_ref(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert_eq!(calls_seen(&up).len(), 1, "the upstream was called");
+    assert_eq!(az.hits(), 1, "one decision per call");
+    let asked: Value = serde_json::from_str(&az.seen()[0].body).unwrap();
+    assert_eq!(asked["caller"]["subject"], "alice");
+    assert_eq!(asked["caller"]["scopes"], json!(["billing.read"]));
+    assert_eq!(asked["tool"]["id"], "up.list_items");
+    assert_eq!(asked["tool"]["upstream"], "up");
+    assert_eq!(asked["tool"]["name"], "list_items");
+    assert_eq!(asked["tool"]["read_only"], json!(true));
+    assert_eq!(asked["arguments"], json!({"cursor": "c2"}), "the arguments as the agent sent them");
+    assert_eq!(asked["meta"]["ai.example/tenant"], "acme", "the client's forwarded _meta rides along");
+    drop(s);
+    let logged = std::fs::read_to_string(&log).unwrap();
+    let call = logged.lines().find(|l| l.contains("\"event\":\"call\"")).expect("a call line");
+    assert!(call.contains("\"authz\":\"allow\""), "the call line says it was authorized: {call}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn a_denied_call_never_reaches_the_upstream_and_names_the_reason() {
+    let up = recording_server().await;
+    let az = authz_server(|_| {
+        crate::testserver::Reply::json(r#"{"allow": false, "reason": "cluster must match staging-*"}"#)
+    })
+    .await;
+    let mut s = authorized_surface(&up, &az.url(), "", "").await;
+    let log = capture_log(&mut s, "authz_deny");
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}})).await.unwrap();
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let text = result_text(&r);
+    assert!(text.starts_with("AUTHZ_DENIED: up.whoami — cluster must match staging-*"), "{text}");
+    assert!(calls_seen(&up).is_empty(), "the upstream must not be called");
+    drop(s);
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        logged.lines().any(|l| l.contains("\"event\":\"authz_denied\"") && l.contains("staging-*")),
+        "{logged}"
+    );
+    assert!(!logged.contains("\"event\":\"call\""), "a refused call is not a call: {logged}");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn a_4xx_from_the_authorizer_is_a_denial_with_the_bodys_reason() {
+    let up = recording_server().await;
+    let az = authz_server(|_| crate::testserver::Reply::text("missing warrant").with_status(401)).await;
+    let s = authorized_surface(&up, &az.url(), "", "").await;
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}})).await.unwrap();
+    assert!(result_text(&r).contains("AUTHZ_DENIED: up.whoami — missing warrant"), "{r}");
+    assert!(calls_seen(&up).is_empty());
+}
+
+#[tokio::test]
+async fn an_unreachable_or_failing_authorizer_fails_closed_by_default() {
+    let up = recording_server().await;
+    // Nothing listens here.
+    let s = authorized_surface(&up, "http://127.0.0.1:1/authorize", "", "").await;
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}})).await.unwrap();
+    assert!(result_text(&r).starts_with("AUTHZ_UNAVAILABLE"), "{r}");
+    assert!(calls_seen(&up).is_empty(), "fail closed: nothing was sent");
+    // A 5xx is an outage too, not a denial.
+    let az = authz_server(|_| crate::testserver::Reply::status(503)).await;
+    let s = authorized_surface(&up, &az.url(), "", "").await;
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}})).await.unwrap();
+    let text = result_text(&r);
+    assert!(text.contains("AUTHZ_UNAVAILABLE") && text.contains("HTTP 503"), "{text}");
+    assert!(calls_seen(&up).is_empty());
+}
+
+#[tokio::test]
+async fn fail_open_serves_the_call_when_the_authorizer_is_down_and_says_so() {
+    let up = recording_server().await;
+    let az = authz_server(|_| crate::testserver::Reply::status(503)).await;
+    let mut s = authorized_surface(&up, &az.url(), "  fail_open: true\n", "").await;
+    let log = capture_log(&mut s, "authz_fail_open");
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}})).await.unwrap();
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert_eq!(calls_seen(&up).len(), 1);
+    drop(s);
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        logged.lines().any(|l| l.contains("\"event\":\"authz_unavailable\"") && l.contains("\"served\":true")),
+        "{logged}"
+    );
+    assert!(
+        logged.lines().any(|l| l.contains("\"event\":\"call\"") && l.contains("\"authz\":\"unavailable\"")),
+        "{logged}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn report_only_asks_logs_the_would_deny_and_serves_the_call() {
+    let up = recording_server().await;
+    let az = authz_server(|_| crate::testserver::Reply::json(r#"{"allow": false, "reason": "nope"}"#)).await;
+    let mut s = authorized_surface(&up, &az.url(), "  report_only: true\n", "").await;
+    let log = capture_log(&mut s, "authz_report_only");
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}})).await.unwrap();
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert_eq!(az.hits(), 1, "still asked");
+    assert_eq!(calls_seen(&up).len(), 1, "still served");
+    drop(s);
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        logged.lines().any(|l| l.contains("\"event\":\"authz_would_deny\"") && l.contains("nope")),
+        "{logged}"
+    );
+    assert!(
+        logged.lines().any(|l| l.contains("\"event\":\"call\"") && l.contains("\"authz\":\"would_deny\"")),
+        "{logged}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn a_cached_read_is_still_authorized_on_every_call() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let up = recording_server().await;
+    let allow = Arc::new(AtomicBool::new(true));
+    let a = allow.clone();
+    let az = authz_server(move |_| {
+        if a.load(Ordering::Relaxed) {
+            crate::testserver::Reply::json(r#"{"allow": true}"#)
+        } else {
+            crate::testserver::Reply::json(r#"{"allow": false, "reason": "revoked"}"#)
+        }
+    })
+    .await;
+    let s = authorized_surface(&up, &az.url(), "", "read_cache_ttl_s: 60\n").await;
+    let call = json!({"tool_id": "up.list_items", "arguments": {}});
+    let r = s.call(&anon(), "call_tool", call.clone()).await.unwrap();
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let r = s.call(&anon(), "call_tool", call.clone()).await.unwrap();
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert_eq!(calls_seen(&up).len(), 1, "the second read was a cache hit");
+    assert_eq!(az.hits(), 2, "but was still authorized");
+    allow.store(false, Ordering::Relaxed);
+    let r = s.call(&anon(), "call_tool", call).await.unwrap();
+    assert!(result_text(&r).contains("AUTHZ_DENIED"), "a cached answer is not a bypass: {r}");
+}
+
+#[tokio::test]
+async fn every_composite_step_is_authorized_but_pagination_pages_are_not() {
+    let up = recording_server().await;
+    let az = authz_server(allow_all).await;
+    let top = "\
+overlays:
+  - tool: up.list_items
+    paginate: { items: data, cursor: next_cursor, into: cursor, max_pages: 5 }
+workflows:
+  - id: up.both
+    description: \"List, then who.\"
+    steps:
+      - id: list
+        tool: up.list_items
+        input: {}
+      - id: who
+        tool: up.whoami
+        input: {}
+";
+    let s = authorized_surface(&up, &az.url(), "", top).await;
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "up.both", "arguments": {}})).await.unwrap();
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert_eq!(calls_seen(&up).len(), 3, "two pages, then the second step");
+    assert_eq!(az.hits(), 2, "one decision per step; a follow-up page is the same call");
+    let asked: Vec<String> = az
+        .seen()
+        .iter()
+        .map(|r| serde_json::from_str::<Value>(&r.body).unwrap()["tool"]["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(asked, vec!["up.list_items", "up.whoami"]);
+}
+
+#[tokio::test]
+async fn a_tool_the_caller_cannot_see_is_refused_before_the_authorizer_is_asked() {
+    let up = recording_server().await;
+    let az = authz_server(allow_all).await;
+    let top = "scopes:\n  rules:\n    - {scope: admin, tools: [\"up.*\"]}\n";
+    let s = authorized_surface(&up, &az.url(), "", top).await;
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}})).await.unwrap();
+    assert!(result_text(&r).contains("unknown tool_id"), "{r}");
+    assert_eq!(az.hits(), 0, "a hidden tool is never described to the authorizer");
+    assert!(calls_seen(&up).is_empty());
+}
+
+#[tokio::test]
+async fn include_arguments_false_withholds_them_and_headers_authenticate_the_proxy() {
+    let up = recording_server().await;
+    let az = authz_server(allow_all).await;
+    let extra = "  include_arguments: false\n  headers:\n    X-Authz-Token: \"shh\"\n";
+    let s = authorized_surface(&up, &az.url(), extra, "").await;
+    s.call(&anon(), "call_tool", json!({"tool_id": "up.list_items", "arguments": {"cursor": "c2"}})).await.unwrap();
+    let got = &az.seen()[0];
+    let asked: Value = serde_json::from_str(&got.body).unwrap();
+    assert!(asked.get("arguments").is_none(), "{asked}");
+    assert_eq!(asked["tool"]["id"], "up.list_items");
+    assert_eq!(got.header("x-authz-token"), Some("shh"));
+}
+
+#[tokio::test]
+async fn a_slow_authorizer_is_an_outage() {
+    let up = recording_server().await;
+    let az = authz_server(|_| crate::testserver::Reply::json(r#"{"allow": true}"#).after(700)).await;
+    let s = authorized_surface(&up, &az.url(), "  timeout_ms: 200\n", "").await;
+    let r = s.call(&anon(), "call_tool", json!({"tool_id": "up.whoami", "arguments": {}})).await.unwrap();
+    let text = result_text(&r);
+    assert!(text.contains("AUTHZ_UNAVAILABLE") && text.contains("timed out"), "{text}");
+    assert!(calls_seen(&up).is_empty());
+}
+
+#[test]
+fn authorizer_config_has_safe_defaults_and_rejects_what_it_cannot_honour() {
+    let cfg = Config::from_yaml("upstreams: []\nauthorizer:\n  url: https://authz.internal/v1/authorize\n").unwrap();
+    let a = cfg.authorizer.expect("configured");
+    assert_eq!(a.timeout_ms, 1000);
+    assert!(!a.fail_open && !a.report_only && a.include_arguments);
+    for (yaml, what) in [
+        ("upstreams: []\nauthorizer:\n  url: ftp://x/\n", "authorizer.url must be an http(s) URL"),
+        ("upstreams: []\nauthorizer:\n  url: https://x/\n  timeout_ms: 0\n", "timeout_ms"),
+        ("upstreams: []\nauthorizer:\n  url: https://x/\n  cache_ttl_s: 5\n", "unknown field"),
+    ] {
+        let err = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+        assert!(err.contains(what), "{yaml}: {err}");
+    }
+}
+
+#[test]
+fn the_access_report_names_the_authorizer_and_warns_when_it_does_not_enforce() {
+    let yaml = "mode: three_tool\nupstreams: []\nauthorizer:\n  url: https://authz.internal/v1/authorize\n  report_only: true\n  fail_open: true\n";
+    let s = test_surface(Config::from_yaml(yaml).unwrap(), vec![]);
+    let r = s.access_report(&Caller::default(), 0);
+    assert_eq!(r["authorizer"]["configured"], json!(true));
+    assert_eq!(r["authorizer"]["enforced"], json!(false));
+    assert_eq!(r["authorizer"]["url"], "https://authz.internal/v1/authorize");
+    let warnings = r["warnings"].to_string();
+    assert!(warnings.contains("authorizer is report-only"), "{warnings}");
+    assert!(warnings.contains("authorizer fail_open"), "{warnings}");
+    let none = test_surface(Config::from_yaml("mode: three_tool\nupstreams: []\n").unwrap(), vec![]);
+    let r = none.access_report(&Caller::default(), 0);
+    assert_eq!(r["authorizer"]["configured"], json!(false));
+    assert!(!r["warnings"].to_string().contains("authorizer"));
 }
 
 #[tokio::test]

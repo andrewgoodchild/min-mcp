@@ -204,13 +204,18 @@ impl ServerHandler for MinMcpServer {
         }
         let name = request.name.to_string();
         let args = request.arguments.map(Value::Object).unwrap_or_else(|| json!({}));
+        // The client's request `_meta` crosses to the upstream call made on its
+        // behalf — trace context, a vendor envelope — minus the keys that name
+        // this hop. rmcp lifts it off the wire into the context (the typed
+        // `request.meta` stays empty on the way in, by its contract).
+        let meta = crate::modern::forward_meta(&context.meta);
         // The surface returns every tool-level outcome — client-side argument
         // errors, upstream isError, timeouts, AND transport failures — as an
         // isError result (Ok), so the agent can reason about it. Only a failure
         // of min-mcp itself reaches the Err branch; `{:#}` keeps the cause chain.
         let result = self
             .surface
-            .call(&caller, &name, args)
+            .call_with_meta(&caller, &name, args, meta.as_ref())
             .await
             .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?;
         Ok(value_to_call_result(&result).into())

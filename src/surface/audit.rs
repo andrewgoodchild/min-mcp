@@ -207,7 +207,7 @@ impl Surface {
         let (mut passed, mut failed) = (0usize, 0usize);
         let mut results = Vec::new();
         for (tool, check) in checks {
-            let outcome = match self.route_call(caller, &tool, check.arguments.clone(), &[]).await {
+            let outcome = match self.route_call(caller, &tool, check.arguments.clone(), &[], None).await {
                 Ok(r) => eval_expect(&r, self.tool_from_spec(&tool), &check.expect),
                 Err(e) => (false, vec![format!("call errored: {e}")]),
             };
@@ -389,6 +389,20 @@ impl Surface {
         } else if !tamper_evident {
             warnings.push("audit log is not tamper-evident (no log_hmac_key)".into());
         }
+        let az = cfg.authorizer.as_ref();
+        if let Some(a) = az {
+            if a.report_only {
+                warnings.push(
+                    "authorizer is report-only: nothing is refused; what would be is logged as `authz_would_deny`".into(),
+                );
+            }
+            if a.fail_open {
+                warnings.push(
+                    "authorizer fail_open: when it cannot be reached, calls are served unchecked (logged as `authz_unavailable`)"
+                        .into(),
+                );
+            }
+        }
 
         json!({
             "identity": {
@@ -414,6 +428,13 @@ impl Surface {
                 "overlay_limits": overlay_limits,
             },
             "audit": {"log": audit_log, "tamper_evident": tamper_evident},
+            "authorizer": {
+                "configured": az.is_some(),
+                "url": az.map(|a| a.url.as_str()),
+                "enforced": az.is_some_and(|a| !a.report_only),
+                "fail_open": az.is_some_and(|a| a.fail_open),
+                "report_only": az.is_some_and(|a| a.report_only),
+            },
             "warnings": warnings,
         })
     }

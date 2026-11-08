@@ -18,6 +18,7 @@ upstreams: [ ... ]        # required: one or more upstreams (below)
 filters: { ... }          # static include/exclude of whole APIs or tools
 scopes: { ... }           # per-caller visibility rules (default-deny if present)
 auth: { ... }             # JWT verification (HS256 / RS256 / JWKS)
+authorizer: { ... }       # external policy engine asked before every call (ext_authz shape)
 overlays: [ ... ]         # patch/reshape tools you don't own — see overlays.md
 workflows: [ ... ]        # composite multi-step tools — see composites.md
 binding_policy: warn      # warn (default) | strict — how broken overlays behave
@@ -39,6 +40,7 @@ shadow: false             # score alternative retrievers on real traffic (see be
 | `auth` | How callers are identified: a JWT verifier (HS256 / RS256 / JWKS, with optional `audience` / `issuer` / `subject_claim`), or `trusted_headers` from a gateway; `allow_anonymous`. Over HTTP identity is per request. See [Transports & auth](transports-and-auth.md#caller-identity). |
 | `http` | The HTTP listener's own hardening: `tls` (`cert_file`, `key_file`, and `client_ca_file` for mutual TLS) and `limits` (`max_body_bytes`, `max_in_flight`). See [TLS](transports-and-auth.md#tls-on-the-listener). |
 | `poisoning_policy` | What the server does about a tool whose name or description trips a [tool-poisoning rule](cli.md#lint): `warn` (default — name it and serve it), `strict` (refuse to start), `off`. The check reads names and descriptions only, so it costs nothing at startup. |
+| `authorizer` | An external authorizer asked before every upstream call, Envoy `ext_authz` in shape: `url`, `headers` (`${…}` references), `timeout_ms` (default 1000), `fail_open` (default false — refuse when it cannot answer), `report_only`, `include_arguments` (default true). min-mcp is the gate, not the policy engine. See [External authorizer](transports-and-auth.md#external-authorizer-authorizer). |
 | `auth.introspection` | RFC 7662 token revocation: `url`, `client_id`, `client_secret`, `cache_ttl_s` (default 60 — this is your revocation latency), `fail_open` (default false — refuse when the IdP is unreachable). Bearer tokens only. See [Revocation](transports-and-auth.md#revocation-authintrospection). |
 | `overlays` | Per-tool fixes for a server you don't own: patch descriptions, the input schema (`fields`: required/example/enum/hide/`user_supplied`), errors (`error_hints` + `retryable` + structured `field`), responses, request `defaults`/`headers` (with `{{uuid}}`/`{{hash}}` generators), `aliases`, `paginate`, `verify` checks, and per-tool guards — `timeout_s` (call deadline) and `breaker` (circuit breaker on consecutive failures). See [Overlays](overlays.md). |
 | `workflows` | Composite tools. See [Composites](composites.md). |
@@ -180,6 +182,24 @@ auth:
     scopes: X-Auth-Scopes          # space- or comma-separated scopes
     subject: X-Auth-Subject        # optional; the audit label
   allow_anonymous: false           # true: a request with no identity gets the process caller
+```
+
+## Authorizer
+
+An external policy engine asked before every upstream call — whether *this*
+caller may make *this* call with *these* arguments, which scopes cannot say.
+One `POST` per call; the contract and the ordering are in
+[Transports → External authorizer](transports-and-auth.md#external-authorizer-authorizer).
+
+```yaml
+authorizer:
+  url: https://authz.internal:9090/v1/authorize
+  headers:                                 # how min-mcp authenticates to it
+    Authorization: "Bearer ${AUTHZ_TOKEN}"
+  timeout_ms: 1000                         # past this it counts as unreachable
+  fail_open: false                         # default: an unreachable authorizer refuses the call
+  report_only: false                       # true: ask, log `authz_would_deny`, refuse nothing
+  include_arguments: true                  # false: send who and what, not with what
 ```
 
 ## Rate limits

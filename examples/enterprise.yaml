@@ -52,6 +52,18 @@ scopes:
     - scope: store.write
       tools: ["acme.widgets/create", "acme.orders/create"]
 
+# --- Argument-level policy, if you run a policy engine -------------------------
+# Asked before every upstream call with the caller, the tool, the arguments as
+# the agent sent them, and the client's `_meta`. Envoy ext_authz in shape: a 2xx
+# allows, a 4xx denies with the body as the reason, a 5xx or no answer is an
+# outage — refused unless fail_open. Commented out so this file stays
+# offline-runnable.
+# authorizer:
+#   url: http://127.0.0.1:9090/v1/authorize
+#   headers: { Authorization: "Bearer ${vault:minmcp/prod#authz_token}" }
+#   timeout_ms: 500
+#   report_only: true                      # roll out: log `authz_would_deny` first
+
 # --- The listener itself ------------------------------------------------------
 http:
   # TLS terminated here rather than only at the gateway. Commented out so this

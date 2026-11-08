@@ -10,10 +10,15 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use base64::Engine;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// The modern revision the upstream clients speak.
 pub const MODERN_VERSION: &str = "2026-07-28";
+
+/// The request `_meta` key a client uses to ask for progress on ITS hop.
+const PROGRESS_TOKEN: &str = "progressToken";
+/// The prefix of the request `_meta` keys that describe the requesting client.
+const MCP_META_PREFIX: &str = "io.modelcontextprotocol/";
 
 /// How long a `server/discover` probe waits. A legacy stdio server may ignore
 /// a request that arrives before `initialize`, so silence has to mean "legacy";
@@ -61,17 +66,42 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-/// `params` with the `_meta` every modern request has to carry.
+/// `params` with the `_meta` every modern request has to carry. A `_meta` the
+/// params already hold — a client's, forwarded by [`forward_meta`] — is kept;
+/// min-mcp's keys describe THIS hop, so on a shared key they win.
 pub fn with_meta(mut params: Value) -> Value {
-    let meta = json!({
-        "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
-        "io.modelcontextprotocol/clientCapabilities": {},
-        "io.modelcontextprotocol/clientInfo": {"name": "min-mcp", "version": env!("CARGO_PKG_VERSION")},
-    });
+    let ours = [
+        ("io.modelcontextprotocol/protocolVersion", json!(MODERN_VERSION)),
+        ("io.modelcontextprotocol/clientCapabilities", json!({})),
+        ("io.modelcontextprotocol/clientInfo", json!({"name": "min-mcp", "version": env!("CARGO_PKG_VERSION")})),
+    ];
     if let Some(obj) = params.as_object_mut() {
-        obj.insert("_meta".to_string(), meta);
+        let meta = obj.entry("_meta").or_insert_with(|| json!({}));
+        if !meta.is_object() {
+            *meta = json!({});
+        }
+        if let Some(m) = meta.as_object_mut() {
+            m.extend(ours.into_iter().map(|(k, v)| (k.to_string(), v)));
+        }
     }
     params
+}
+
+/// What of a client's request `_meta` crosses the proxy, onto the upstream call
+/// made on its behalf. Two kinds of key stay behind because they name the
+/// client's hop, not the upstream's: `progressToken` (min-mcp relays no progress
+/// notifications, so a forwarded token would name a request the upstream cannot
+/// reach) and the `io.modelcontextprotocol/` context keys (they describe the
+/// client; [`with_meta`] adds min-mcp's own for a modern upstream). Everything
+/// else — trace context, a vendor envelope — is the client's to send and the
+/// upstream's to read. `None` when nothing is left to send.
+pub fn forward_meta(client: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let kept: Map<String, Value> = client
+        .iter()
+        .filter(|(k, _)| k.as_str() != PROGRESS_TOKEN && !k.starts_with(MCP_META_PREFIX))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    (!kept.is_empty()).then_some(kept)
 }
 
 /// Decide the era from a `server/discover` outcome. Only a `DiscoverResult` or
@@ -312,6 +342,45 @@ mod tests {
         assert_eq!(p["name"], "t");
         assert_eq!(p["_meta"]["io.modelcontextprotocol/protocolVersion"], MODERN_VERSION);
         assert!(p["_meta"]["io.modelcontextprotocol/clientCapabilities"].is_object());
+    }
+
+    #[test]
+    fn a_forwarded_meta_is_kept_and_ours_wins_on_a_shared_key() {
+        let p = with_meta(json!({"name": "t", "_meta": {
+            "traceparent": "00-abc-def-01",
+            "io.modelcontextprotocol/protocolVersion": "2025-06-18",
+        }}));
+        assert_eq!(p["_meta"]["traceparent"], "00-abc-def-01", "the client's key survives");
+        assert_eq!(
+            p["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            MODERN_VERSION,
+            "this hop's version, not the client's"
+        );
+        // A `_meta` that is not an object cannot be merged into; ours replaces it.
+        let p = with_meta(json!({"name": "t", "_meta": 7}));
+        assert_eq!(p["_meta"]["io.modelcontextprotocol/protocolVersion"], MODERN_VERSION);
+    }
+
+    #[test]
+    fn forward_meta_keeps_the_clients_keys_and_drops_what_names_its_hop() {
+        let client = json!({
+            "traceparent": "00-abc-def-01",
+            "tracestate": "v=1",
+            "ai.example/tenant": "acme",
+            "progressToken": 7,
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let kept = forward_meta(client.as_object().unwrap()).expect("something crosses");
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        assert_eq!(kept["traceparent"], "00-abc-def-01");
+        assert_eq!(kept["ai.example/tenant"], "acme");
+        assert!(!kept.contains_key("progressToken"), "a progress token names the client's hop");
+        assert!(!kept.contains_key("io.modelcontextprotocol/protocolVersion"));
+        // Nothing left means nothing sent: no empty `_meta` on the wire.
+        let only_hop_keys = json!({"progressToken": 1, "io.modelcontextprotocol/clientInfo": {}});
+        assert!(forward_meta(only_hop_keys.as_object().unwrap()).is_none());
+        assert!(forward_meta(&Map::new()).is_none());
     }
 
     #[test]

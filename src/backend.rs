@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use secrecy::SecretString;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::config::UpstreamConfig;
 use crate::exec::Executor;
@@ -68,15 +68,18 @@ impl Backend {
     /// Returns an MCP tool-result Value ({content, isError}) either way.
     /// `extra_headers` are per-operation request headers (from an overlay); they
     /// apply to spec (HTTP) upstreams only — MCP subprocess/HTTP upstreams ignore
-    /// them (their transport isn't a per-call REST request).
+    /// them (their transport isn't a per-call REST request). `meta` is the
+    /// mirror image: the client's request `_meta`, forwarded on an MCP
+    /// upstream's `tools/call` and meaningless to a spec, which has no `_meta`.
     pub async fn call_tool(
         &self,
         name: &str,
         args: Value,
         extra_headers: &[(String, String)],
+        meta: Option<&Map<String, Value>>,
         deadline: Option<std::time::Duration>,
     ) -> Result<Value> {
-        Ok(self.call_tool_reach(name, args, extra_headers, deadline).await?.0)
+        Ok(self.call_tool_reach(name, args, extra_headers, meta, deadline).await?.0)
     }
 
     /// [`Self::call_tool`], plus whether the call reached the upstream. An MCP
@@ -87,13 +90,14 @@ impl Backend {
         name: &str,
         args: Value,
         extra_headers: &[(String, String)],
+        meta: Option<&Map<String, Value>>,
         deadline: Option<std::time::Duration>,
     ) -> Result<(Value, Reach)> {
         let mut r = match self {
             // Spec results compact in exec.rs, where the envelope is built.
             Backend::Spec(s) => return s.call_tool(name, args, extra_headers, deadline).await,
-            Backend::Mcp(u) => u.call_tool(name, args, deadline).await?,
-            Backend::Http(h) => h.call_tool(name, args, deadline).await?,
+            Backend::Mcp(u) => u.call_tool(name, args, meta, deadline).await?,
+            Backend::Http(h) => h.call_tool(name, args, meta, deadline).await?,
         };
         if self.result_format() == crate::config::ResultFormat::Json {
             compact_json_texts(&mut r);

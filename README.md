@@ -135,6 +135,7 @@ development tool. What you turn on when it becomes infrastructure:
 |---|---|
 | **Identity** | Per-request caller over HTTP: a validated bearer, or identity headers from a gateway. Scopes are default-deny once any rule exists |
 | **Revocation** | RFC 7662 introspection, so a validly-signed token can still be refused once revoked |
+| **Policy** | An external authorizer (OPA, Cedar, a warrant verifier) asked before every call with the caller, the tool and the arguments, Envoy `ext_authz` in shape. min-mcp is the gate, not the policy engine |
 | **Wire** | TLS on the listener, and mutual TLS — which is what makes trusting a gateway's identity headers sound rather than assumed |
 | **Bounds** | Request body, in-flight requests, concurrent upstream calls, connection deadlines, per-caller rate limits |
 | **Tool integrity** | Tool definitions checked for poisoning at startup; `strict` refuses to serve a flagged tool |

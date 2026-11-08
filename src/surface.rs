@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::backend::{Backend, SpecBackend};
 use crate::caller::Caller;
@@ -119,6 +119,9 @@ pub struct Surface {
     breakers: Mutex<HashMap<String, breaker::BreakerState>>,
     /// Token buckets for `rate_limits` and overlay `rate_limit`.
     limits: ratelimit::Buckets,
+    /// The external authorizer (`authorizer:`), asked before every upstream
+    /// call. None = no policy hook; scopes alone decide.
+    authorizer: Option<crate::authz::Authorizer>,
     /// Slots for tool calls in flight to upstreams (`max_concurrent_calls`).
     /// `None` when disabled. Held ONLY across the upstream call itself, never
     /// across cache, breaker or shaping work — and never across a nested call,
@@ -137,6 +140,12 @@ replace the description with an overlay, or set `poisoning_policy: warn` if they
 
 impl Surface {
     pub async fn build(config: Config, secrets: Secrets) -> Result<Self> {
+        // First: a bad secret reference in its headers should fail before any
+        // upstream is spawned.
+        let authorizer = match &config.authorizer {
+            Some(a) => Some(crate::authz::Authorizer::new(a, &secrets).await?),
+            None => None,
+        };
         let mut upstreams = Vec::new();
         let mut listings: Vec<Vec<ToolDef>> = Vec::new();
         let mut ttls: Vec<Option<u64>> = Vec::new();
@@ -240,6 +249,7 @@ impl Surface {
             resource_origin: Mutex::new(HashMap::new()),
             breakers: Mutex::new(HashMap::new()),
             limits: ratelimit::Buckets::default(),
+            authorizer,
             upstream_slots: (config_max_concurrent > 0)
                 .then(|| tokio::sync::Semaphore::new(config_max_concurrent)),
         };
@@ -528,18 +538,40 @@ impl Surface {
 
     /// Invoke a tool or composite by id with optional projection (`minmcp call`).
     pub async fn cli_call(&self, caller: &Caller, tool_id: &str, arguments: Value, fields: &[String]) -> Result<Value> {
-        let mut r = self.route_call(caller, tool_id, arguments, fields).await?;
+        let mut r = self.route_call(caller, tool_id, arguments, fields, None).await?;
         truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
         Ok(r)
     }
 
-    /// Client-side errors (bad args, unknown tool) are returned as isError
-    /// tool results with a `bad_arg` marker — NOT as Err, so the transport
-    /// loop never mislabels them "the upstream may be down".
+    /// [`Self::call_with_meta`] with nothing attached. Test convenience: a
+    /// served request always has a context, so the server goes through
+    /// `call_with_meta` even when the client sent no `_meta`.
+    #[cfg(test)]
     pub async fn call(&self, caller: &Caller, name: &str, args: Value) -> Result<Value> {
-        let has_meta = self.config.mode != Mode::Passthrough;
+        self.call_with_meta(caller, name, args, None).await
+    }
+
+    /// Run an agent-facing tool: a meta-tool, or in passthrough an upstream
+    /// tool by its exposed name. Client-side errors (bad args, unknown tool)
+    /// are returned as isError tool results with a `bad_arg` marker — NOT as
+    /// Err, so the transport loop never mislabels them "the upstream may be
+    /// down".
+    ///
+    /// `meta` is the client's request `_meta` — what
+    /// [`crate::modern::forward_meta`] left of it — carried to the upstream
+    /// call made on the client's behalf: every page auto-pagination fetches,
+    /// every step a composite runs. The meta-tools themselves (`search_tools`,
+    /// `get_tool_details`) answer locally and have nothing to forward it to.
+    pub async fn call_with_meta(
+        &self,
+        caller: &Caller,
+        name: &str,
+        args: Value,
+        meta: Option<&Map<String, Value>>,
+    ) -> Result<Value> {
+        let meta_tools = self.config.mode != Mode::Passthrough;
         match name {
-            "search_tools" if has_meta => {
+            "search_tools" if meta_tools => {
                 let Some(query) = args.get("query").and_then(Value::as_str) else {
                     return Ok(bad_arg("search_tools requires a 'query' string"));
                 };
@@ -555,7 +587,7 @@ impl Surface {
                 }
                 Ok(text_result(text, false))
             }
-            "get_tool_details" if has_meta => {
+            "get_tool_details" if meta_tools => {
                 let Some(id) = args.get("tool_id").and_then(Value::as_str) else {
                     return Ok(bad_arg("get_tool_details requires a 'tool_id' string"));
                 };
@@ -563,7 +595,7 @@ impl Surface {
                 self.log_event(caller, "details", json!({"tool_id": id}));
                 Ok(text_result(text, false))
             }
-            "call_tool" if has_meta => {
+            "call_tool" if meta_tools => {
                 let Some(id) = args.get("tool_id").and_then(Value::as_str) else {
                     return Ok(bad_arg("call_tool requires a 'tool_id' string"));
                 };
@@ -593,7 +625,7 @@ impl Surface {
                 // Agent boundary: bound the result AFTER overlays/projection ran
                 // on the full body (workflow steps and verify call route_call/
                 // dispatch directly and read untruncated results).
-                let mut r = self.route_call(caller, &id, inner, &fields).await?;
+                let mut r = self.route_call(caller, &id, inner, &fields, meta).await?;
                 truncate_result_text(&mut r, AGENT_RESULT_BUDGET);
                 Ok(r)
             }
@@ -618,7 +650,7 @@ impl Surface {
                         true,
                     ));
                 };
-                let mut r = self.dispatch(caller, &id, args, &[]).await?;
+                let mut r = self.dispatch(caller, &id, args, &[], meta).await?;
                 // A tool that declares an `outputSchema` MUST return conforming
                 // `structuredContent`, and strict clients error without it, so
                 // the budget bounds only its text. Without a schema the
@@ -768,12 +800,19 @@ impl Surface {
     }
 
     /// Route a call to a composite workflow if the id names one, else a tool.
-    async fn route_call(&self, caller: &Caller, id: &str, args: Value, fields: &[String]) -> Result<Value> {
+    async fn route_call(
+        &self,
+        caller: &Caller,
+        id: &str,
+        args: Value,
+        fields: &[String],
+        meta: Option<&Map<String, Value>>,
+    ) -> Result<Value> {
         if let Some(&i) = self.workflow_by_id.get(id).filter(|_| self.may_call(caller, id)) {
             let wf = &self.config.workflows[i];
-            return self.execute_workflow(caller, wf, args).await;
+            return self.execute_workflow(caller, wf, args, meta).await;
         }
-        self.dispatch(caller, id, args, fields).await
+        self.dispatch(caller, id, args, fields, meta).await
     }
 
     /// One-line description of any callable id — upstream tool or workflow.

@@ -13,8 +13,17 @@ fn not_sent(result: Value) -> Result<(Value, Reach)> {
 }
 
 impl Surface {
-    pub(super) async fn dispatch(&self, caller: &Caller, tool_id: &str, arguments: Value, fields: &[String]) -> Result<Value> {
-        Ok(self.dispatch_reach(caller, tool_id, arguments, fields).await?.0)
+    /// `meta` is the client's request `_meta`, as [`crate::modern::forward_meta`]
+    /// left it, for the upstream call made on the client's behalf.
+    pub(super) async fn dispatch(
+        &self,
+        caller: &Caller,
+        tool_id: &str,
+        arguments: Value,
+        fields: &[String],
+        meta: Option<&Map<String, Value>>,
+    ) -> Result<Value> {
+        Ok(self.dispatch_reach(caller, tool_id, arguments, fields, meta).await?.0)
     }
 
     /// [`Self::dispatch`], plus whether the call reached the upstream — set
@@ -26,6 +35,7 @@ impl Surface {
         tool_id: &str,
         arguments: Value,
         fields: &[String],
+        meta: Option<&Map<String, Value>>,
     ) -> Result<(Value, Reach)> {
         let started = Instant::now();
         // One catalog for the whole call: the definition, its schema, headers
@@ -58,6 +68,16 @@ impl Surface {
                 true,
             ));
         }
+        // External authorizer, if one is configured: after visibility (a tool
+        // the caller cannot see is never described to it) and rate limits (a
+        // flood never reaches it); before the cache (a cached answer must still
+        // be authorized) and before defaults and injected values (it sees what
+        // the agent asked, and a secret never leaves the proxy). One round trip
+        // per call; a pagination follow-up is the same call.
+        let authz = match self.authorize(caller, &t, tool_id, &arguments, meta).await {
+            Ok(label) => label,
+            Err(refusal) => return not_sent(refusal),
+        };
         // Over the arguments as the CALLER sent them, before defaults and
         // injected secrets, so an operator can reproduce it with `audit-args`.
         let args_mac = self.args_key.as_ref().map(|k| k.mac(&canonical_args(&arguments)));
@@ -146,7 +166,10 @@ impl Surface {
         // tools with a read-only signal (spec GET / readOnlyHint / overlay
         // `cacheable: true`), only when a TTL is configured. The cached value is
         // the RAW pre-shaping result (post-pagination), so each hit still gets
-        // THIS call's overlay transform + `fields` projection below.
+        // THIS call's overlay transform + `fields` projection below. The client's
+        // `_meta` is not part of the key: it is metadata, not an argument (a
+        // trace id differs on every request), and a tool whose answer depends
+        // on it has no business being cached.
         let cacheable = self.cache_allowed(tool_id, read_only);
         let cache_key =
             cacheable.then(|| (tool_id.to_string(), cache::canonical_args(&arguments)));
@@ -198,7 +221,7 @@ impl Surface {
                 // far more than the upstream work it exists to bound.
                 let called = {
                     let _slot = self.upstream_slot().await;
-                    self.upstreams[idx].call_tool_reach(&original_name, call_args, &extra_headers, deadline).await
+                    self.upstreams[idx].call_tool_reach(&original_name, call_args, &extra_headers, meta, deadline).await
                 };
                 if called.is_err() {
                     reach = Reach::NoAnswer;
@@ -263,7 +286,7 @@ impl Surface {
             if let Some(p) = paginate {
                 if !is_error {
                     let (merged, partial) = self
-                        .paginate(caller, idx, &original_name, arguments, &extra_headers, result, p, deadline)
+                        .paginate(caller, idx, &original_name, arguments, &extra_headers, meta, result, p, deadline)
                         .await?;
                     result = merged;
                     partial_pages = partial;
@@ -344,9 +367,79 @@ impl Surface {
             if let Some(mac) = args_mac {
                 fields["args_mac"] = json!(mac);
             }
+            if let Some(a) = authz {
+                fields["authz"] = json!(a);
+            }
             self.log_event(caller, "call", fields);
         }
         Ok((result, reach))
+    }
+
+    /// Ask the external authorizer about this call, if one is configured.
+    /// `Ok(None)`: no authorizer. `Ok(Some(label))`: proceed, and say on the
+    /// call's audit line why — `allow`, or under report-only / fail-open the
+    /// decision that was NOT enforced. `Err(result)`: the isError result to
+    /// return instead of calling the upstream.
+    async fn authorize(
+        &self,
+        caller: &Caller,
+        t: &ToolDef,
+        tool_id: &str,
+        arguments: &Value,
+        meta: Option<&Map<String, Value>>,
+    ) -> Result<Option<&'static str>, Value> {
+        use crate::authz::Decision;
+        let Some(az) = &self.authorizer else { return Ok(None) };
+        let started = Instant::now();
+        let req = crate::authz::Request {
+            caller,
+            tool_id,
+            upstream: self.upstreams[t.upstream_idx].name(),
+            name: &t.name,
+            read_only: t.read_only,
+            arguments,
+            meta,
+        };
+        let decision = az.decide(&req).await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        match decision {
+            Decision::Allow => Ok(Some("allow")),
+            Decision::Deny { reason } if az.report_only() => {
+                self.log_event(caller, "authz_would_deny", json!({"tool_id": tool_id, "reason": reason, "latency_ms": latency_ms}));
+                Ok(Some("would_deny"))
+            }
+            Decision::Deny { reason } => {
+                self.log_event(caller, "authz_denied", json!({"tool_id": tool_id, "reason": reason, "latency_ms": latency_ms}));
+                Err(text_result(
+                    format!(
+                        "AUTHZ_DENIED: {tool_id} — {reason}. The authorizer refused this call. Do not retry it \
+                         with the same arguments, and do not work around it with another tool; report the \
+                         reason, or change the request only if the reason says how."
+                    ),
+                    true,
+                ))
+            }
+            Decision::Unavailable { why } => {
+                // Report-only never refuses, so an outage under it serves too.
+                let served = az.fail_open() || az.report_only();
+                self.log_event(
+                    caller,
+                    "authz_unavailable",
+                    json!({"tool_id": tool_id, "error": why, "served": served, "latency_ms": latency_ms}),
+                );
+                if served {
+                    crate::log_warn!("authorizer did not answer ({why}); serving {tool_id} unchecked (fail_open / report_only)");
+                    return Ok(Some("unavailable"));
+                }
+                Err(text_result(
+                    format!(
+                        "AUTHZ_UNAVAILABLE: the authorizer did not answer ({why}), so {tool_id} was not called. \
+                         Retry later or report it; do not work around it with another tool."
+                    ),
+                    true,
+                ))
+            }
+        }
     }
 
     /// The first exhausted limit for this call, as (what, retry_in_s): the
@@ -431,6 +524,7 @@ impl Surface {
         name: &str,
         mut args: Value,
         headers: &[(String, String)],
+        meta: Option<&Map<String, Value>>,
         first: Value,
         p: &crate::config::Paginate,
         deadline: Option<std::time::Duration>,
@@ -468,7 +562,7 @@ impl Surface {
             // pagination and surfaces on the merged (partial) result instead.
             let paged = {
                 let _slot = self.upstream_slot().await;
-                self.upstreams[idx].call_tool(name, args.clone(), headers, deadline).await
+                self.upstreams[idx].call_tool(name, args.clone(), headers, meta, deadline).await
             };
             let next = match paged {
                 Ok(n) => n,

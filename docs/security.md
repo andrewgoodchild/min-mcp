@@ -17,6 +17,7 @@ what you turn on when it becomes infrastructure.
 |---|---|
 | Who is calling? | `auth:` — a validated bearer, or identity headers from a gateway |
 | What may they reach? | `scopes:` — default-deny once any rule exists |
+| May they make *this* call, with *these* arguments? | `authorizer:` — your policy engine, asked per call; min-mcp is the gate, not the engine |
 | Is their token still good? | `auth.introspection` — RFC 7662 revocation |
 | How often may they call? | `rate_limits` — keyed per caller |
 | Is the wire protected? | `http.tls`, and `client_ca_file` for mutual TLS |
@@ -46,6 +47,13 @@ Worth reading before you rely on one.
 
 - **Scopes** hide tools from a caller. They are not a data-access control: a
   tool a caller *can* reach returns whatever the upstream returns.
+- **The authorizer** sees the arguments as the caller sent them, before
+  overlay defaults and injected values — so a secret never leaves the proxy,
+  and a default-filled field is not in what it judges. It is asked once per
+  upstream call, so a composite's steps are judged as the tools they call and a
+  pagination follow-up is not re-asked. Nothing is cached: its latency is on
+  every call, so keep it local. `fail_open` serves calls unchecked while it is
+  down, and says so on each one.
 - **Rate limits** key on the caller's subject, falling back to the client
   certificate or peer address. Callers behind one shared gateway arrive on one
   address, so without `trusted_headers.subject` they share a bucket. min-mcp
@@ -76,8 +84,11 @@ Not oversights — each has a reason, and a shape of deployment that answers it.
 - **Session-identity binding.** Scopes always come from the current request's
   token, never from session state, so a session id carries no privilege on its
   own.
-- **Argument taint tracking and response scanning.** A guardrail product's job.
-  For stripping fields out of a payload, overlay `response.remove` is the tool.
+- **Argument-level policy, taint tracking and response scanning.** A policy or
+  guardrail product's job. `authorizer:` is where such a product plugs in for
+  the per-call decision, with the caller, the tool and the arguments; the rules
+  themselves live there, not here. For stripping fields out of a payload,
+  overlay `response.remove` is the tool.
 
 ## Supply chain
 
