@@ -6,6 +6,8 @@ All notable changes to min-mcp. Format loosely follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-08
+
 ### Security
 
 - **Overlay redaction and `fields` now reach `structuredContent`.** An MCP result carries its
